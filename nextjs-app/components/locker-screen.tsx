@@ -544,7 +544,9 @@ export function LockerScreen() {
                 </div>
                 <div className="min-w-0">
                   <p className="truncate text-sm font-semibold text-white">{user?.name || 'User'}</p>
-                  <p className="truncate text-xs text-slate-400">{user?.email || user?.customId || 'SafeBill user'}</p>
+                  <p className="truncate text-xs text-slate-400">
+                    {user?.customId ? `ID: ${user.customId}` : (user?.userId ? `ID: ${user.userId}` : (user?.email || 'SafeBill user'))}
+                  </p>
                 </div>
               </div>
             </div>
