@@ -44,3 +44,8 @@ nextjs-app/lint.txt
 backend/temp_test_invoice.pdf
 backend/.tmp-pip/
 backend/infra/aws-lambda/.aws-sam/
+deploy/ec2/.tmp/
+deploy/ec2/*.env
+!deploy/ec2/app.env.example
+deploy/ec2/secrets/*
+!deploy/ec2/secrets/.gitkeep

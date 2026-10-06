@@ -62,6 +62,7 @@ Backend includes strict validation in `AWS_ONLY_MODE=true`:
 - Backend AWS deployment: `backend/infra/AWS_DEPLOY.md`
 - Frontend AWS deployment: `nextjs-app/DEPLOYMENT.md`
 - Frontend quick start: `nextjs-app/QUICK_DEPLOY.md`
+- EC2 single-instance deployment: `deploy/ec2/README.md`
 
 ## Local Setup
 

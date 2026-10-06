@@ -1,0 +1,11 @@
+node_modules/
+.next/
+.env
+.env.local
+next-dev.log
+.frontend-dev.log
+.frontend-dev.err.log
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
