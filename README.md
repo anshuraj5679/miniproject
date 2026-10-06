@@ -24,22 +24,22 @@ SafeBill is a warranty locker and invoice intelligence platform that helps consu
 
 ## Repository Layout
 
-- `nextjs-app/` — Next.js app (consumer + merchant portals) and BFF `/api/*` proxy routes
-- `backend/` — FastAPI ingestion/RAG API, extraction pipeline, and notifications
-- `deploy/` — EC2 deployment assets and infrastructure references
+- `nextjs-app/` -- Next.js app (consumer + merchant portals) and BFF `/api/*` proxy routes
+- `backend/` -- FastAPI ingestion/RAG API, extraction pipeline, and notifications
+- `deploy/` -- EC2 deployment assets and infrastructure references
 
 ## AWS Tech Stack (Brief)
 
 SafeBill is deployed on AWS using a managed stack for identity, storage, AI inference, and messaging:
 
-- **Amazon Cognito** — user authentication and JWT identity
-- **Amazon S3** — invoice/document storage and presigned downloads
-- **Amazon Bedrock** — LLM-powered extraction and insight generation
-- **Amazon Textract / Vision OCR** — OCR for images (fallbacks handled in backend)
-- **Amazon SES** — email notifications (verified domain sender)
-- **Amazon SNS** — push/SMS/WhatsApp channels (optional)
-- **Amazon RDS (Postgres)** — primary metadata store
-- **EC2 + Docker Compose** — runtime deployment for API and web
+- **Amazon Cognito** -- user authentication and JWT identity
+- **Amazon S3** -- invoice/document storage and presigned downloads
+- **Amazon Bedrock** -- LLM-powered extraction and insight generation using Amazon Nova Pro
+- **Amazon Textract / Vision OCR** -- OCR for images (fallbacks handled in backend)
+- **Amazon SES** -- email notifications (verified domain sender)
+- **Amazon SNS** -- push/SMS/WhatsApp channels (optional)
+- **Amazon RDS (Postgres)** -- primary metadata store
+- **EC2 + Docker Compose** -- runtime deployment for API and web
 
 ![AWS Tech Stack](nextjs-app/public/readme/aws%20tech-stack.png)
 
