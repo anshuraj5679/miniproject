@@ -1,90 +1,48 @@
-# SafeBill (AWS-Only Stack)
+# SafeBill
 
-SafeBill is a warranty locker + invoice intelligence platform built as a monorepo:
+SafeBill is a warranty locker and invoice intelligence platform that helps consumers and merchants store bills, extract structured data, and stay ahead of warranty deadlines. The repo is a monorepo with a Next.js web app and a FastAPI backend.
 
-- `nextjs-app/` - Next.js web app (consumer + merchant portals) and BFF `/api/*` proxy routes
-- `backend/` - FastAPI ingestion/RAG API and notification processing
+## Product Snapshots
 
-This repository is now configured for **AWS-only integration**.
+![Landing Page](nextjs-app/public/readme/Landing%20Page.png)
 
-## AWS Services Used
+![Consumer](nextjs-app/public/readme/consumer.png)
 
-- **Amazon Cognito**: authentication and JWT identity
-- **Amazon S3**: invoice/document object storage + presigned download links
-- **Amazon Bedrock**: metadata generation, embeddings, grounded answer generation
-- **Amazon Textract**: OCR and expense extraction for images
-- **Amazon SES**: email delivery
-- **Amazon SNS**: SMS/push/WhatsApp publish channels
-- **AWS Secrets Manager + SSM Parameter Store**: runtime configuration injection
-- **API Gateway + Lambda** (or **ECS Fargate**): backend runtime options
-- **AWS Amplify Hosting**: Next.js frontend hosting
+![Merchant](nextjs-app/public/readme/merchant.png)
 
-## Architecture
+![Login & Signup](nextjs-app/public/readme/loginsignup.png)
 
-```mermaid
-flowchart LR
-  U[Browser] --> FE[Next.js App on Amplify]
-  FE --> BFF[Next.js /api/*]
-  BFF --> API[FastAPI on Lambda+API GW or ECS]
+![Product Page](nextjs-app/public/readme/productpage.png)
 
-  API --> COG[Cognito]
-  API --> S3[S3]
-  API --> BR[Bedrock]
-  API --> TXT[Textract]
-  API --> SES[SES]
-  API --> SNS[SNS]
-  API --> DB[(Postgres/Aurora + pgvector)]
-```
+## What It Does
 
-## AWS-Only Enforcement
+- OCR and metadata extraction for invoices and warranty documents
+- Consumer warranty locker with reminders and claim readiness insights
+- Merchant bill assignment workflow to consumers
+- AI-powered summaries and insights for invoices
+- Secure document storage and sharing
 
-Backend includes strict validation in `AWS_ONLY_MODE=true`:
+## Repository Layout
 
-- Provider checks:
-  - `AUTH_PROVIDER=cognito`
-  - `AI_PROVIDER=bedrock`
-  - `STORAGE_PROVIDER=s3`
-  - `EMAIL_PROVIDER=ses`
-  - `SMS_PROVIDER=sns`
-  - `PUSH_PROVIDER=sns`
-  - `WHATSAPP_PROVIDER=sns`
-- Required settings checks:
-  - `AWS_REGION`
-  - `COGNITO_USER_POOL_ID`
-  - `COGNITO_APP_CLIENT_ID`
-  - `S3_BUCKET_NAME`
-  - `BEDROCK_CHAT_MODEL`
-  - `BEDROCK_EMBEDDING_MODEL`
-- Non-AWS model fallbacks are disabled in AWS-only mode.
+- `nextjs-app/` — Next.js app (consumer + merchant portals) and BFF `/api/*` proxy routes
+- `backend/` — FastAPI ingestion/RAG API, extraction pipeline, and notifications
+- `deploy/` — EC2 deployment assets and infrastructure references
 
-## Deploy
+## AWS Tech Stack (Brief)
 
-- Backend AWS deployment: `backend/infra/AWS_DEPLOY.md`
-- Frontend AWS deployment: `nextjs-app/DEPLOYMENT.md`
-- Frontend quick start: `nextjs-app/QUICK_DEPLOY.md`
-- EC2 single-instance deployment: `deploy/ec2/README.md`
+SafeBill is deployed on AWS using a managed stack for identity, storage, AI inference, and messaging:
 
-## Local Setup
+- **Amazon Cognito** — user authentication and JWT identity
+- **Amazon S3** — invoice/document storage and presigned downloads
+- **Amazon Bedrock** — LLM-powered extraction and insight generation
+- **Amazon Textract / Vision OCR** — OCR for images (fallbacks handled in backend)
+- **Amazon SES** — email notifications (verified domain sender)
+- **Amazon SNS** — push/SMS/WhatsApp channels (optional)
+- **Amazon RDS (Postgres)** — primary metadata store
+- **EC2 + Docker Compose** — runtime deployment for API and web
 
-### Backend
+![AWS Tech Stack](nextjs-app/public/readme/aws%20tech-stack.png)
 
-```powershell
-Copy-Item backend/.env.example backend/.env
-cd backend
-python -m pip install -r requirements.txt
-```
+## Contributions
 
-### Frontend
-
-```powershell
-Copy-Item nextjs-app/.env.local.example nextjs-app/.env.local
-cd nextjs-app
-npm install
-```
-
-Run backend and frontend with your existing local workflow.
-
-## Important Notes
-
-- This migration updates code and IaC/docs for AWS-only operation.
-- Actual cloud cutover still requires applying infrastructure in your AWS account and setting all environment variables/secrets there.
+Contributions are welcome. Please open an issue to discuss major changes before submitting a PR. For smaller fixes, submit a PR directly with a concise description and screenshots if UI behavior changes.
