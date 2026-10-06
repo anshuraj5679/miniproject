@@ -32,14 +32,23 @@ SafeBill is a warranty locker and invoice intelligence platform that helps consu
 
 SafeBill is deployed on AWS using a managed stack for identity, storage, AI inference, and messaging:
 
-- **Amazon Cognito** -- user authentication and JWT identity
-- **Amazon S3** -- invoice/document storage and presigned downloads
-- **Amazon Bedrock** -- LLM-powered extraction and insight generation using Amazon Nova Pro
-- **Amazon Textract / Vision OCR** -- OCR for images (fallbacks handled in backend)
-- **Amazon SES** -- email notifications (verified domain sender)
-- **Amazon SNS** -- push/SMS/WhatsApp channels (optional)
-- **Amazon RDS (Postgres)** -- primary metadata store
-- **EC2 + Docker Compose** -- runtime deployment for API and web
+Amazon Cognito — Central identity provider for both consumers and merchants. It manages sign‑up, login, password resets, and issues JWTs that the
+    backend validates for role‑based access to bills, assignments, and settings.
+  - Amazon S3 — Durable object store for raw invoices, uploaded images, and OCR text snapshots. The backend writes files to S3 and generates presigned URLs
+    for secure, time‑limited access from the UI.
+  - Amazon Bedrock — Hosts the LLM (AMAZON NOVA PRO) used for text‑to‑schema extraction (invoice fields, product names, GST info), plus narrative insight generation. It
+    converts OCR text into structured metadata used throughout the app.
+  - Amazon Textract / Google Vision OCR — OCR layer for extracting text from scanned bills and PDFs. The backend chooses the best OCR output, then feeds it into
+    deterministic parsing and LLM mapping.
+  - Amazon SES — Transactional email delivery for warranty reminders, merchant assignment updates, and claim readiness alerts. It uses a verified sender
+    domain with DKIM for deliverability.
+  - Amazon SNS — Optional multi‑channel delivery layer for SMS/WhatsApp/push notifications when enabled. It’s wired in the backend as a provider for
+    non‑email alerts.
+  - Amazon RDS (Postgres) — Primary relational store for users, documents, extracted metadata, assignments, reviews, and notifications. This is the single
+    source of truth for the product state.
+  - EC2 + Docker Compose — Runtime hosting for both backend and frontend containers. Compose manages service lifecycle, networking, and environment
+    configuration on the EC2 instance.
+  - Amazon Titan used for image generation for the scanned bills.
 
 ![AWS Tech Stack](nextjs-app/public/readme/aws%20tech-stack.png)
 
