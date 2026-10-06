@@ -569,6 +569,15 @@ def process_pending_async_extraction_jobs(
                 services=services,
             )
             continue
+        if _looks_like_person_photo(payload):
+            failed += 1
+            _mark_async_job_failed(
+                db,
+                job,
+                error_message="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+                services=services,
+            )
+            continue
 
         request_metadata = job.request_metadata if isinstance(job.request_metadata, dict) else {}
         try:
@@ -2301,6 +2310,57 @@ def _extract_text_with_google_vision(image_bytes: bytes) -> str:
         if isinstance(first_ann, dict):
             return str(first_ann.get("description") or "").strip()
     return ""
+
+
+def _looks_like_person_photo(image_bytes: bytes) -> bool:
+    if not image_bytes or httpx is None:
+        return False
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return False
+    auth_headers, params, auth_mode = _google_vision_auth_context()
+    if auth_mode == "none":
+        return False
+    if auth_mode == "service_account" and (service_account is None or GoogleAuthRequest is None):
+        return False
+
+    endpoint = (get_settings().google_vision_endpoint or "").strip() or "https://vision.googleapis.com/v1/images:annotate"
+    payload = {
+        "requests": [
+            {
+                "image": {"content": base64.b64encode(image_bytes).decode("ascii")},
+                "features": [
+                    {"type": "FACE_DETECTION", "maxResults": 3},
+                    {"type": "LABEL_DETECTION", "maxResults": 8},
+                ],
+            }
+        ]
+    }
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            response = client.post(endpoint, params=params, headers=auth_headers, json=payload)
+            response.raise_for_status()
+            parsed = response.json()
+    except Exception:
+        return False
+
+    responses = parsed.get("responses", []) if isinstance(parsed, dict) else []
+    first = responses[0] if isinstance(responses, list) and responses else {}
+    if not isinstance(first, dict):
+        return False
+    faces = first.get("faceAnnotations")
+    if isinstance(faces, list) and faces:
+        return True
+    labels = first.get("labelAnnotations")
+    if isinstance(labels, list):
+        for label in labels:
+            if not isinstance(label, dict):
+                continue
+            desc = str(label.get("description") or "").strip().lower()
+            if desc in {"person", "people", "face", "selfie", "portrait", "human", "man", "woman"}:
+                score = _coerce_float(label.get("score"), default=0.0) or 0.0
+                if score >= 0.7:
+                    return True
+    return False
 
 
 def _google_vision_auth_context() -> tuple[dict[str, str], dict[str, str] | None, str]:
@@ -4782,6 +4842,11 @@ async def ingest_image(
         user_id=user_id,
         merchant_user_id=merchant_user_id,
     )
+    if _looks_like_person_photo(payload):
+        raise HTTPException(
+            status_code=422,
+            detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+        )
     image_classification = _classify_document_image_with_bedrock(payload, filename)
     image_doc_is_invoice = image_classification.get("is_invoice") if image_classification else None
     image_doc_confidence = _coerce_float(image_classification.get("confidence"), default=0.0) if image_classification else 0.0
