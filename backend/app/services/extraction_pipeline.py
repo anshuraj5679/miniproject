@@ -214,6 +214,21 @@ def _looks_like_non_merchandise_line_item(name: str | None) -> bool:
         "tax rate",
         "item number",
         "hsn",
+        "amount in words",
+        "total amount",
+        "tax amount",
+        "taxable amount",
+        "gst amount",
+        "igst",
+        "cgst",
+        "sgst",
+        "total",
+        "subtotal",
+        "discount",
+        "shipping charges",
+        "delivery charges",
+        "handling charges",
+        "packaging charges",
     )
     if any(token in compact for token in blocked_tokens):
         return True

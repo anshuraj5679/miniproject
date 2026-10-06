@@ -1047,6 +1047,21 @@ def _looks_like_non_merchandise_item_name(value: object) -> bool:
         "tax rate",
         "item number",
         "hsn",
+        "amount in words",
+        "total amount",
+        "tax amount",
+        "taxable amount",
+        "gst amount",
+        "igst",
+        "cgst",
+        "sgst",
+        "total",
+        "subtotal",
+        "discount",
+        "shipping charges",
+        "delivery charges",
+        "handling charges",
+        "packaging charges",
     )
     if any(token in compact for token in blocked_tokens):
         return True
@@ -1063,6 +1078,8 @@ def _first_meaningful_line(text: str, fallback: str) -> str:
         if len(line) > 120:
             continue
         if re.fullmatch(r"[\W_]+", line):
+            continue
+        if _looks_like_non_merchandise_item_name(line):
             continue
         return line
     return fallback
@@ -2298,6 +2315,8 @@ def _persist_structured_document(
 
     title_fallback = filename.rsplit(".", 1)[0] if filename else "Uploaded Document"
     extracted_product_name = str(sanitize_merchandise_name(metadata.get("product_name")) or "").strip()
+    if extracted_product_name and _looks_like_non_merchandise_item_name(extracted_product_name):
+        extracted_product_name = ""
     metadata_line_items = metadata.get("line_items")
     sanitized_line_items: list[dict[str, object]] = []
     if isinstance(metadata_line_items, list):
