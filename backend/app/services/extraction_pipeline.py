@@ -6,6 +6,12 @@ from datetime import date, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import model_validator
+
+try:
+    from dateutil import parser as date_parser
+except Exception:  # pragma: no cover - optional runtime dependency
+    date_parser = None  # type: ignore[assignment]
 
 
 TEXT_FIELDS = {
@@ -66,6 +72,32 @@ ENGINE_WEIGHTS = {
     "tesseract_regex": 0.72,
 }
 
+_DATE_LIKE_RE = re.compile(
+    r"(?i)"
+    r"(\b\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}\b"
+    r"|\b\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}\b"
+    r"|\b\d{1,2}[\/\-.][A-Za-z]{3,9}[\/\-.]\d{2,4}\b"
+    r"|\b[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4}\b"
+    r"|\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\b)"
+)
+
+
+def _looks_like_dimension_amount(amount: float | None, context_text: str | None) -> bool:
+    if amount is None:
+        return False
+    text = (context_text or "").strip()
+    if not text:
+        return False
+    if amount <= 0:
+        return False
+    rounded = round(amount)
+    if abs(amount - rounded) > 1e-6:
+        return False
+    size = int(rounded)
+    if size < 10 or size > 200:
+        return False
+    return bool(re.search(rf"(?i)\b{size}\s*(?:-?\s*(?:inch|inches|in\.|\"|cm|mm))\b", text))
+
 
 def _safe_float(value: object) -> float | None:
     if value is None:
@@ -99,6 +131,14 @@ def _safe_date_iso(value: object) -> str | None:
         try:
             return date.fromisoformat(text[:10]).isoformat()
         except ValueError:
+            pass
+        if date_parser is None or not _DATE_LIKE_RE.search(text):
+            return None
+        try:
+            # India-first parsing aligns with GST invoice conventions (e.g. 30.03.2018).
+            parsed = date_parser.parse(text, dayfirst=True, fuzzy=True).date()
+            return parsed.isoformat()
+        except (ValueError, TypeError, OverflowError):
             return None
     return None
 
@@ -215,6 +255,24 @@ class StrictInvoiceExtraction(BaseModel):
     def _category(cls, value: object) -> str | None:
         normalized = _normalize_category(value)
         return normalized or (_normalize_text(value) if value else None)
+
+    @model_validator(mode="after")
+    def _sanitize_dimension_amounts(self) -> "StrictInvoiceExtraction":
+        # Prevent common false-positive totals like `42` coming from a product dimension
+        # (e.g. "42-inch TV") when the doc is a warranty card / certificate.
+        if self.total_amount is not None:
+            context_parts: list[str] = []
+            if self.product_name:
+                context_parts.append(self.product_name)
+            if self.brand:
+                context_parts.append(self.brand)
+            for item in (self.line_items or [])[:10]:
+                if item and item.name:
+                    context_parts.append(item.name)
+            context = " ".join(context_parts)
+            if _looks_like_dimension_amount(self.total_amount, context):
+                self.total_amount = None
+        return self
 
 
 def ensure_strict_extraction(payload: dict[str, Any] | None) -> dict[str, Any]:

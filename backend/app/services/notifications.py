@@ -26,6 +26,7 @@ from app.models import (
     NotificationJob,
     NotificationPreference,
 )
+from app.services.date_utils import add_months
 
 DEFAULT_TIMEZONE = timezone.utc
 IN_APP_PLACEHOLDER_EMAIL = "in-app@local"
@@ -569,7 +570,7 @@ class NotificationService:
         has_extended = bool(references.get("extended_warranty_purchased"))
         effective_months = warranty_months + (extended_months if has_extended or extended_months > 0 else 0)
         if warranty_end is None and purchase_date and effective_months > 0:
-            warranty_end = purchase_date + timedelta(days=max(effective_months, 1) * 30)
+            warranty_end = add_months(purchase_date, effective_months)
         return purchase_date, warranty_end
 
     def _build_payload(

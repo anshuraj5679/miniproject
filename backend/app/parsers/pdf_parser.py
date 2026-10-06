@@ -32,6 +32,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
 # `USE_UNSTRUCTURED_PARTITION=false` (the default).
 
 from app.core.config import get_settings
+from app.services.date_utils import add_months
 
 CURRENCY_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
 
@@ -113,9 +114,14 @@ def _extract_labeled_value(text: str, labels: list[str]) -> str | None:
 def _extract_labeled_date(text: str, labels: list[str]) -> date | None:
     joined = "|".join(labels)
     date_pattern = (
-        r"([0-3]?\d[\/\-.][01]?\d[\/\-.]\d{2,4}"
+        r"("
+        r"[0-3]?\d[\/\-.][01]?\d[\/\-.]\d{2,4}"
         r"|\d{4}[\/\-.][01]?\d[\/\-.][0-3]?\d"
-        r"|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4})"
+        r"|[0-3]?\d[\/\-.][A-Za-z]{3,9}[\/\-.]\d{2,4}"
+        r"|[A-Za-z]{3,9}[\/\-.][0-3]?\d[\/\-.]\d{2,4}"
+        r"|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4}"
+        r"|[0-3]?\d\s+[A-Za-z]{3,9}\s+\d{2,4}"
+        r")"
     )
     match = re.search(rf"(?im)(?:{joined})\s*[:\-]?\s*{date_pattern}", text)
     return _safe_date(match.group(1)) if match else None
@@ -123,6 +129,7 @@ def _extract_labeled_date(text: str, labels: list[str]) -> date | None:
 
 def _extract_bill_id(text: str, filename: str) -> str:
     patterns = [
+        r"(?im)\b(?:invoice\s*\/\s*bill|bill\s*\/\s*invoice)\s*(?:no|number|#|id)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})",
         r"(?im)\b(?:invoice|bill|receipt)\s*(?:no|number|#|id)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})",
         r"(?im)\binvoice\s*[:\-]\s*([A-Z0-9][A-Z0-9\-\/]{2,})",
         r"(?im)\binv\s*(?:no|number|#)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})",
@@ -162,6 +169,8 @@ def _extract_vendor(text: str, lines: list[str]) -> str:
             r"sold\s+by",
             r"store(?:\s*name)?",
             r"shop(?:\s*name)?",
+            r"company(?:\s*name)?",
+            r"manufacturer",
             r"from",
         ],
     )
@@ -560,7 +569,7 @@ def extract_invoice_metadata(text: str, filename: str) -> dict[str, Any]:
     if warranty_start is None:
         warranty_start = purchase_date
     if warranty_end is None and warranty_start and warranty_months:
-        warranty_end = warranty_start + timedelta(days=max(warranty_months, 1) * 30)
+        warranty_end = add_months(warranty_start, warranty_months)
 
     return {
         "bill_id": bill_id,

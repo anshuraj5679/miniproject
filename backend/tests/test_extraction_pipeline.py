@@ -86,3 +86,19 @@ def test_estimate_claim_readiness_penalizes_missing_fields_and_deadline() -> Non
     assert readiness["score"] < 0.75
     assert "purchase_date" in readiness["missing"]
     assert "serial_number" in readiness["missing"]
+
+
+def test_ensure_strict_extraction_parses_non_iso_dates_and_sanitizes_dimension_totals() -> None:
+    parsed = ensure_strict_extraction(
+        {
+            "date": "10-Feb-2026",
+            "warranty_start": "10 Feb 2026",
+            "warranty_end": "Feb 10, 2028",
+            "product_name": "UltraSmart LED Television 42-inch",
+            "total_amount": 42,
+        }
+    )
+    assert parsed["date"] == "2026-02-10"
+    assert parsed["warranty_start"] == "2026-02-10"
+    assert parsed["warranty_end"] == "2028-02-10"
+    assert parsed["total_amount"] is None

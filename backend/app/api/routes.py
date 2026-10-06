@@ -78,6 +78,7 @@ from app.schemas import (
     WarrantyItemView,
 )
 from app.services.embeddings import build_embedding_text
+from app.services.date_utils import add_months
 from app.services.extraction_pipeline import (
     build_review_fields,
     compute_field_confidences,
@@ -563,6 +564,9 @@ def _extract_image_metadata_with_openai(image_bytes: bytes, filename: str) -> di
     system_prompt = (
         "You are an invoice data extraction engine. "
         "Return only JSON. Do not guess missing values. Use null for missing fields. "
+        "Dates must be ISO 8601 format (YYYY-MM-DD). Convert from formats like 10-Feb-2026 if present. "
+        "Only set monetary fields when they are explicitly shown as money (currency symbol/code or labels like TOTAL/AMOUNT/MRP/PRICE). "
+        "Never treat product dimensions (e.g., '42-inch'), model numbers, serial numbers, warranty months, phone numbers, or addresses as amounts. "
         "Extract these keys exactly: "
         "bill_id, vendor, date, total_amount, vendor_tax_id, taxable_amount, gst_amount, gst_rate, "
         "cgst_amount, sgst_amount, igst_amount, product_name, brand, serial_number, warranty_months, "
@@ -888,7 +892,7 @@ def _persist_structured_document(
     extracted_warranty_start = _coerce_date(metadata.get("warranty_start")) or resolved_date
     extracted_warranty_end = _coerce_date(metadata.get("warranty_end"))
     if extracted_warranty_end is None and extracted_warranty_start:
-        extracted_warranty_end = extracted_warranty_start + timedelta(days=max(extracted_warranty_months, 1) * 30)
+        extracted_warranty_end = add_months(extracted_warranty_start, extracted_warranty_months)
     metadata_line_items = metadata.get("line_items")
     inferred_category = _infer_locker_category(
         product_name=(extracted_product_name or title),
@@ -1437,7 +1441,7 @@ def _serialize_document(document: Document) -> DocumentView:
     warranty_start = _coerce_date(references.get("warranty_start")) or purchase_date
     warranty_end = _coerce_date(references.get("warranty_end"))
     if warranty_end is None and warranty_start and warranty_months:
-        warranty_end = warranty_start + timedelta(days=max(warranty_months, 1) * 30)
+        warranty_end = add_months(warranty_start, warranty_months)
 
     purchase_date_iso = purchase_date.isoformat() if purchase_date else None
     warranty_start_iso = warranty_start.isoformat() if warranty_start else None
@@ -2319,11 +2323,7 @@ def create_merchant_manual_bill(
     fallback_bill_id = f"MB-{int(time.time() * 1000)}"
     resolved_bill_id = (request.bill_id or fallback_bill_id).strip()[:128]
     warranty_start = request.purchase_date
-    warranty_end = (
-        warranty_start + timedelta(days=max(request.warranty_months, 1) * 30)
-        if warranty_start
-        else None
-    )
+    warranty_end = add_months(warranty_start, request.warranty_months) if warranty_start else None
     extracted_text = _manual_bill_text_payload(
         request=request,
         resolved_bill_id=resolved_bill_id,

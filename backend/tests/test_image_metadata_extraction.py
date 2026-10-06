@@ -55,3 +55,27 @@ def test_infer_locker_category_preserves_valid_source_category() -> None:
         source_category="Appliances",
     )
     assert category == "Appliances"
+
+
+def test_extract_invoice_metadata_from_warranty_certificate_style_text() -> None:
+    ocr_text = """
+    WARRANTY CERTIFICATE (SAMPLE TEMPLATE)
+
+    Company Name: XYZ Electronics Pvt. Ltd.
+    Product Name: UltraSmart LED Television 42-inch
+    Model Number: US-LED42X2026
+    Serial Number: SN1234567890
+    Invoice/Bill Number: INV-2026-001245
+    Purchase Date: 10-Feb-2026
+    Warranty Period: 24 Months from Purchase Date
+    """
+    metadata = extract_invoice_metadata(ocr_text, "warranty.png")
+
+    assert metadata["bill_id"] == "INV-2026-001245"
+    assert metadata["vendor"] == "XYZ Electronics Pvt. Ltd."
+    assert metadata["date"] == date(2026, 2, 10)
+    assert metadata["total_amount"] is None
+    assert metadata["serial_number"] == "SN1234567890"
+    assert metadata["warranty_months"] == 24
+    assert metadata["warranty_start"] == date(2026, 2, 10)
+    assert metadata["warranty_end"] == date(2028, 2, 10)

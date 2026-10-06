@@ -19,6 +19,7 @@ from app.core.config import get_settings
 from app.models import Chunk, Document
 from app.parsers.pdf_parser import parse_pdf_document
 from app.services.chunking import structure_aware_chunking
+from app.services.date_utils import add_months
 from app.services.embeddings import EmbeddingService, build_embedding_text
 from app.services.metadata_generator import MetadataGenerator
 from app.services.vector_store import PineconeVectorStore
@@ -273,7 +274,7 @@ class IngestionService:
             try:
                 start_date = date.fromisoformat(warranty_start_iso)
                 warranty_months = int(references_payload.get("warranty_months") or 12)
-                warranty_end_iso = (start_date + timedelta(days=max(warranty_months, 1) * 30)).isoformat()
+                warranty_end_iso = add_months(start_date, warranty_months).isoformat()
             except (TypeError, ValueError):
                 warranty_end_iso = None
         if warranty_end_iso and not references_payload.get("warranty_end"):
