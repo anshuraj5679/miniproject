@@ -1048,14 +1048,56 @@ class NotificationService:
         db.commit()
         return True
 
-    def _send_email(self, *, recipient_email: str, subject: str, body: str) -> None:
-        if not self.settings.smtp_host or not self.settings.email_from:
-            raise RuntimeError("SMTP settings are incomplete. Configure SMTP_HOST and EMAIL_FROM.")
+    def _send_email(self, *, recipient_email: str, subject: str, body: str) -> dict[str, object]:
+        sender_email = (self.settings.email_from or "").strip()
+        if not sender_email:
+            raise RuntimeError("Email sender is not configured. Set EMAIL_FROM.")
+
+        sender_name = (self.settings.email_from_name or "").strip()
+        from_value = formataddr((sender_name, sender_email)) if sender_name else sender_email
+        webhook_url = (self.settings.email_webhook_url or "").strip()
+
+        # Many PaaS providers block outbound SMTP ports; allow HTTPS delivery via a webhook
+        # compatible with Resend's API shape (`/emails`), while keeping SMTP as the default.
+        if webhook_url:
+            headers = {"Content-Type": "application/json"}
+            token = (self.settings.email_webhook_api_key or "").strip()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            payload = {
+                "from": from_value,
+                "to": [recipient_email],
+                "subject": subject,
+                "text": body,
+            }
+            with httpx.Client(timeout=20.0) as client:
+                response = client.post(webhook_url, headers=headers, json=payload)
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Email webhook failed with status {response.status_code}: {response.text[:400]}"
+                )
+            message_id: str | None = None
+            try:
+                parsed = response.json()
+                if isinstance(parsed, dict):
+                    raw_id = parsed.get("id") or parsed.get("message_id") or parsed.get("messageId")
+                    if raw_id:
+                        message_id = str(raw_id)[:128]
+            except Exception:
+                message_id = None
+            provider_payload: dict[str, object] = {
+                "provider": "email_webhook",
+                "status_code": response.status_code,
+            }
+            if message_id:
+                provider_payload["message_id"] = message_id
+            return provider_payload
+
+        if not self.settings.smtp_host:
+            raise RuntimeError("SMTP settings are incomplete. Configure SMTP_HOST (or EMAIL_WEBHOOK_URL).")
 
         message = EmailMessage()
-        sender_name = (self.settings.email_from_name or "").strip()
-        sender_email = self.settings.email_from.strip()
-        message["From"] = formataddr((sender_name, sender_email)) if sender_name else sender_email
+        message["From"] = from_value
         message["To"] = recipient_email
         message["Subject"] = subject
         message.set_content(body)
@@ -1071,7 +1113,7 @@ class NotificationService:
                 if username:
                     smtp.login(username, password)
                 smtp.send_message(message)
-            return
+            return {"provider": "smtp"}
 
         with smtplib.SMTP(host=host, port=port, timeout=timeout_seconds) as smtp:
             if self.settings.smtp_use_tls:
@@ -1079,6 +1121,7 @@ class NotificationService:
             if username:
                 smtp.login(username, password)
             smtp.send_message(message)
+        return {"provider": "smtp"}
 
     def _channel_webhook_url(self, channel: str) -> str:
         if channel == CHANNEL_SMS:
@@ -1146,8 +1189,7 @@ class NotificationService:
                 f"Amount: {payload.get('total_amount_formatted', '-')}\n\n"
                 "Regards,\nSafeBill"
             )
-            self._send_email(recipient_email=job.recipient_email, subject=job.subject, body=body)
-            return {"provider": "smtp"}
+            return self._send_email(recipient_email=job.recipient_email, subject=job.subject, body=body)
 
         if job.channel in {CHANNEL_SMS, CHANNEL_PUSH, CHANNEL_WHATSAPP}:
             return self._send_webhook_channel(

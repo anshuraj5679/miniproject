@@ -183,6 +183,7 @@ Notifications:
 
 - Channel toggles: `EMAIL_NOTIFICATIONS_ENABLED`, `SMS_NOTIFICATIONS_ENABLED`, `PUSH_NOTIFICATIONS_ENABLED`, `WHATSAPP_NOTIFICATIONS_ENABLED`
 - SMTP: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_TLS`, `SMTP_USE_SSL`, `EMAIL_FROM`, `EMAIL_FROM_NAME`
+- Email webhook (HTTPS, Resend-compatible): `EMAIL_WEBHOOK_URL`, `EMAIL_WEBHOOK_API_KEY`
 - Webhooks: `SMS_WEBHOOK_URL`, `PUSH_WEBHOOK_URL`, `WHATSAPP_WEBHOOK_URL`, `NOTIFICATION_WEBHOOK_SECRET`
 - Worker: `NOTIFICATION_WORKER_POLL_SECONDS`, `NOTIFICATION_WORKER_BATCH_SIZE`, retry/backoff settings
 
@@ -301,7 +302,7 @@ Processing:
 
 Channels:
 
-- **Email** via SMTP (`SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM`)
+- **Email** via SMTP (`SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM`) or HTTPS webhook (`EMAIL_WEBHOOK_URL`, `EMAIL_WEBHOOK_API_KEY`)
 - **SMS/Push/WhatsApp** via configured webhook URLs + optional HMAC signature (`NOTIFICATION_WEBHOOK_SECRET`)
 - **In-app** is persisted as jobs with `channel=in_app` and served via `GET /api/v1/notifications`
 

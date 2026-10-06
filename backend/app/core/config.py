@@ -121,6 +121,8 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     smtp_use_tls: bool = True
     smtp_use_ssl: bool = False
+    email_webhook_url: str = ""
+    email_webhook_api_key: str = ""
     email_from: str = ""
     email_from_name: str = "SafeBill"
     notification_default_alert_days: str = "30,7,1"
