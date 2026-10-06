@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 from app.core.config import get_settings
 from app.models import Chunk, Document
-from app.parsers.pdf_parser import parse_pdf_document
+from app.parsers.pdf_parser import ParsedDocument, parse_pdf_document
 from app.services.chunking import structure_aware_chunking
 from app.services.date_utils import add_months
 from app.services.metadata_generator import MetadataGenerator
@@ -199,8 +199,13 @@ class IngestionService:
         ocr_mode: str | None = None,
         version: int = 1,
         references: dict[str, Any] | None = None,
+        parsed: ParsedDocument | None = None,
     ) -> tuple[Document, int]:
-        parsed = parse_pdf_document(file_bytes=file_bytes, filename=filename, ocr_mode_override=ocr_mode)
+        parsed = parsed or parse_pdf_document(
+            file_bytes=file_bytes,
+            filename=filename,
+            ocr_mode_override=ocr_mode,
+        )
         chunks = structure_aware_chunking(parsed)
         if len(chunks) > self.settings.max_chunks_per_document:
             raise ValueError("Document exceeds configured chunk limit.")
