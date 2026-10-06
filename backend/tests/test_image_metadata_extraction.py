@@ -235,3 +235,70 @@ def test_extract_invoice_metadata_from_multiline_tools_ocr_text() -> None:
     assert any("taparia universal tool kit" in str(item.get("name") or "").lower() for item in line_items)
     assert all("32aabba7890b1zb" not in str(item.get("name") or "").lower() for item in line_items)
     assert all("kerala" not in str(item.get("name") or "").lower() for item in line_items)
+
+
+def test_extract_invoice_metadata_recovers_google_vision_amounts_and_ignores_signature_noise() -> None:
+    ocr_text = """
+    amazon.in
+    Digitally Signed by DS CLOUDTAIL INDIA PRIVATE LIMITED 2
+    Date: 2020.10.22 09:24:05 UTC
+    Reason: Invoice
+    Sold By:
+    Cloudtail India Private Limited
+    Warehouse C F, Sai Dham Logistics Park,
+    Village Dohale, Post Padgha, Taluka Bhiwandi
+    THANE, MAHARASHTRA, 421101
+    IN
+    Tax Invoice/Bill of Supply/Cash Memo
+    (Original for Recipient)
+    Billing Address :
+    Arati Swain
+    At/Po Jaipur, Jaipur Village
+    KRUSHNANANDAPUR, ODISHA, 754133
+    IN
+    State/UT Code: 21
+    PAN No: AAQCS4259Q
+    GST Registration No: 27AAQCS4259Q1ZA
+    Order Number: 403-4032777-6833965
+    Order Date: 21.10.2020
+    Shipping Address :
+    Arati Swain
+    Arati Swain
+    At/Po Jaipur, Jaipur Village
+    KRUSHNANANDAPUR, ODISHA, 754133
+    IN
+    State/UT Code: 21
+    Place of supply: ODISHA
+    Place of delivery: ODISHA
+    Invoice Number: IN-SBOK-179862
+    Invoice Details: MH-SBOK-1004-2021
+    Invoice Date: 22.10.2020
+    SI.
+    No Description
+    Unit Price Qty
+    Net
+    Amount
+    Tax Tax Tax
+    Rate Type Amount Amount
+    Total
+    1 Samsung 108 cm (43 Inches) Wondertainment Series Full
+    HD LED Smart TV UA43TE50AAKXXL (Titan Gray) (2020 23.429.69 1 23.429.69 28% IGST 6.560.31 29.990.00
+    model) | B086R98PKS (B086R98PKS)
+    HSN:8528
+    TOTAL:
+    Amount in Words:
+    Twenty-nine Thousand Nine Hundred And Ninety only
+    """
+    metadata = extract_invoice_metadata(ocr_text, "amazon-invoice.png")
+
+    assert metadata["bill_id"] == "IN-SBOK-179862"
+    assert metadata["vendor"] == "Cloudtail India Private Limited"
+    assert metadata["date"] == date(2020, 10, 22)
+    assert abs(float(metadata["total_amount"] or 0.0) - 29990.0) < 0.01
+    assert str(metadata.get("product_name") or "").lower().startswith("samsung 108 cm")
+    assert str(metadata.get("product_name") or "").lower() != "digitally signed by ds cloudtail india private limited"
+
+    line_items = metadata.get("line_items") or []
+    assert line_items
+    assert str(line_items[0].get("name") or "").lower().startswith("samsung 108 cm")
+    assert abs(float(line_items[0].get("amount") or 0.0) - 29990.0) < 0.01

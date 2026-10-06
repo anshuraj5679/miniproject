@@ -9,6 +9,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
     boto3 = None  # type: ignore[assignment]
 
 from app.core.config import get_settings
+from app.services.bedrock_client import configure_bedrock_api_key
 from app.services.planner import Plan
 from app.services.retrieval import RetrievalHit
 
@@ -21,6 +22,7 @@ class GroundedAnswerGenerator:
         self.bedrock = None
         if boto3:
             try:
+                configure_bedrock_api_key(settings)
                 self.bedrock = boto3.client("bedrock-runtime", region_name=settings.aws_region)
             except Exception:
                 self.bedrock = None

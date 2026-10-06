@@ -4,7 +4,7 @@ import { BackendApiError, backendApiFetch, resolveRequestAuthToken, withQuery } 
 export const runtime = 'nodejs'
 const INGEST_TIMEOUT_MS = 120000
 const DOCUMENT_FETCH_TIMEOUT_MS = 60000
-const DEFAULT_OCR_MODE = 'vision_only'
+const DEFAULT_OCR_MODE = 'hybrid'
 
 interface IngestResponse {
   document_id: string

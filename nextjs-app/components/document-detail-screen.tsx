@@ -21,7 +21,6 @@ import {
   AlertTriangle,
   Languages,
   RefreshCw,
-  Volume2,
   ExternalLink,
   Copy,
   MapPin,
@@ -703,7 +702,6 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
         { key: 'bharat.loading', text: 'Reviewing OCR text and building claim guidance.' },
         { key: 'bharat.personalize', text: 'Personalize output' },
         { key: 'bharat.refresh', text: 'Refresh Insight' },
-        { key: 'bharat.listen', text: 'Listen Summary' },
         { key: 'bharat.context', text: 'AI context' },
         { key: 'bharat.detected', text: 'Detected language' },
         { key: 'bharat.output', text: 'Output language' },
@@ -1543,14 +1541,6 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
                   >
                     {isOutputUpdating ? <span className="loading loading-spinner loading-xs"></span> : <RefreshCw className="h-4 w-4" />}
                     {translateUi('bharat.refresh', 'Refresh Insight')}
-                  </button>
-                  <button
-                    onClick={handleGenerateBharatSpeech}
-                    disabled={isOutputUpdating || bharatSpeechLoading}
-                    className="inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-sky-500 to-indigo-500 px-3 py-2 text-sm font-semibold text-white transition-opacity hover:opacity-95 disabled:opacity-60"
-                  >
-                    {bharatSpeechLoading ? <span className="loading loading-spinner loading-xs"></span> : <Volume2 className="h-4 w-4" />}
-                    {translateUi('bharat.listen', 'Listen Summary')}
                   </button>
                 </div>
 

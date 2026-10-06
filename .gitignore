@@ -51,3 +51,4 @@ deploy/ec2/*.env
 deploy/ec2/secrets/*
 !deploy/ec2/secrets/.gitkeep
 run-logs/
+artifacts/

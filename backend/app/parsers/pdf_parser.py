@@ -48,8 +48,9 @@ from app.core.config import get_settings
 from app.services.date_utils import add_months
 from app.services.extraction_pipeline import sanitize_merchandise_name
 
-CURRENCY_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
-DECIMAL_AMOUNT_RE = re.compile(r"(?<!\d)([0-9][0-9,]*\.\d{2})(?!\d)")
+NUMERIC_TOKEN_PATTERN = r"[0-9][0-9,]*(?:[.,]\d{1,3})*"
+CURRENCY_RE = re.compile(rf"[-+]?{NUMERIC_TOKEN_PATTERN}")
+DECIMAL_AMOUNT_RE = re.compile(rf"(?<!\d)({NUMERIC_TOKEN_PATTERN}[.,]\d{{2}})(?!\d)")
 
 
 @dataclass
@@ -83,14 +84,43 @@ def normalize_numeric_field(value: str | None) -> float | None:
     cleaned = value
     for token in ("INR", "Rs.", "Rs", "$", "\u20b9", "EUR", "USD"):
         cleaned = cleaned.replace(token, "")
-    cleaned = cleaned.replace(",", "").strip()
+    cleaned = cleaned.strip()
     if not cleaned:
         return None
     match = CURRENCY_RE.search(cleaned)
     if not match:
         return None
+    token = match.group(0).strip(".,")
+    if not token:
+        return None
+    sign = ""
+    if token[0] in "+-":
+        sign = token[0]
+        token = token[1:]
+    if not token:
+        return None
+    if "." in token or "," in token:
+        last_dot = token.rfind(".")
+        last_comma = token.rfind(",")
+        decimal_index = max(last_dot, last_comma)
+        decimal_part = token[decimal_index + 1 :]
+        integer_part = token[:decimal_index]
+        if integer_part and decimal_part.isdigit() and len(decimal_part) <= 2:
+            normalized_int = re.sub(r"[.,]", "", integer_part)
+            if normalized_int:
+                try:
+                    return float(f"{sign}{normalized_int}.{decimal_part}")
+                except ValueError:
+                    pass
+        if token.count(".") + token.count(",") >= 1:
+            normalized_int = re.sub(r"[.,]", "", token)
+            if normalized_int:
+                try:
+                    return float(f"{sign}{normalized_int}")
+                except ValueError:
+                    pass
     try:
-        return float(match.group(0).replace(",", ""))
+        return float(f"{sign}{token.replace(',', '')}")
     except ValueError:
         return None
 
@@ -148,6 +178,9 @@ def _looks_like_non_merchandise_label(value: str) -> bool:
         "hsn code",
         "item number",
         "tax rate",
+        "digitally signed",
+        "authorized signatory",
+        "reason: invoice",
     )
     if any(token in text for token in blocked_tokens):
         return True
@@ -514,6 +547,60 @@ def _extract_tax_breakdown(text: str) -> dict[str, float | None]:
 
 
 def _extract_line_items_from_text(lines: list[str]) -> list[dict[str, Any]]:
+    recovered_rows: list[dict[str, Any]] = []
+    seen_row_names: set[str] = set()
+    trailing_value_re = re.compile(
+        rf"\s+(?:\d+%|[A-Z]{{2,8}}|{NUMERIC_TOKEN_PATTERN})(?:\s+(?:\d+%|[A-Z]{{2,8}}|{NUMERIC_TOKEN_PATTERN})){{2,}}\s*$"
+    )
+    for index, raw_line in enumerate(lines):
+        line = _clean_line(raw_line)
+        lowered = line.lower()
+        if not line or _looks_like_non_merchandise_label(line):
+            continue
+        if any(token in lowered for token in ("digitally signed", "authorized signatory", "reason: invoice")):
+            continue
+        decimal_amounts = [
+            normalize_numeric_field(token)
+            for token in DECIMAL_AMOUNT_RE.findall(line)
+        ]
+        decimal_amounts = [
+            round(value, 2)
+            for value in decimal_amounts
+            if value is not None and 0 < value <= 1_000_000
+        ]
+        if len(decimal_amounts) < 2:
+            continue
+        candidate_source = line
+        if index > 0:
+            previous_line = _clean_line(lines[index - 1])
+            previous_lowered = previous_line.lower()
+            if (
+                previous_line
+                and not DECIMAL_AMOUNT_RE.findall(previous_line)
+                and not _looks_like_non_merchandise_label(previous_line)
+                and not any(token in previous_lowered for token in ("digitally signed", "authorized signatory", "reason: invoice"))
+                and not any(token in previous_lowered for token in ("invoice", "bill", "date", "gst", "tax", "order"))
+                and len(re.findall(r"[A-Za-z]{2,}", previous_line)) >= 2
+            ):
+                candidate_source = f"{re.sub(r'^\d+\s+', '', previous_line).strip()} {line}"
+        candidate = re.sub(r"^\d+\s+", "", candidate_source)
+        candidate = trailing_value_re.sub("", candidate).strip(":- ")
+        candidate = str(sanitize_merchandise_name(candidate) or candidate).strip(":- ")
+        if len(re.findall(r"[A-Za-z]{2,}", candidate)) < 2:
+            continue
+        if _looks_like_non_merchandise_label(candidate):
+            continue
+        key = candidate.lower()
+        if key in seen_row_names:
+            continue
+        amount = decimal_amounts[-1]
+        if amount <= 100 and len(decimal_amounts) >= 2:
+            amount = max(decimal_amounts[:-1])
+        seen_row_names.add(key)
+        recovered_rows.append({"name": candidate[:255], "amount": amount})
+    if recovered_rows:
+        return recovered_rows[:50]
+
     table_header_index = next(
         (
             index
@@ -634,8 +721,8 @@ def _extract_line_items_from_text(lines: list[str]) -> list[dict[str, Any]]:
         "grand total",
         "warranty",
     )
-    amount_re = re.compile(r"(?i)(?:inr|rs\.?|\$)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*$")
-    numeric_re = re.compile(r"(?i)(?:inr|rs\.?|\$|₹)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)")
+    amount_re = re.compile(rf"(?i)(?:inr|rs\.?|\$)?\s*({NUMERIC_TOKEN_PATTERN})\s*$")
+    numeric_re = re.compile(rf"(?i)(?:inr|rs\.?|\$|₹)?\s*({NUMERIC_TOKEN_PATTERN})")
     currency_re = re.compile(r"(?i)\b(?:inr|rs\.?)\b|[₹$]")
 
     for raw_line in lines:
@@ -1003,6 +1090,38 @@ def extract_invoice_metadata(text: str, filename: str) -> dict[str, Any]:
         tax_breakdown["gst_amount"] = summary_amounts["gst_amount"]
     if summary_amounts.get("gst_rate") is not None:
         tax_breakdown["gst_rate"] = summary_amounts["gst_rate"]
+
+    line_item_amounts = [
+        round(amount, 2)
+        for amount in (
+            normalize_numeric_field(str(item.get("amount")))
+            for item in line_items
+            if isinstance(item, dict) and item.get("amount") is not None
+        )
+        if amount is not None and amount > 0
+    ]
+    if line_item_amounts:
+        inferred_total = round(sum(line_item_amounts), 2) if len(line_item_amounts) > 1 else line_item_amounts[0]
+        if total_amount is None or total_amount <= 0 or total_amount < inferred_total * 0.6:
+            total_amount = inferred_total
+
+    taxable_amount = normalize_numeric_field(str(tax_breakdown.get("taxable_amount")))
+    gst_amount = normalize_numeric_field(str(tax_breakdown.get("gst_amount")))
+    if total_amount is not None:
+        for key in ("taxable_amount", "gst_amount", "cgst_amount", "sgst_amount", "igst_amount"):
+            value = normalize_numeric_field(str(tax_breakdown.get(key)))
+            if value is not None and value > total_amount * 1.05:
+                tax_breakdown[key] = None
+        taxable_amount = normalize_numeric_field(str(tax_breakdown.get("taxable_amount")))
+        gst_amount = normalize_numeric_field(str(tax_breakdown.get("gst_amount")))
+        if taxable_amount is not None and 0 < taxable_amount < total_amount:
+            derived_gst = round(total_amount - taxable_amount, 2)
+            if derived_gst > 0 and (gst_amount is None or abs((taxable_amount + gst_amount) - total_amount) > 2.0):
+                tax_breakdown["gst_amount"] = derived_gst
+                tax_breakdown["gst_rate"] = round((derived_gst / taxable_amount) * 100.0, 2)
+                lowered = normalized.lower()
+                if "igst" in lowered and "cgst" not in lowered and "sgst" not in lowered:
+                    tax_breakdown["igst_amount"] = derived_gst
 
     product_name = _extract_product_name(normalized, lines, vendor)
     if line_items:

@@ -10,7 +10,6 @@ import { useGsapReveal } from '@/lib/gsap-helpers'
 import { useAuthStore } from '@/lib/store/auth-store'
 import type { UserType } from '@/lib/types'
 
-import { ThemeToggle } from './theme-toggle'
 
 interface SignupApiResponse {
   userSub?: string
@@ -305,7 +304,6 @@ export function SignupScreen() {
           </a>
         </div>
         <div className="flex-none">
-          <ThemeToggle />
         </div>
       </div>
 

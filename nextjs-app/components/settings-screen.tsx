@@ -4,36 +4,80 @@ import { useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   ArrowLeft,
-  Palette,
   Bell,
-  Shield,
-  Wifi,
-  Network,
   Download,
   Trash2,
   ChevronRight,
 } from 'lucide-react'
-import { useThemeStore } from '@/lib/store/theme-store'
+import { useAuthStore } from '@/lib/store/auth-store'
 import { useGsapReveal } from '@/lib/gsap-helpers'
 
 export function SettingsScreen() {
   const router = useRouter()
-  const { theme, setTheme } = useThemeStore()
+  const { user } = useAuthStore()
   const rootRef = useRef<HTMLDivElement>(null)
 
   // Notification preferences
   const [inApp, setInApp] = useState(true)
   const [emailNotifs, setEmailNotifs] = useState(true)
-  const [smsNotifs, setSmsNotifs] = useState(false)
   const [pushNotifs, setPushNotifs] = useState(true)
-  const [whatsapp, setWhatsapp] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
 
-  // Feature toggles
-  const [localVault, setLocalVault] = useState(false)
-  const [offlineOcr, setOfflineOcr] = useState(false)
-  const [graphAugment, setGraphAugment] = useState(true)
+  useGsapReveal(rootRef, [inApp, emailNotifs, pushNotifs, exporting, exportError])
 
-  useGsapReveal(rootRef, [theme, inApp, emailNotifs, smsNotifs, pushNotifs, whatsapp, localVault, offlineOcr, graphAugment])
+  const handleExportAllData = async () => {
+    if (!user?.userId) {
+      setExportError('Sign in to export your data.')
+      return
+    }
+    setExporting(true)
+    setExportError(null)
+    try {
+      const params = new URLSearchParams()
+      if (user.userType === 'merchant') {
+        params.set('merchantUserId', user.userId)
+      } else {
+        params.set('userId', user.userId)
+      }
+      params.set('limit', '500')
+
+      const response = await fetch(`/api/documents?${params.toString()}`, {
+        method: 'GET',
+        credentials: 'include',
+      })
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null)
+        const message = payload && typeof payload.error === 'string' ? payload.error : 'Export failed.'
+        throw new Error(message)
+      }
+      const payload = await response.json()
+      const exportPayload = {
+        exportedAt: new Date().toISOString(),
+        user: {
+          userId: user.userId,
+          userType: user.userType || 'consumer',
+          email: user.email,
+          name: user.name,
+          customId: user.customId,
+        },
+        documents: Array.isArray(payload?.documents) ? payload.documents : payload,
+      }
+      const blob = new Blob([JSON.stringify(exportPayload, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `safebill-export-${user.userId}-${new Date().toISOString().slice(0, 10)}.json`
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : 'Export failed.')
+    } finally {
+      setExporting(false)
+    }
+  }
 
   return (
     <div ref={rootRef} className="dashboard-shell">
@@ -51,30 +95,6 @@ export function SettingsScreen() {
       </div>
 
       <div className="container mx-auto px-4 py-6 max-w-2xl">
-        {/* Theme */}
-        <div data-gsap="card" className="dashboard-card mb-4 p-5">
-          <div className="gap-3">
-            <h2 className="text-base font-bold gap-2 text-slate-900 flex items-center">
-              <div className="p-1.5 rounded-lg bg-blue-50 border border-blue-100"><Palette className="w-5 h-5 text-blue-600" /></div>
-              Appearance
-            </h2>
-            <div className="form-control mt-3">
-              <label className="label">
-                <span className="label-text font-medium text-slate-700">Theme</span>
-              </label>
-              <select
-                value={theme}
-                onChange={(e) => setTheme(e.target.value as 'light' | 'dark' | 'system')}
-                className="dashboard-input"
-              >
-                <option value="light">Light</option>
-                <option value="dark">Dark</option>
-                <option value="system">System</option>
-              </select>
-            </div>
-          </div>
-        </div>
-
         {/* Notifications */}
         <div data-gsap="card" className="dashboard-card mb-4 p-5">
           <div className="gap-3">
@@ -84,52 +104,28 @@ export function SettingsScreen() {
             </h2>
             <ToggleRow label="In-app notifications" checked={inApp} onChange={setInApp} />
             <ToggleRow label="Email notifications" checked={emailNotifs} onChange={setEmailNotifs} />
-            <ToggleRow label="SMS notifications" checked={smsNotifs} onChange={setSmsNotifs} />
             <ToggleRow label="Push notifications" checked={pushNotifs} onChange={setPushNotifs} />
-            <ToggleRow label="WhatsApp notifications" checked={whatsapp} onChange={setWhatsapp} />
-          </div>
-        </div>
-
-        {/* Features */}
-        <div data-gsap="card" className="dashboard-card mb-4 p-5">
-          <div className="gap-3">
-            <h2 className="text-base font-bold gap-2 text-slate-900 flex items-center">
-              <div className="p-1.5 rounded-lg bg-blue-50 border border-blue-100"><Shield className="w-5 h-5 text-blue-600" /></div>
-              Privacy & Features
-            </h2>
-            <ToggleRow
-              label="Local-only vault"
-              hint="Keep documents only on this device"
-              checked={localVault}
-              onChange={setLocalVault}
-            />
-            <ToggleRow
-              label="Offline OCR"
-              hint="Process bills without internet"
-              checked={offlineOcr}
-              onChange={setOfflineOcr}
-              icon={<Wifi className="w-4 h-4 text-slate-500" />}
-            />
-            <ToggleRow
-              label="Graph augmentation"
-              hint="Enable knowledge graph for better AI answers"
-              checked={graphAugment}
-              onChange={setGraphAugment}
-              icon={<Network className="w-4 h-4 text-slate-500" />}
-            />
           </div>
         </div>
 
         {/* Data */}
         <div data-gsap="panel" className="dashboard-card mb-4">
           <div className="gap-1 p-0">
-            <button data-gsap-hover="lift" className="flex h-14 w-full items-center justify-between px-6 text-left text-sm font-medium text-slate-700 transition hover:bg-blue-50 rounded-t-2xl">
+            <button
+              data-gsap-hover="lift"
+              onClick={handleExportAllData}
+              disabled={exporting}
+              className="flex h-14 w-full items-center justify-between px-6 text-left text-sm font-medium text-slate-700 transition hover:bg-blue-50 rounded-t-2xl disabled:opacity-60"
+            >
               <span className="flex items-center gap-3">
                 <Download className="w-4 h-4 text-blue-600" />
-                Export all data
+                {exporting ? 'Exporting...' : 'Export all data'}
               </span>
               <ChevronRight className="w-4 h-4 text-slate-300" />
             </button>
+            {exportError ? (
+              <div className="px-6 pb-3 text-xs text-rose-600">{exportError}</div>
+            ) : null}
             <div className="my-0 border-t border-slate-100 px-6"></div>
             <button data-gsap-hover="lift" className="flex h-14 w-full items-center justify-between px-6 text-left text-sm font-medium text-red-600 transition hover:bg-red-50 rounded-b-2xl">
               <span className="flex items-center gap-3">

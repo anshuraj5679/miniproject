@@ -153,6 +153,8 @@ class Settings(BaseSettings):
     bedrock_text_mapping_enabled: bool = True
     bedrock_image_region: str = ""
     bedrock_image_model: str = "amazon.titan-image-generator-v2:0"
+    aws_anthropic_key: str = ""
+    aws_amazonnova_key: str = ""
     product_image_generation_enabled: bool = True
     product_image_width: int = 768
     product_image_height: int = 768

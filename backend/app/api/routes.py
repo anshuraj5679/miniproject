@@ -54,6 +54,7 @@ from app.models import (
     SecurityAuditLog,
 )
 from app.parsers.pdf_parser import extract_invoice_metadata
+from app.services.bedrock_client import configure_bedrock_api_key
 from app.schemas import (
     AskRequest,
     AskResponse,
@@ -1188,6 +1189,7 @@ def _build_image_ocr_diagnostics(image_bytes: bytes) -> str:
         diagnostics.append("bedrock=unconfigured (BEDROCK_CHAT_MODEL empty)")
     else:
         try:
+            configure_bedrock_api_key(settings)
             bedrock_client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
             bedrock_client.converse(
                 modelId=model,
@@ -1716,6 +1718,7 @@ def _extract_text_metadata_with_bedrock(ocr_text: str, filename: str) -> dict[st
     )
 
     try:
+        configure_bedrock_api_key(settings)
         client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
         response = client.converse(
             modelId=model,
@@ -1775,6 +1778,7 @@ def _extract_product_name_with_bedrock(ocr_text: str, filename: str) -> dict[str
     )
     user_payload = f"filename={filename}\nocr_text:\n{ocr_text[:18000]}"
     try:
+        configure_bedrock_api_key(settings)
         client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
         response = client.converse(
             modelId=model,

@@ -3,7 +3,6 @@
 import { useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { ArrowRight, Check, ScanLine, Sparkles } from 'lucide-react'
-import { ThemeToggle } from './theme-toggle'
 import { useGsapReveal } from '@/lib/gsap-helpers'
 
 export function OnboardingScreen() {
@@ -24,7 +23,6 @@ export function OnboardingScreen() {
 
         <div className="relative z-10 container mx-auto px-8 py-6">
           <div data-gsap="hero" className="flex justify-end mb-4">
-            <ThemeToggle />
           </div>
 
           <div className="max-w-2xl mx-auto">

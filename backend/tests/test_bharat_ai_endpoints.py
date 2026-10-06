@@ -22,7 +22,7 @@ class _FakeBharatAI:
             "claim_steps": ["Keep invoice safe"],
             "merchant_notes": ["No action needed"],
             "payment_references": ["UTR12345678"],
-            "model_used": "global.amazon.nova-2-lite-v1:0",
+            "model_used": "apac.anthropic.claude-3-sonnet-20240229-v1:0",
             "speech_audio_base64": None,
             "speech_content_type": None,
         }
@@ -49,7 +49,7 @@ class _FakeBharatAI:
             "support_points": [f"[{target_language_code}] Point 1"],
             "missing_information": [f"[{target_language_code}] Missing 1"],
             "confidence_note": f"[{target_language_code}] Answer limited to invoice content",
-            "model_used": "global.amazon.nova-2-lite-v1:0",
+            "model_used": "apac.anthropic.claude-3-sonnet-20240229-v1:0",
         }
 
     @staticmethod
@@ -149,7 +149,7 @@ def test_bharat_ai_ask_endpoint_returns_grounded_answer() -> None:
         assert payload["answer"] == "[hi] Grounded answer"
         assert payload["supportPoints"] == ["[hi] Point 1"]
         assert payload["missingInformation"] == ["[hi] Missing 1"]
-        assert payload["modelUsed"] == "global.amazon.nova-2-lite-v1:0"
+        assert payload["modelUsed"] == "apac.anthropic.claude-3-sonnet-20240229-v1:0"
     finally:
         app.dependency_overrides.clear()
 

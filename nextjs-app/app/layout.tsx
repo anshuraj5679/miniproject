@@ -1,7 +1,6 @@
 import './globals.css'
 import type { Metadata } from 'next'
 import { StoreHydrator } from '@/components/store-hydrator'
-import { ThemeProvider } from '@/components/theme-provider'
 import { Inter } from "next/font/google";
 import { cn } from "@/lib/utils";
 
@@ -18,12 +17,10 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" suppressHydrationWarning className={cn("font-sans", inter.variable)}>
+    <html lang="en" suppressHydrationWarning className={cn("font-sans", inter.variable)} data-theme="winter">
       <body className="font-sans">
-        <ThemeProvider>
-          <StoreHydrator />
-          {children}
-        </ThemeProvider>
+        <StoreHydrator />
+        {children}
       </body>
     </html>
   )

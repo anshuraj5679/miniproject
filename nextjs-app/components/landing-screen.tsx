@@ -30,7 +30,6 @@ import {
   Youtube,
 } from 'lucide-react'
 import Image from 'next/image'
-import { ThemeToggle } from './theme-toggle'
 import { persistClientAuthCookies, signInWithIdentifier } from '@/lib/auth-client'
 import { useAuthStore } from '@/lib/store/auth-store'
 import { useGsapReveal } from '@/lib/gsap-helpers'
@@ -518,7 +517,6 @@ export function LandingScreen() {
               >
                 Sign in to SafeBill
               </button>
-              <ThemeToggle />
             </div>
 
             <button

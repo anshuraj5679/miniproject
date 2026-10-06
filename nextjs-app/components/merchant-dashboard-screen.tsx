@@ -692,7 +692,7 @@ export function MerchantDashboardScreen() {
       if (uploadForm.vendor.trim()) formData.append('vendor', uploadForm.vendor.trim())
       if (uploadForm.purchaseDate.trim()) formData.append('purchaseDate', uploadForm.purchaseDate.trim())
       if (uploadForm.totalAmount.trim()) formData.append('totalAmount', uploadForm.totalAmount.trim())
-      formData.append('ocrMode', 'vision_only')
+      formData.append('ocrMode', 'hybrid')
 
       const response = await fetch('/api/merchant/upload', {
         method: 'POST',

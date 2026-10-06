@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 from app.core.config import get_settings
 from app.models import Document
+from app.services.bedrock_client import configure_bedrock_api_key
 from app.services.extraction_pipeline import sanitize_merchandise_name
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ class ProductImageService:
         self.aws_only_mode = settings.aws_only_mode
         self._clients: dict[str, Any | None] = {}
         if boto3 and self.enabled and self.model:
+            configure_bedrock_api_key(settings)
             client = self._client_for_region(self.preferred_region)
             if client is None and self.aws_only_mode:
                 raise RuntimeError("Bedrock runtime is unavailable for image generation.")
