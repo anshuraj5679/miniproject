@@ -2964,16 +2964,33 @@ def _persist_structured_document(
 
     fingerprint = extraction_fingerprint(metadata, extracted_text)
     duplicate_count = 0
-    if user_id:
+    scoped_user_id = str(user_id or "").strip()
+    scoped_merchant_id = str((additional_references or {}).get("merchant_user_id") or "").strip()
+    owner_field = None
+    owner_value = ""
+    if scoped_user_id:
+        owner_field = Document.references["user_id"].as_string()
+        owner_value = scoped_user_id
+    elif scoped_merchant_id:
+        owner_field = Document.references["merchant_user_id"].as_string()
+        owner_value = scoped_merchant_id
+    if owner_field is not None and owner_value:
+        duplicate_conditions: list[object] = [
+            Document.references["extraction_fingerprint"].as_string() == fingerprint,
+        ]
+        if resolved_bill_id:
+            duplicate_conditions.append(Document.bill_id == resolved_bill_id)
         duplicate_stmt = select(func.count(Document.id)).where(
-            Document.references["user_id"].as_string() == (user_id or "anonymous"),
-            or_(
-                Document.bill_id == resolved_bill_id,
-                Document.references["extraction_fingerprint"].as_string() == fingerprint,
-            ),
+            owner_field == owner_value,
+            or_(*duplicate_conditions),
         )
         duplicate_count = int(db.execute(duplicate_stmt).scalar_one_or_none() or 0)
     duplicate_flag = duplicate_count > 0
+    if duplicate_flag:
+        raise HTTPException(
+            status_code=409,
+            detail="Duplicate bill detected. This bill already exists in your locker.",
+        )
 
     references: dict[str, object] = {
         "filename": filename,
@@ -4489,6 +4506,32 @@ async def ingest_pdf(
         snapshot_references=ocr_snapshot_references,
         fallback_text=resolved_pdf_text,
     )
+    fingerprint = extraction_fingerprint(parsed_metadata, resolved_pdf_text)
+    owner_field = None
+    owner_value = ""
+    if user_id:
+        owner_field = Document.references["user_id"].as_string()
+        owner_value = user_id
+    elif merchant_user_id:
+        owner_field = Document.references["merchant_user_id"].as_string()
+        owner_value = merchant_user_id
+    if owner_field is not None and owner_value:
+        duplicate_conditions: list[object] = [
+            Document.references["extraction_fingerprint"].as_string() == fingerprint,
+        ]
+        candidate_bill = str(parsed_metadata.get("bill_id") or "").strip()
+        if candidate_bill:
+            duplicate_conditions.append(Document.bill_id == candidate_bill)
+        duplicate_stmt = select(func.count(Document.id)).where(
+            owner_field == owner_value,
+            or_(*duplicate_conditions),
+        )
+        duplicate_count = int(db.execute(duplicate_stmt).scalar_one_or_none() or 0)
+        if duplicate_count > 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Duplicate bill detected. This bill already exists in your locker.",
+            )
     has_invoice_signals = any(
         _is_meaningful_metadata_value(parsed_metadata.get(key))
         for key in ("bill_id", "vendor", "total_amount", "date")
@@ -4521,6 +4564,8 @@ async def ingest_pdf(
         references.update(ocr_snapshot_references)
     if document_type_payload:
         references.update(document_type_payload)
+    if fingerprint:
+        references["extraction_fingerprint"] = fingerprint
     if storage_references:
         references.update(storage_references)
     if user_id:
