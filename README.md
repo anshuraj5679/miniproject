@@ -2,6 +2,16 @@
 
 SafeBill is a warranty locker and invoice intelligence platform that helps consumers and merchants store bills, extract structured data, and stay ahead of warranty deadlines. The repo is a monorepo with a Next.js web app and a FastAPI backend.
 
+## Demo
+
+<div align="center">
+
+[![Watch SafeBill Demo](https://img.youtube.com/vi/zDqRoWsBW1Q/maxresdefault.jpg)](https://youtu.be/zDqRoWsBW1Q)
+
+**Click the image above to watch the demo on YouTube**
+
+</div>
+
 ## Product Snapshots
 
 ![Landing Page](nextjs-app/public/readme/Landing%20Page.png)
