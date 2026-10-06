@@ -31,7 +31,7 @@ import {
 } from 'lucide-react'
 import Image from 'next/image'
 import { ThemeToggle } from './theme-toggle'
-import { persistClientAuthCookies, signInWithCustomId } from '@/lib/auth-client'
+import { persistClientAuthCookies, signInWithIdentifier } from '@/lib/auth-client'
 import { useAuthStore } from '@/lib/store/auth-store'
 import { useGsapReveal } from '@/lib/gsap-helpers'
 import { AwsBeamSection } from './aws-beam-section'
@@ -272,7 +272,7 @@ export function LandingScreen() {
   const [isScrolled, setIsScrolled] = useState(false)
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false)
   const [userType, setUserType] = useState<UserType>('consumer')
-  const [customId, setCustomId] = useState('')
+  const [identifier, setIdentifier] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -405,8 +405,8 @@ export function LandingScreen() {
   }, [])
 
   const handleLogin = async () => {
-    if (!customId.trim() || !password.trim()) {
-      setError('Please enter your ID and password.')
+    if (!identifier.trim() || !password.trim()) {
+      setError('Please enter your login ID and password.')
       return
     }
 
@@ -414,8 +414,8 @@ export function LandingScreen() {
     setError(null)
 
     try {
-      const result = await signInWithCustomId({
-        customId,
+      const result = await signInWithIdentifier({
+        identifier,
         password,
         userType,
       })
@@ -1086,7 +1086,9 @@ export function LandingScreen() {
                     <LogIn className="h-7 w-7 text-blue-600" />
                   </div>
                   <h2 className="text-2xl font-bold text-slate-900">Sign in to SafeBill</h2>
-                  <p className="mt-1 text-sm text-slate-500">Access your locker and claim workflows</p>
+                  <p className="mt-1 text-sm text-slate-500">
+                    Access your locker and claim workflows with SafeBill ID, email, or phone
+                  </p>
                 </div>
 
                 <div className="mb-5 grid grid-cols-2 rounded-xl bg-slate-100 p-1">
@@ -1117,13 +1119,18 @@ export function LandingScreen() {
                 <div className="space-y-4">
                   <div>
                     <label className="mb-1 block text-sm font-semibold text-slate-700">
-                      {userType === 'consumer' ? 'Consumer ID' : 'Merchant ID'}
+                      {userType === 'consumer' ? 'Consumer ID, email, or phone' : 'Merchant ID, email, or phone'}
                     </label>
                     <input
                       type="text"
-                      placeholder={userType === 'consumer' ? 'e.g. CON-XXXXXX' : 'e.g. MER-XXXXXX'}
-                      value={customId}
-                      onChange={(e) => setCustomId(e.target.value)}
+                      placeholder={
+                        userType === 'consumer'
+                          ? 'CON-XXXXXX, name@email.com, or +91XXXXXXXXXX'
+                          : 'MER-XXXXXX, name@email.com, or +91XXXXXXXXXX'
+                      }
+                      value={identifier}
+                      onChange={(e) => setIdentifier(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleLogin()}
                       className="h-11 w-full rounded-xl border border-slate-300 px-3 text-slate-900 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
                     />
                   </div>
@@ -1138,6 +1145,21 @@ export function LandingScreen() {
                       onKeyDown={(e) => e.key === 'Enter' && handleLogin()}
                       className="h-11 w-full rounded-xl border border-slate-300 px-3 text-slate-900 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
                     />
+                  </div>
+
+                  <div className="flex items-center justify-between gap-3 text-sm">
+                    <button
+                      onClick={() => router.push(`/auth/recover-id?userType=${userType}`)}
+                      className="font-semibold text-blue-600 transition hover:text-blue-700"
+                    >
+                      {userType === 'merchant' ? 'Forgot Merchant ID?' : 'Forgot Consumer ID?'}
+                    </button>
+                    <button
+                      onClick={() => router.push(`/auth/forgot-password?userType=${userType}`)}
+                      className="font-semibold text-blue-600 transition hover:text-blue-700"
+                    >
+                      Forgot password?
+                    </button>
                   </div>
 
                   <button

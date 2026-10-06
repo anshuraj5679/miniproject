@@ -1,4 +1,8 @@
-import type { CognitoAuthResult } from '@/lib/cognito'
+import {
+  normalizeAuthContact,
+  parseSafeBillId,
+  type CognitoAuthResult,
+} from '@/lib/cognito'
 import type { User, UserType } from '@/lib/types'
 
 export interface LookupIdentityResponse {
@@ -16,6 +20,57 @@ export interface SignInWithCustomIdResult {
   token: string
   user: User
   userType: UserType
+}
+
+async function authenticateWithResolvedIdentity(params: {
+  username: string
+  password: string
+  userType: UserType
+  customId?: string
+  fullName?: string
+  email?: string
+  phone?: string
+}): Promise<SignInWithCustomIdResult> {
+  const authResponse = await fetch('/api/auth/cognito/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username: params.username,
+      password: params.password,
+      userType: params.userType,
+      customId: params.customId,
+      name: params.fullName || '',
+      email: params.email,
+      phone: params.phone,
+    }),
+  })
+  const authData = (await authResponse.json().catch(() => null)) as (CognitoAuthResult & { error?: string }) | null
+
+  if (!authResponse.ok || !authData?.accessToken || !authData.user?.userId) {
+    throw new Error(authData?.error || 'Login failed.')
+  }
+
+  const finalUserType = authData.user.userType === 'merchant' ? 'merchant' : params.userType
+  const sessionToken = String(authData.idToken || authData.accessToken || '').trim()
+  if (!sessionToken) {
+    throw new Error('Login succeeded but no session token was returned.')
+  }
+
+  return {
+    token: sessionToken,
+    userType: finalUserType,
+    user: {
+      userId: authData.user.userId,
+      email: authData.user.email || params.email,
+      phone: authData.user.phone || params.phone,
+      loginId: authData.user.loginId || params.username,
+      userType: finalUserType,
+      customId: authData.user.customId || params.customId,
+      name: authData.user.name || params.fullName || '',
+      picture: authData.user.picture,
+      provider: authData.user.provider,
+    },
+  }
 }
 
 export async function signInWithCustomId(params: {
@@ -36,45 +91,39 @@ export async function signInWithCustomId(params: {
   }
 
   const resolvedType = lookupData.userType === 'merchant' ? 'merchant' : 'consumer'
-  const authResponse = await fetch('/api/auth/cognito/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      username: lookupData.username,
-      password: params.password,
-      userType: resolvedType,
-      customId: lookupData.customId || normalizedCustomId,
-      name: lookupData.fullName || '',
-      email: lookupData.email,
-      phone: lookupData.phone,
-    }),
+  return authenticateWithResolvedIdentity({
+    username: lookupData.username,
+    password: params.password,
+    userType: resolvedType,
+    customId: lookupData.customId || normalizedCustomId,
+    fullName: lookupData.fullName || '',
+    email: lookupData.email,
+    phone: lookupData.phone,
   })
-  const authData = (await authResponse.json().catch(() => null)) as (CognitoAuthResult & { error?: string }) | null
+}
 
-  if (!authResponse.ok || !authData?.accessToken || !authData.user?.userId) {
-    throw new Error(authData?.error || 'Login failed.')
+export async function signInWithIdentifier(params: {
+  identifier: string
+  password: string
+  userType: UserType
+}): Promise<SignInWithCustomIdResult> {
+  const safeBillId = parseSafeBillId(params.identifier)
+  if (safeBillId) {
+    return signInWithCustomId({
+      customId: safeBillId.customId,
+      password: params.password,
+      userType: safeBillId.userType,
+    })
   }
 
-  const finalUserType = authData.user.userType === 'merchant' ? 'merchant' : resolvedType
-  const sessionToken = String(authData.idToken || authData.accessToken || '').trim()
-  if (!sessionToken) {
-    throw new Error('Login succeeded but no session token was returned.')
-  }
-  return {
-    token: sessionToken,
-    userType: finalUserType,
-    user: {
-      userId: authData.user.userId,
-      email: authData.user.email || lookupData.email,
-      phone: authData.user.phone || lookupData.phone,
-      loginId: authData.user.loginId || lookupData.username,
-      userType: finalUserType,
-      customId: authData.user.customId || lookupData.customId || normalizedCustomId,
-      name: authData.user.name || lookupData.fullName || '',
-      picture: authData.user.picture,
-      provider: authData.user.provider,
-    },
-  }
+  const contact = normalizeAuthContact(params.identifier)
+  return authenticateWithResolvedIdentity({
+    username: contact.value,
+    password: params.password,
+    userType: params.userType,
+    email: contact.email,
+    phone: contact.phone,
+  })
 }
 
 export function persistClientAuthCookies(token: string, userType: UserType) {

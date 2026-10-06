@@ -45,6 +45,10 @@ def _jwks_client(jwks_url: str):
     return PyJWKClient(jwks_url)
 
 
+def cognito_jwt_runtime_available() -> bool:
+    return jwt is not None and PyJWKClient is not None
+
+
 def _extract_user_type(claims: dict[str, Any]) -> str | None:
     cognito_custom = str(claims.get("custom:user_type") or "").strip().lower()
     if cognito_custom in {"consumer", "merchant"}:

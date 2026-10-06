@@ -13,6 +13,7 @@ export async function POST(request: NextRequest) {
   try {
     const body = (await request.json().catch(() => ({}))) as ExchangeBody
     const code = String(body.code || '').trim()
+    const requestedUserType: UserType = body.userType === 'merchant' ? 'merchant' : 'consumer'
     if (!code) {
       return NextResponse.json({ error: 'code is required' }, { status: 400 })
     }
@@ -62,7 +63,7 @@ export async function POST(request: NextRequest) {
     }
 
     const claims = decodeJwtPayload(idToken)
-    const user = extractAuthUserFromClaims(claims)
+    const user = extractAuthUserFromClaims(claims, { userType: requestedUserType })
 
     return NextResponse.json({
       accessToken,

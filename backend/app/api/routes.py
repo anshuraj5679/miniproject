@@ -578,6 +578,32 @@ def _list_cognito_users_by_custom_id(
     return matched
 
 
+def _list_cognito_users_by_attribute(
+    *,
+    client: object,
+    user_pool_id: str,
+    attribute_name: str,
+    attribute_value: str,
+    limit: int = 20,
+) -> list[dict[str, object]]:
+    escaped = str(attribute_value or "").replace('"', '\\"')
+    if not escaped:
+        return []
+    try:
+        response = client.list_users(
+            UserPoolId=user_pool_id,
+            Filter=f'{attribute_name} = "{escaped}"',
+            Limit=max(1, min(limit, 60)),
+        )
+    except Exception:
+        return []
+
+    users = response.get("Users", [])
+    if not isinstance(users, list):
+        return []
+    return [user for user in users if isinstance(user, dict)]
+
+
 def _user_type_from_custom_id(custom_id: str) -> str | None:
     normalized = str(custom_id or "").strip().upper()
     if normalized.startswith("MER-"):
@@ -800,6 +826,96 @@ def lookup_user_by_custom_id(payload: dict[str, object]) -> dict[str, object]:
         }
 
     raise HTTPException(status_code=404, detail="Account not found")
+
+
+@router.post("/auth/recover-id")
+def recover_custom_id_via_email(payload: dict[str, object]) -> dict[str, object]:
+    settings = get_settings()
+    email = str(payload.get("email") or payload.get("identifier") or "").strip().lower()
+    requested_type = str(payload.get("userType") or "").strip().lower()
+    account_label = "Merchant ID" if requested_type == "merchant" else "Consumer ID"
+
+    if "@" not in email or requested_type not in {"consumer", "merchant"}:
+        raise HTTPException(status_code=400, detail="email and valid userType are required")
+
+    generic_response = {
+        "ok": True,
+        "deliveryDestination": email,
+        "deliveryMedium": "EMAIL",
+        "message": f"If an account exists, your {account_label} has been emailed.",
+    }
+
+    if not settings.cognito_user_pool_id:
+        raise HTTPException(status_code=500, detail="COGNITO_USER_POOL_ID is not configured")
+    if boto3 is None:
+        raise HTTPException(status_code=500, detail="boto3 dependency is unavailable")
+
+    try:
+        client = boto3.client("cognito-idp", region_name=settings.aws_region)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to initialize Cognito client: {exc}") from exc
+
+    try:
+        users = _list_cognito_users_by_attribute(
+            client=client,
+            user_pool_id=settings.cognito_user_pool_id,
+            attribute_name="email",
+            attribute_value=email,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Cognito lookup failed: {exc}") from exc
+
+    matched_user: dict[str, object] | None = None
+    resolved_custom_id = ""
+    full_name = ""
+
+    for user in users:
+        attrs = _cognito_attr_map(user)
+        resolved_email = str(attrs.get("email") or "").strip().lower()
+        resolved_custom_id = str(
+            attrs.get("custom:custom_id") or attrs.get("preferred_username") or ""
+        ).strip().upper()
+        if not resolved_email or resolved_email != email or not resolved_custom_id:
+            continue
+
+        discovered_type = str(attrs.get("custom:user_type") or "").strip().lower()
+        if discovered_type not in {"consumer", "merchant"}:
+            discovered_type = _user_type_from_custom_id(resolved_custom_id) or ""
+        if discovered_type != requested_type:
+            continue
+
+        matched_user = user
+        full_name = str(attrs.get("name") or attrs.get("given_name") or "").strip()
+        break
+
+    if matched_user is None or not resolved_custom_id:
+        return generic_response
+
+    salutation = full_name or ("Merchant" if requested_type == "merchant" else "Consumer")
+    subject = f"Your SafeBill {account_label}"
+    body = "\n".join(
+        [
+            f"Hello {salutation},",
+            "",
+            f"Your SafeBill {account_label} is: {resolved_custom_id}",
+            "",
+            "Use this ID with your password to sign in to SafeBill.",
+            "If you did not request this email, you can ignore it.",
+            "",
+            "SafeBill",
+        ]
+    )
+
+    try:
+        _notification_service._send_email(
+            recipient_email=email,
+            subject=subject,
+            body=body,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to send recovery email: {exc}") from exc
+
+    return generic_response
 
 
 @router.post("/auth/cognito/login")

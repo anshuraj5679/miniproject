@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.dependencies import get_services
 from app.api.routes import process_pending_async_extraction_jobs, router
 from app.core.config import get_settings
+from app.core.security import cognito_jwt_runtime_available
 from app.core.database import SessionLocal
 from app.services.notifications import NotificationService
 
@@ -71,6 +72,13 @@ def _validate_aws_only_configuration() -> None:
         raise RuntimeError(
             "AWS-only mode requires TEXTRACT_PROXY_URL to be an AWS endpoint (amazonaws.com), "
             "or leave it empty to use direct AWS Textract."
+        )
+
+    auth_provider = str(settings.auth_provider or "").strip().lower()
+    if auth_provider in {"cognito", "aws_cognito"} and not cognito_jwt_runtime_available():
+        raise RuntimeError(
+            "Cognito auth requires PyJWT[crypto] in the active Python runtime. "
+            "Install backend requirements before starting the API."
         )
 
 

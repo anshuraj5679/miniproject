@@ -140,6 +140,18 @@ function inferUserTypeFromValue(value: string | undefined): UserType | undefined
   return undefined
 }
 
+export function parseSafeBillId(value: string): { customId: string; userType: UserType } | null {
+  const normalized = value.trim().toUpperCase()
+  if (!/^(CON|MER)-[A-Z0-9]{4,}$/.test(normalized)) {
+    return null
+  }
+
+  return {
+    customId: normalized,
+    userType: normalized.startsWith('MER-') ? 'merchant' : 'consumer',
+  }
+}
+
 export function normalizeEmailAddress(value: string): string {
   return value.trim().toLowerCase()
 }

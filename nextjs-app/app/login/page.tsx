@@ -4,7 +4,7 @@ import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { LogIn, ShieldCheck } from 'lucide-react'
 
-import { persistClientAuthCookies, signInWithCustomId } from '@/lib/auth-client'
+import { persistClientAuthCookies, signInWithIdentifier } from '@/lib/auth-client'
 import { useAuthStore } from '@/lib/store/auth-store'
 import type { UserType } from '@/lib/types'
 
@@ -12,14 +12,14 @@ export default function LoginPage() {
   const router = useRouter()
   const { setAuth } = useAuthStore()
   const [userType, setUserType] = useState<UserType>('consumer')
-  const [customId, setCustomId] = useState('')
+  const [identifier, setIdentifier] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const handleLogin = async () => {
-    if (!customId.trim() || !password.trim()) {
-      setError('Please enter your ID and password.')
+    if (!identifier.trim() || !password.trim()) {
+      setError('Please enter your login ID and password.')
       return
     }
 
@@ -27,8 +27,8 @@ export default function LoginPage() {
     setError(null)
 
     try {
-      const result = await signInWithCustomId({
-        customId,
+      const result = await signInWithIdentifier({
+        identifier,
         password,
         userType,
       })
@@ -60,7 +60,9 @@ export default function LoginPage() {
                 <LogIn className="w-8 h-8 text-primary" />
               </div>
               <h2 className="text-2xl font-bold">Welcome back</h2>
-              <p className="text-sm text-base-content/60 mt-1">Sign in with your SafeBill ID and password</p>
+              <p className="text-sm text-base-content/60 mt-1">
+                Sign in with your SafeBill ID, email, or phone and password
+              </p>
             </div>
 
             <div className="tabs tabs-boxed bg-base-200 p-1">
@@ -94,14 +96,18 @@ export default function LoginPage() {
               <div className="form-control">
                 <label className="label">
                   <span className="label-text font-medium text-base-content/80">
-                    {userType === 'consumer' ? 'Consumer ID' : 'Merchant ID'}
+                    {userType === 'consumer' ? 'Consumer ID, email, or phone' : 'Merchant ID, email, or phone'}
                   </span>
                 </label>
                 <input
                   type="text"
-                  placeholder={userType === 'consumer' ? 'e.g. CON-7C93F1A2' : 'e.g. MER-4B8D1C7E'}
-                  value={customId}
-                  onChange={(event) => setCustomId(event.target.value)}
+                  placeholder={
+                    userType === 'consumer'
+                      ? 'e.g. CON-7C93F1A2, name@email.com, or +91XXXXXXXXXX'
+                      : 'e.g. MER-4B8D1C7E, name@email.com, or +91XXXXXXXXXX'
+                  }
+                  value={identifier}
+                  onChange={(event) => setIdentifier(event.target.value)}
                   className="input input-bordered w-full focus:input-primary bg-base-50"
                   onKeyDown={(event) => event.key === 'Enter' && handleLogin()}
                 />
@@ -119,6 +125,21 @@ export default function LoginPage() {
                   onKeyDown={(event) => event.key === 'Enter' && handleLogin()}
                   className="input input-bordered w-full focus:input-primary bg-base-50"
                 />
+              </div>
+
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <button
+                  onClick={() => router.push(`/auth/recover-id?userType=${userType}`)}
+                  className="link link-primary font-medium"
+                >
+                  {userType === 'merchant' ? 'Forgot Merchant ID?' : 'Forgot Consumer ID?'}
+                </button>
+                <button
+                  onClick={() => router.push(`/auth/forgot-password?userType=${userType}`)}
+                  className="link link-primary font-medium"
+                >
+                  Forgot password?
+                </button>
               </div>
 
               <button
