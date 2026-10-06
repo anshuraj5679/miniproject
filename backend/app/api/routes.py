@@ -1658,6 +1658,79 @@ def _extract_image_metadata_with_bedrock(image_bytes: bytes, filename: str) -> d
     return _normalize_invoice_metadata(parsed)
 
 
+def _extract_text_metadata_with_bedrock(ocr_text: str, filename: str) -> dict[str, object]:
+    settings = get_settings()
+    if not ocr_text:
+        return {}
+    if boto3 is None:
+        return {}
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return {}
+    if not bool(getattr(settings, "bedrock_text_mapping_enabled", False)):
+        return {}
+
+    model = (settings.bedrock_chat_model or "").strip()
+    if not model:
+        return {}
+
+    system_prompt = (
+        "You are an invoice data extraction engine. "
+        "Return only JSON. Do not guess missing values. Use null for missing fields. "
+        "Dates must be ISO 8601 format (YYYY-MM-DD). Convert from formats like 10-Feb-2026 if present. "
+        "Only set monetary fields when they are explicitly shown as money (currency symbol/code or labels like TOTAL/AMOUNT/MRP/PRICE). "
+        "Never treat product dimensions (e.g., '42-inch'), model numbers, serial numbers, warranty months, phone numbers, or addresses as amounts. "
+        "Extract these keys exactly: "
+        "bill_id, vendor, date, total_amount, vendor_tax_id, taxable_amount, gst_amount, gst_rate, "
+        "cgst_amount, sgst_amount, igst_amount, product_name, brand, serial_number, warranty_months, "
+        "warranty_start, warranty_end, category, line_items. "
+        "For line_items, return an array of objects with keys: name, quantity, unit_price, amount."
+    )
+    user_prompt = (
+        "Extract invoice fields from this OCR text. "
+        "Keep original invoice number formatting and correct decimal amounts. "
+        "If multiple totals appear, prefer grand total/final total."
+    )
+    user_payload = (
+        f"filename={filename}\n"
+        "ocr_text:\n"
+        f"{ocr_text[:18000]}"
+    )
+
+    try:
+        client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+        response = client.converse(
+            modelId=model,
+            system=[{"text": system_prompt}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"text": f"{user_prompt}\n\n{user_payload}"}],
+                }
+            ],
+            inferenceConfig={"temperature": 0.0, "maxTokens": 1000},
+        )
+        content_blocks = (
+            response.get("output", {})
+            .get("message", {})
+            .get("content", [])
+        )
+        raw_content = "".join(
+            str(block.get("text", ""))
+            for block in content_blocks
+            if isinstance(block, dict)
+        ).strip()
+        if not raw_content:
+            return {}
+        if raw_content.startswith("```"):
+            raw_content = raw_content.strip("`")
+            raw_content = raw_content.replace("json\n", "", 1).strip()
+        parsed = json.loads(raw_content)
+    except Exception:
+        return {}
+
+    return _normalize_invoice_metadata(parsed)
+
+
 def _extract_text_with_textract(image_bytes: bytes) -> str:
     settings = get_settings()
     if not image_bytes or boto3 is None:
@@ -2011,6 +2084,28 @@ def _run_image_extraction_router(
                 }
             )
 
+        text_for_mapping = google_text or supplied_text
+        if text_for_mapping and bool(getattr(settings, "bedrock_text_mapping_enabled", True)):
+            bedrock_text_metadata = ensure_strict_extraction(
+                _extract_text_metadata_with_bedrock(text_for_mapping, filename)
+            )
+            if any(
+                _is_meaningful_metadata_value(bedrock_text_metadata.get(key))
+                for key in ("bill_id", "vendor", "total_amount", "date")
+            ):
+                engine_results.append(
+                    {
+                        "engine": "aws_bedrock_text",
+                        "metadata": bedrock_text_metadata,
+                        "text": text_for_mapping,
+                        "field_confidences": compute_field_confidences(
+                            metadata=bedrock_text_metadata,
+                            engine="aws_bedrock_text",
+                            text_quality=estimate_text_quality(text_for_mapping),
+                        ),
+                    }
+                )
+
         needs_bedrock_fast_fallback = google_fast_mode and (
             _looks_like_ui_screenshot(supplied_text or google_text)
             or (not supplied_has_invoice_signals and not google_has_invoice_signals)
@@ -2106,6 +2201,7 @@ def _run_image_extraction_router(
     )
     grounded_engine_names = {
         "google_vision",
+        "aws_bedrock_text",
         "aws_textract",
         "aws_textract_proxy",
         "tesseract_regex",
@@ -4139,7 +4235,7 @@ async def ingest_image(
         for key in ("bill_id", "vendor", "total_amount", "date")
     )
     has_strong_invoice_engine = any(
-        name in {"google_vision", "aws_bedrock_vision", "aws_textract", "aws_textract_proxy", "manual_override"}
+        name in {"google_vision", "aws_bedrock_text", "aws_bedrock_vision", "aws_textract", "aws_textract_proxy", "manual_override"}
         for name in engines_used
     )
     if _looks_like_ui_screenshot(resolved_ocr_text) and not has_strong_invoice_engine:

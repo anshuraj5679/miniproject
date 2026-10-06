@@ -149,7 +149,8 @@ class Settings(BaseSettings):
     cognito_app_client_id: str = ""
     cognito_jwt_issuer: str = ""
     cognito_jwt_audience: str = ""
-    bedrock_chat_model: str = "global.amazon.nova-2-lite-v1:0"
+    bedrock_chat_model: str = "apac.anthropic.claude-3-sonnet-20240229-v1:0"
+    bedrock_text_mapping_enabled: bool = True
     bedrock_image_region: str = ""
     bedrock_image_model: str = "amazon.titan-image-generator-v2:0"
     product_image_generation_enabled: bool = True
