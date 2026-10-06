@@ -320,6 +320,11 @@ def _enforce_document_text_classification(
         snapshot_references=snapshot_references,
         fallback_text=fallback_text,
     )
+    if _looks_like_safebill_ui(ocr_text) or _looks_like_ui_screenshot(ocr_text):
+        raise HTTPException(
+            status_code=422,
+            detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+        )
     if not classification:
         heuristic_is_invoice, heuristic_confidence = _heuristic_is_invoice_document(ocr_text)
         if not heuristic_is_invoice and heuristic_confidence >= 0.8:
@@ -2778,6 +2783,11 @@ def _persist_structured_document(
             total_amount=total_amount,
         )
     )
+    if source in {"image_ocr", "image_ocr_router", "image_ocr_async"} and _metadata_looks_like_ui(metadata):
+        raise HTTPException(
+            status_code=422,
+            detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+        )
 
     fallback_bill = f"{source.upper()}-{int(time.time() * 1000)}"
     resolved_bill_id = str(metadata.get("bill_id") or fallback_bill)[:128]
