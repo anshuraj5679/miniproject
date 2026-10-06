@@ -1219,6 +1219,135 @@ def _looks_like_ui_screenshot(text: str) -> bool:
     return hits >= 2
 
 
+def _heuristic_is_invoice_document(text: str) -> tuple[bool, float]:
+    cleaned = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    if not cleaned:
+        return False, 0.3
+    if len(cleaned) < 30:
+        return False, 0.4
+
+    strong_tokens = (
+        "invoice",
+        "tax invoice",
+        "bill of supply",
+        "cash memo",
+        "receipt",
+        "gstin",
+        "gst",
+        "cgst",
+        "sgst",
+        "igst",
+        "hsn",
+        "pan",
+        "invoice no",
+        "invoice number",
+        "bill no",
+        "order number",
+        "total amount",
+        "grand total",
+        "amount due",
+        "bill to",
+        "ship to",
+        "place of supply",
+        "warranty",
+        "guarantee",
+        "warranty card",
+        "guarantee card",
+    )
+    hits = sum(1 for token in strong_tokens if token in cleaned)
+
+    if "warranty" in cleaned or "guarantee" in cleaned:
+        return True, 0.7 if hits >= 1 else 0.6
+    if hits >= 3:
+        return True, 0.75
+    if hits >= 2 and len(cleaned) >= 120:
+        return True, 0.6
+
+    if hits == 0 and len(cleaned) >= 120:
+        return False, 0.8
+    if hits == 0 and len(cleaned) >= 80:
+        return False, 0.7
+    return False, 0.5
+
+
+def _classify_document_with_bedrock(ocr_text: str, filename: str) -> dict[str, object]:
+    settings = get_settings()
+    if not ocr_text:
+        return {}
+    if boto3 is None:
+        return {}
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return {}
+
+    model = (settings.bedrock_chat_model or "").strip()
+    if not model:
+        return {}
+
+    system_prompt = (
+        "You are a document classifier for SafeBill. "
+        "Decide whether the text represents a bill/invoice/receipt or a warranty/guarantee card. "
+        "Return only JSON with keys: is_invoice (boolean), document_type (string), confidence (0-1), reason (short). "
+        "Acceptable document_type values: invoice, receipt, warranty_card, guarantee_card, other. "
+        "If evidence is weak or unclear, set is_invoice to false with low confidence."
+    )
+    user_payload = f"filename={filename}\nocr_text:\n{ocr_text[:16000]}"
+
+    try:
+        configure_bedrock_api_key(settings)
+        client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+        response = client.converse(
+            modelId=model,
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_payload}]}],
+            inferenceConfig={"temperature": 0.0, "maxTokens": 300},
+        )
+        content_blocks = (
+            response.get("output", {})
+            .get("message", {})
+            .get("content", [])
+        )
+        raw_content = "".join(
+            str(block.get("text", ""))
+            for block in content_blocks
+            if isinstance(block, dict)
+        ).strip()
+        if not raw_content:
+            return {}
+        if raw_content.startswith("```"):
+            raw_content = raw_content.strip("`")
+            raw_content = raw_content.replace("json\n", "", 1).strip()
+        parsed = json.loads(raw_content)
+    except Exception:
+        return {}
+
+    if not isinstance(parsed, dict):
+        return {}
+
+    raw_is_invoice = parsed.get("is_invoice")
+    is_invoice: bool | None = None
+    if isinstance(raw_is_invoice, bool):
+        is_invoice = raw_is_invoice
+    elif isinstance(raw_is_invoice, str):
+        lowered = raw_is_invoice.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            is_invoice = True
+        elif lowered in {"false", "0", "no", "n"}:
+            is_invoice = False
+
+    confidence = _coerce_float(parsed.get("confidence"), default=0.0) or 0.0
+    if confidence < 0:
+        confidence = 0.0
+    if confidence > 1:
+        confidence = 1.0
+
+    return {
+        "is_invoice": is_invoice,
+        "document_type": str(parsed.get("document_type") or "").strip() or None,
+        "confidence": confidence,
+        "reason": str(parsed.get("reason") or "").strip() or None,
+    }
+
+
 def _is_meaningful_metadata_value(value: object) -> bool:
     if value is None:
         return False
@@ -4346,6 +4475,23 @@ async def ingest_image(
                 "Upload the actual invoice photo/PDF."
             ),
         )
+
+    if not has_invoice_signals:
+        classification = _classify_document_with_bedrock(resolved_ocr_text, filename)
+        doc_is_invoice = classification.get("is_invoice") if classification else None
+        doc_confidence = _coerce_float(classification.get("confidence"), default=0.0) if classification else 0.0
+        if doc_is_invoice is False and doc_confidence >= 0.75:
+            raise HTTPException(
+                status_code=422,
+                detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+            )
+        if doc_is_invoice is None or doc_is_invoice is False:
+            heuristic_is_invoice, heuristic_confidence = _heuristic_is_invoice_document(resolved_ocr_text)
+            if not heuristic_is_invoice and heuristic_confidence >= 0.75:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+                )
     if not has_invoice_signals:
         raise HTTPException(
             status_code=422,
