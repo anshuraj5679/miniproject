@@ -473,4 +473,5 @@ Backend deployment requirements:
 
 - A Postgres database with pgvector + extensions
 - Environment variables from `backend/.env.example`
-- Run both the FastAPI app and the notification worker
+- If you enable outbound notifications (email/SMS/push/WhatsApp), run the notification worker (`python -m scripts.notification_worker`).
+- Alternatively, the API will run an in-process due-job loop when outbound channels are enabled; set `DISABLE_IN_APP_NOTIFICATION_WORKER=true` to force external worker-only mode.

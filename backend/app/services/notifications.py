@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import smtplib
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -27,6 +28,8 @@ from app.models import (
     NotificationPreference,
 )
 from app.services.date_utils import add_months
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEZONE = timezone.utc
 IN_APP_PLACEHOLDER_EMAIL = "in-app@local"
@@ -1266,6 +1269,14 @@ class NotificationService:
                 latency_ms = int((perf_counter() - started_at) * 1000)
                 job.retry_count = int(job.retry_count or 0) + 1
                 job.last_error = error_text[:1000]
+                logger.warning(
+                    "notification_job_failed job_id=%s channel=%s event_type=%s attempt=%s error=%s",
+                    str(job.id),
+                    str(job.channel),
+                    str(job.event_type or ""),
+                    attempt_number,
+                    error_text[:240],
+                )
                 if job.retry_count >= max_retries:
                     job.status = STATUS_DEAD_LETTER
                     dead_lettered += 1

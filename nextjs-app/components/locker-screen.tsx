@@ -278,7 +278,7 @@ export function LockerScreen() {
             </div>
             <div className="flex-1 min-w-0">
               <p className="text-sm font-bold truncate">{user?.name || 'User'}</p>
-              <p className="text-xs text-base-content/50 truncate">{user?.email}</p>
+              <p className="text-xs text-base-content/50 truncate">{user?.customId || user?.email}</p>
             </div>
           </div>
         </div>
@@ -495,6 +495,15 @@ export function LockerScreen() {
               <button onClick={() => setSidebarOpen(false)} className="btn btn-circle btn-sm btn-ghost">
                 <X className="w-5 h-5" />
               </button>
+            </div>
+            <div className="mb-6 p-4 rounded-xl bg-base-200/50 border border-base-200 flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-neutral text-neutral-content flex items-center justify-center font-bold text-sm">
+                {user?.name?.[0]?.toUpperCase() || 'U'}
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-bold truncate">{user?.name || 'User'}</p>
+                <p className="text-xs text-base-content/50 truncate">{user?.customId || user?.email}</p>
+              </div>
             </div>
             <nav className="flex-1 space-y-2">
               <SidebarItem icon={LayoutDashboard} label="Dashboard" active onClick={() => router.push('/locker')} />
