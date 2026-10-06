@@ -23,7 +23,6 @@ CREATE TABLE IF NOT EXISTS chunks (
     summary TEXT NOT NULL DEFAULT '',
     keywords TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     hypothetical_questions TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-    embedding_vector VECTOR(3072),
     metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     tsv tsvector,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

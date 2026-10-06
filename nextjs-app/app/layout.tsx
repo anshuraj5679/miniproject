@@ -1,13 +1,7 @@
 import './globals.css'
 import type { Metadata } from 'next'
-import { Inter } from 'next/font/google'
+import { StoreHydrator } from '@/components/store-hydrator'
 import { ThemeProvider } from '@/components/theme-provider'
-
-const inter = Inter({
-  subsets: ['latin'],
-  variable: '--font-inter',
-  display: 'swap',
-})
 
 export const metadata: Metadata = {
   title: 'SafeBill | Smart Warranty Vault',
@@ -21,8 +15,11 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className={`${inter.variable} font-sans`}>
-        <ThemeProvider>{children}</ThemeProvider>
+      <body className="font-sans">
+        <ThemeProvider>
+          <StoreHydrator />
+          {children}
+        </ThemeProvider>
       </body>
     </html>
   )

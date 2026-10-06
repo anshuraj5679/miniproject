@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vision OCR Service</title>
+    <style>
+      :root {
+        --bg: #0f172a;
+        --panel: #111827;
+        --panel-2: #1f2937;
+        --text: #e5e7eb;
+        --muted: #94a3b8;
+        --accent: #38bdf8;
+        --ok: #22c55e;
+        --err: #ef4444;
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", Tahoma, sans-serif;
+        background: radial-gradient(circle at top right, #1d4ed8 0%, var(--bg) 45%);
+        color: var(--text);
+      }
+
+      .wrap {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+
+      .card {
+        background: linear-gradient(180deg, rgba(31, 41, 55, 0.92), rgba(17, 24, 39, 0.96));
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        border-radius: 14px;
+        padding: 18px;
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: 1.4rem;
+      }
+
+      p { color: var(--muted); margin: 0 0 16px; }
+
+      .row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+
+      input[type="file"] {
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid rgba(148, 163, 184, 0.3);
+        border-radius: 10px;
+        padding: 10px;
+      }
+
+      button {
+        background: var(--accent);
+        color: #0f172a;
+        border: none;
+        border-radius: 10px;
+        padding: 11px 16px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+
+      .status {
+        margin-top: 10px;
+        min-height: 20px;
+        color: var(--muted);
+      }
+
+      .status.ok { color: var(--ok); }
+      .status.err { color: var(--err); }
+
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 14px;
+        margin-top: 16px;
+      }
+
+      @media (min-width: 900px) {
+        .grid { grid-template-columns: 1fr 1.4fr; }
+      }
+
+      .box {
+        background: rgba(17, 24, 39, 0.85);
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        border-radius: 12px;
+        padding: 12px;
+      }
+
+      .box h2 {
+        margin: 0 0 10px;
+        font-size: 1rem;
+      }
+
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: #d1d5db;
+        line-height: 1.35;
+        font-size: 0.9rem;
+        max-height: 480px;
+        overflow: auto;
+      }
+
+      .kv {
+        display: grid;
+        grid-template-columns: 160px 1fr;
+        gap: 8px;
+        font-size: 0.95rem;
+      }
+
+      .k { color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      <section class="card">
+        <h1>Google Vision OCR Service</h1>
+        <p>Upload an invoice image/PDF and get OCR text + extracted fields.</p>
+        <div class="row">
+          <input id="file" type="file" accept=".pdf,image/*" />
+          <button id="run">Run OCR</button>
+        </div>
+        <div id="status" class="status"></div>
+      </section>
+
+      <section class="grid">
+        <div class="box">
+          <h2>Extracted Fields</h2>
+          <div id="fields" class="kv"></div>
+        </div>
+        <div class="box">
+          <h2>OCR Text</h2>
+          <pre id="text">No OCR run yet.</pre>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const fileInput = document.getElementById("file");
+      const runBtn = document.getElementById("run");
+      const statusEl = document.getElementById("status");
+      const textEl = document.getElementById("text");
+      const fieldsEl = document.getElementById("fields");
+
+      function setStatus(message, kind) {
+        statusEl.textContent = message;
+        statusEl.className = `status ${kind || ""}`.trim();
+      }
+
+      function renderFields(fields) {
+        const entries = Object.entries(fields || {});
+        if (!entries.length) {
+          fieldsEl.innerHTML = "<div class='k'>No fields found</div><div>-</div>";
+          return;
+        }
+        fieldsEl.innerHTML = entries
+          .map(([key, value]) => {
+            const display = value === null || value === undefined || value === "" ? "-" : String(value);
+            return `<div class="k">${key}</div><div>${display}</div>`;
+          })
+          .join("");
+      }
+
+      runBtn.addEventListener("click", async () => {
+        const file = fileInput.files?.[0];
+        if (!file) {
+          setStatus("Choose a file first.", "err");
+          return;
+        }
+
+        runBtn.disabled = true;
+        setStatus("Running OCR...", "");
+        textEl.textContent = "";
+        fieldsEl.innerHTML = "";
+
+        try {
+          const form = new FormData();
+          form.append("file", file);
+
+          const response = await fetch("/api/ocr", {
+            method: "POST",
+            body: form,
+          });
+
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok || !payload.ok) {
+            throw new Error(payload.error || `Request failed (${response.status})`);
+          }
+
+          setStatus(`Done. ${payload.pages} page(s) processed.`, "ok");
+          textEl.textContent = payload.fullText || "No text detected.";
+          renderFields(payload.fields || {});
+        } catch (error) {
+          setStatus(error.message || "OCR failed.", "err");
+          textEl.textContent = "No output.";
+          renderFields({});
+        } finally {
+          runBtn.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

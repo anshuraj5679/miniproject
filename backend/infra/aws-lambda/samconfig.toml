@@ -1,0 +1,16 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "sam-app"
+resolve_s3 = true
+s3_prefix = "sam-app"
+region = "us-east-1"
+profile = "safe33"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = false
+parameter_overrides = "AppName=\"safebill-backend\" StageName=\"prod\" PythonRuntime=\"python3.12\" LambdaMemorySize=\"1024\" LambdaTimeout=\"30\" CorsAllowedOrigins=\"http://localhost:3000\" DocumentsBucketName=\"\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

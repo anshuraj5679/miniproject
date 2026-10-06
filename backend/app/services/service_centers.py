@@ -10,14 +10,22 @@ from typing import Any
 from urllib.parse import quote_plus
 
 import httpx
+import requests
+
+try:
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from google.oauth2 import service_account
+except Exception:  # pragma: no cover - optional runtime dependency
+    GoogleAuthRequest = None  # type: ignore[assignment]
+    service_account = None  # type: ignore[assignment]
 
 
 @dataclass
 class ServiceCenterCandidate:
     name: str
     address: str
-    latitude: float
-    longitude: float
+    latitude: float | None
+    longitude: float | None
     distance_km: float | None
     source: str = "brand_directory"
     confidence: str = "verified"
@@ -31,7 +39,7 @@ class ServiceCenterCandidate:
 
 
 class ServiceCenterLocator:
-    GOOGLE_TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    GOOGLE_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
     NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
     OVERPASS_URLS = (
         "https://overpass.kumi.systems/api/interpreter",
@@ -60,9 +68,94 @@ class ServiceCenterLocator:
     INVALID_COMPANY_TOKENS = {"", "unknown", "unknown_vendor", "service center", "service centre"}
     SOURCE_PRIORITY = {
         "brand_directory": 0,
-        "openstreetmap_overpass": 1,
-        "google_maps": 2,
-        "openstreetmap_nominatim": 3,
+        "official_support": 1,
+        "openstreetmap_overpass": 2,
+        "google_maps": 3,
+        "openstreetmap_nominatim": 4,
+    }
+    CORPORATE_SUFFIX_TOKENS = {
+        "inc",
+        "inc.",
+        "corp",
+        "corp.",
+        "corporation",
+        "company",
+        "co",
+        "co.",
+        "ltd",
+        "ltd.",
+        "limited",
+        "private",
+        "pvt",
+        "pvt.",
+        "llc",
+        "llp",
+        "plc",
+    }
+    BRAND_DESCRIPTOR_TOKENS = {
+        "india",
+        "electronics",
+        "electronic",
+        "appliances",
+        "appliance",
+        "technology",
+        "technologies",
+        "digital",
+        "devices",
+        "device",
+        "systems",
+        "system",
+        "retail",
+        "store",
+        "stores",
+        "care",
+    }
+    OFFICIAL_SUPPORT_LINKS: dict[str, dict[str, str | None]] = {
+        "apple": {
+            "name": "Apple Support",
+            "website": "https://support.apple.com/en-in/repair",
+            "phone": None,
+        },
+        "samsung": {
+            "name": "Samsung Support",
+            "website": "https://www.samsung.com/in/support/service-center/",
+            "phone": "+91-1800-40-7267864",
+        },
+        "lg": {
+            "name": "LG Support",
+            "website": "https://www.lg.com/in/support/repair-warranty",
+            "phone": "+91-1800-315-9999",
+        },
+        "sony": {
+            "name": "Sony Support",
+            "website": "https://www.sony.co.in/electronics/support",
+            "phone": None,
+        },
+        "xiaomi": {
+            "name": "Xiaomi Support",
+            "website": "https://www.mi.com/in/service/repair/",
+            "phone": None,
+        },
+        "oneplus": {
+            "name": "OnePlus Support",
+            "website": "https://www.oneplus.in/support",
+            "phone": None,
+        },
+        "dell": {
+            "name": "Dell Support",
+            "website": "https://www.dell.com/support/home/en-in",
+            "phone": None,
+        },
+        "hp": {
+            "name": "HP Support",
+            "website": "https://support.hp.com/in-en",
+            "phone": None,
+        },
+        "lenovo": {
+            "name": "Lenovo Support",
+            "website": "https://support.lenovo.com/in/en/repair-status",
+            "phone": None,
+        },
     }
     SERVICE_SIGNAL = re.compile(r"\b(service|centre|center|repair|support|care|authorized|authorised)\b", re.I)
     PINCODE_SIGNAL = re.compile(r"\b([1-9][0-9]{5})\b")
@@ -138,11 +231,17 @@ class ServiceCenterLocator:
         google_maps_api_key: str | None = None,
         *,
         enable_google_lookup: bool = False,
+        live_lookup_enabled: bool = False,
+        google_credentials_file: str | None = None,
+        google_oauth_scope: str | None = None,
         directory_path: str | None = None,
         directory_entries: list[dict[str, Any]] | None = None,
     ) -> None:
         self.google_maps_api_key = (google_maps_api_key or "").strip()
-        self.enable_google_lookup = bool(enable_google_lookup and self.google_maps_api_key)
+        self.google_credentials_file = (google_credentials_file or "").strip()
+        self.google_oauth_scope = (google_oauth_scope or "").strip() or "https://www.googleapis.com/auth/cloud-platform"
+        self.live_lookup_enabled = bool(live_lookup_enabled)
+        self.enable_google_lookup = bool(enable_google_lookup and (self.google_maps_api_key or self.google_credentials_file))
         self.directory_entries = (
             self._load_directory_entries(directory_path=directory_path)
             if directory_entries is None
@@ -163,10 +262,71 @@ class ServiceCenterLocator:
         cleaned = re.sub(r"\s+", " ", value).strip(" ,.-:!?")
         if not cleaned:
             return None
+        cleaned = re.sub(r"(?i)^\s*the\s+", "", cleaned).strip()
+        tokens = [token for token in cleaned.split(" ") if token]
+        while len(tokens) > 1:
+            tail = tokens[-1].strip(".,").lower()
+            if tail in cls.CORPORATE_SUFFIX_TOKENS or tail in cls.BRAND_DESCRIPTOR_TOKENS or tail == "of":
+                tokens.pop()
+                continue
+            break
+        if tokens:
+            cleaned = " ".join(tokens).strip(" ,.-:!?")
+        if not cleaned:
+            return None
         lowered = cleaned.lower()
         if lowered in cls.INVALID_COMPANY_TOKENS:
             return None
         return cleaned[:120]
+
+    @staticmethod
+    def _maps_search_url(query: str) -> str:
+        return f"https://www.google.com/maps/search/?api=1&query={quote_plus(query)}"
+
+    def _official_support_fallbacks(
+        self,
+        *,
+        company_name: str,
+        location_hint: str | None,
+        anchor_latitude: float | None,
+        anchor_longitude: float | None,
+        limit: int,
+    ) -> list[ServiceCenterCandidate]:
+        if limit <= 0:
+            return []
+
+        normalized_key = self._normalize_text(company_name)
+        if not normalized_key:
+            return []
+        brand_key = normalized_key.split(" ", 1)[0]
+        official = self.OFFICIAL_SUPPORT_LINKS.get(brand_key, {})
+        place_label = (location_hint or "your area").strip()
+        maps_query = f"{company_name} authorized service center {place_label}".strip()
+        website = str(official.get("website") or "").strip() or None
+        phone = str(official.get("phone") or "").strip() or None
+        support_name = str(official.get("name") or f"{company_name} Support").strip()
+        address = (
+            f"Use the official {company_name} support channel to locate an authorized service provider near {place_label}."
+            if place_label
+            else f"Use the official {company_name} support channel to locate an authorized service provider."
+        )
+        fallback = ServiceCenterCandidate(
+            name=support_name,
+            address=address,
+            latitude=anchor_latitude,
+            longitude=anchor_longitude,
+            distance_km=None,
+            source="official_support",
+            confidence="official",
+            map_url=self._maps_search_url(maps_query),
+            city=place_label if place_label and place_label.lower() != "your area" else None,
+            phone=phone,
+            website=website,
+            pincode=self.parse_pincode(place_label),
+            pickup_available=None,
+            estimated_tat_days=None,
+        )
+        return [fallback][:limit]
 
     @classmethod
     def parse_radius_km(cls, query: str, default_km: float | None = None) -> float:
@@ -245,6 +405,30 @@ class ServiceCenterLocator:
         if place_id:
             return f"https://www.google.com/maps/search/?api=1&query={query}&query_place_id={quote_plus(place_id)}"
         return f"https://www.google.com/maps/search/?api=1&query={query}"
+
+    def _google_places_auth_headers(self) -> dict[str, str]:
+        if self.google_maps_api_key:
+            return {"X-Goog-Api-Key": self.google_maps_api_key}
+        if not self.google_credentials_file or service_account is None or GoogleAuthRequest is None:
+            return {}
+        try:
+            session = requests.Session()
+            session.trust_env = False
+            creds = service_account.Credentials.from_service_account_file(
+                self.google_credentials_file,
+                scopes=[self.google_oauth_scope],
+            )
+            creds.refresh(GoogleAuthRequest(session=session))
+            token = str(creds.token or "").strip()
+            project_id = str(getattr(creds, "project_id", "") or "").strip()
+        except Exception:
+            return {}
+        if not token or not project_id:
+            return {}
+        return {
+            "Authorization": f"Bearer {token}",
+            "X-Goog-User-Project": project_id,
+        }
 
     def _matches_company(self, company_name: str, name: str, address: str) -> bool:
         normalized_company = self._normalize_text(company_name)
@@ -625,25 +809,55 @@ out tags center 120;
         normalized_query = query.strip()
         if not normalized_query:
             return []
-        if location_hint and (anchor_latitude is None or anchor_longitude is None):
-            normalized_query = f"{normalized_query} in {location_hint.strip()}"
-        params: dict[str, str] = {"query": normalized_query, "key": self.google_maps_api_key}
+
+        auth_headers = self._google_places_auth_headers()
+        if not auth_headers:
+            return []
+
+        search_query = normalized_query if not location_hint else f"{normalized_query} {location_hint.strip()}"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-FieldMask": (
+                "places.id,"
+                "places.displayName,"
+                "places.formattedAddress,"
+                "places.location,"
+                "places.googleMapsUri,"
+                "places.nationalPhoneNumber,"
+                "places.websiteUri"
+            ),
+            "User-Agent": self.USER_AGENT,
+        }
+        headers.update(auth_headers)
+        payload: dict[str, Any] = {
+            "textQuery": search_query,
+            "pageSize": max(1, min(limit, 20)),
+            "languageCode": "en",
+            "regionCode": "IN",
+        }
         if anchor_latitude is not None and anchor_longitude is not None:
-            params["location"] = f"{anchor_latitude:.6f},{anchor_longitude:.6f}"
-            params["radius"] = str(int(max(1000, min(radius_km * 1000, self.MAX_RADIUS_KM * 1000))))
-        headers = {"User-Agent": self.USER_AGENT}
+            payload["locationBias"] = {
+                "circle": {
+                    "center": {
+                        "latitude": anchor_latitude,
+                        "longitude": anchor_longitude,
+                    },
+                    "radius": float(max(1000, min(int(radius_km * 1000), 50000))),
+                }
+            }
+
         try:
-            with httpx.Client(timeout=self.DEFAULT_TIMEOUT_SECONDS, headers=headers) as client:
-                response = client.get(self.GOOGLE_TEXT_SEARCH_URL, params=params)
+            with httpx.Client(timeout=self.DEFAULT_TIMEOUT_SECONDS, trust_env=False) as client:
+                response = client.post(self.GOOGLE_TEXT_SEARCH_URL, headers=headers, json=payload)
                 response.raise_for_status()
-                payload = response.json()
+                response_payload = response.json()
         except Exception:
             return []
-        status = str(payload.get("status") or "").upper() if isinstance(payload, dict) else ""
-        if status not in {"OK", "ZERO_RESULTS"}:
+
+        results = response_payload.get("places") if isinstance(response_payload, dict) else None
+        if not isinstance(results, list):
             return []
-        results = payload.get("results") if isinstance(payload, dict) else None
-        return results[: max(limit, self.DEFAULT_LIMIT)] if isinstance(results, list) else []
+        return [item for item in results if isinstance(item, dict)][:limit]
 
     def _candidate_from_google(
         self,
@@ -654,17 +868,24 @@ out tags center 120;
         anchor_longitude: float | None,
         radius_km: float,
     ) -> ServiceCenterCandidate | None:
-        geometry = item.get("geometry")
-        location = geometry.get("location") if isinstance(geometry, dict) else None
+        location = item.get("location")
+        if not isinstance(location, dict):
+            geometry = item.get("geometry")
+            location = geometry.get("location") if isinstance(geometry, dict) else None
         if not isinstance(location, dict):
             return None
         try:
-            latitude = float(location.get("lat"))
-            longitude = float(location.get("lng"))
+            latitude = float(location.get("latitude") if location.get("latitude") is not None else location.get("lat"))
+            longitude = float(location.get("longitude") if location.get("longitude") is not None else location.get("lng"))
         except (TypeError, ValueError):
             return None
-        name = str(item.get("name") or "").strip() or "Service Center"
-        address = str(item.get("formatted_address") or name).strip()
+        display_name = item.get("displayName")
+        if isinstance(display_name, dict):
+            name = str(display_name.get("text") or "").strip()
+        else:
+            name = str(item.get("name") or "").strip()
+        name = name or "Service Center"
+        address = str(item.get("formatted_address") or item.get("formattedAddress") or name).strip()
         if not self._matches_company(company_name, name, address):
             return None
         distance_km: float | None = None
@@ -672,8 +893,11 @@ out tags center 120;
             distance_km = round(self._haversine_km(anchor_latitude, anchor_longitude, latitude, longitude), 2)
             if distance_km > radius_km:
                 return None
-        place_id = str(item.get("place_id") or "").strip() or None
+        place_id = str(item.get("id") or item.get("place_id") or "").strip() or None
         confidence = "likely"
+        website = str(item.get("websiteUri") or "").strip() or None
+        phone = str(item.get("nationalPhoneNumber") or "").strip() or None
+        google_maps_uri = str(item.get("googleMapsUri") or "").strip() or None
         return ServiceCenterCandidate(
             name=name[:120],
             address=address[:280],
@@ -682,14 +906,16 @@ out tags center 120;
             distance_km=distance_km,
             source="google_maps",
             confidence=confidence,
-            map_url=self._google_map_url(name=name, address=address, place_id=place_id),
+            map_url=google_maps_uri or self._google_map_url(name=name, address=address, place_id=place_id),
+            phone=phone,
+            website=website,
             pincode=self._extract_pincode_from_address(address),
             pickup_available=self._infer_pickup_available(
                 source="google_maps",
                 confidence=confidence,
                 name=name,
                 address=address,
-                website=None,
+                website=website,
             ),
             estimated_tat_days=self._estimate_tat_days(
                 source="google_maps",
@@ -775,10 +1001,12 @@ out tags center 120;
         location_hint: str | None = None,
         radius_km: float | None = None,
         limit: int = DEFAULT_LIMIT,
+        allow_external_lookup: bool = True,
     ) -> list[ServiceCenterCandidate]:
         normalized_company = self.normalize_company_name(company_name)
         if not normalized_company:
             return []
+        use_live_lookup = bool(allow_external_lookup and self.live_lookup_enabled)
 
         safe_limit = max(1, min(limit, 10))
         safe_radius = self.parse_radius_km("", default_km=radius_km)
@@ -811,7 +1039,9 @@ out tags center 120;
         def append(candidate: ServiceCenterCandidate | None) -> None:
             if candidate is None:
                 return
-            key = (candidate.name.lower(), int(round(candidate.latitude * 1000)), int(round(candidate.longitude * 1000)))
+            lat_key = int(round(candidate.latitude * 1000)) if candidate.latitude is not None else -999999
+            lon_key = int(round(candidate.longitude * 1000)) if candidate.longitude is not None else -999999
+            key = (candidate.name.lower(), lat_key, lon_key)
             if key in seen:
                 return
             seen.add(key)
@@ -827,7 +1057,32 @@ out tags center 120;
         ):
             append(center)
 
-        if len(candidates) < safe_limit:
+        if candidates and not use_live_lookup:
+            if anchor_lat is not None and anchor_lon is not None:
+                candidates.sort(
+                    key=lambda item: (
+                        self.SOURCE_PRIORITY.get(item.source, 99),
+                        item.distance_km if item.distance_km is not None else float("inf"),
+                        item.name.lower(),
+                    )
+                )
+            else:
+                candidates.sort(key=lambda item: (self.SOURCE_PRIORITY.get(item.source, 99), item.name.lower()))
+            return candidates[:safe_limit]
+
+        if not candidates and not use_live_lookup:
+            fallback_centers = self._official_support_fallbacks(
+                company_name=normalized_company,
+                location_hint=location_hint,
+                anchor_latitude=anchor_lat,
+                anchor_longitude=anchor_lon,
+                limit=safe_limit,
+            )
+            for center in fallback_centers:
+                append(center)
+            return candidates[:safe_limit]
+
+        if use_live_lookup and len(candidates) < safe_limit:
             overpass_raw = self._search_overpass(company_name=normalized_company, bbox=bbox)
             if not overpass_raw and anchor_lat is not None and anchor_lon is not None:
                 expanded_bbox = self._bbox_from_radius(anchor_lat, anchor_lon, min(max(safe_radius * 1.35, 30.0), 35.0))
@@ -847,7 +1102,7 @@ out tags center 120;
             f"{normalized_company} service center",
             f"{normalized_company} repair center",
         ]
-        if len(candidates) < target_count:
+        if use_live_lookup and len(candidates) < target_count:
             for query in query_variants:
                 for raw in self._search_google_places(
                     query=query,
@@ -869,7 +1124,7 @@ out tags center 120;
                 if len(candidates) >= target_count:
                     break
 
-        if len(candidates) < target_count:
+        if use_live_lookup and len(candidates) < target_count:
             for query in query_variants:
                 for raw in self._search_nominatim(query=query, limit=max(8, safe_limit * 2), location_hint=location_hint):
                     append(
@@ -883,6 +1138,16 @@ out tags center 120;
                     )
                 if len(candidates) >= target_count:
                     break
+
+        if not candidates:
+            for center in self._official_support_fallbacks(
+                company_name=normalized_company,
+                location_hint=location_hint,
+                anchor_latitude=anchor_lat,
+                anchor_longitude=anchor_lon,
+                limit=safe_limit,
+            ):
+                append(center)
 
         if anchor_lat is not None and anchor_lon is not None:
             candidates.sort(

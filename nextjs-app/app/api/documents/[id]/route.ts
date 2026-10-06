@@ -14,7 +14,11 @@ export async function GET(request: NextRequest, context: RouteContext) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const userId = request.nextUrl.searchParams.get('userId') || undefined
+    const rawUserId = request.nextUrl.searchParams.get('userId') || undefined
+    const userId =
+      rawUserId && rawUserId.trim().toLowerCase() !== 'anonymous'
+        ? rawUserId.trim()
+        : undefined
     const merchantUserId = request.nextUrl.searchParams.get('merchantUserId') || undefined
     const path = withQuery(`/documents/${context.params.id}`, {
       user_id: userId,
@@ -41,7 +45,11 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const userId = request.nextUrl.searchParams.get('userId') || undefined
+    const rawUserId = request.nextUrl.searchParams.get('userId') || undefined
+    const userId =
+      rawUserId && rawUserId.trim().toLowerCase() !== 'anonymous'
+        ? rawUserId.trim()
+        : undefined
     const merchantUserId = request.nextUrl.searchParams.get('merchantUserId') || undefined
     const path = withQuery(`/documents/${context.params.id}`, {
       user_id: userId,

@@ -110,11 +110,12 @@ def run_sql_file(path: Path) -> None:
 def main() -> None:
     base = Path(__file__).resolve().parents[1] / "sql"
     for script in (
-        "001_pgvector.sql",
+        "001_extensions.sql",
         "002_schema.sql",
-        "003_hybrid_search.sql",
         "004_notifications.sql",
         "005_top_tier_features.sql",
+        "006_vectorless_cleanup.sql",
+        "007_async_extraction_jobs.sql",
     ):
         run_sql_file(base / script)
 

@@ -1,40 +1,11 @@
 'use client'
 
-import { Suspense, useEffect, useState } from 'react'
+import { Suspense, useCallback, useEffect, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import type { Session } from '@supabase/supabase-js'
-import { supabase } from '@/lib/supabase'
 import { useAuthStore } from '@/lib/store/auth-store'
 import type { UserType } from '@/lib/types'
-
-function generateCustomId(type: UserType): string {
-  const prefix = type === 'consumer' ? 'CON' : 'MER'
-  const timestamp = Date.now().toString(36).toUpperCase()
-  const random = Math.random().toString(36).slice(2, 6).toUpperCase()
-  return `${prefix}-${timestamp}-${random}`
-}
-
-function stableIdSeed(input: string): string {
-  let hash = 2166136261
-  for (let i = 0; i < input.length; i += 1) {
-    hash ^= input.charCodeAt(i)
-    hash = Math.imul(hash, 16777619)
-  }
-  const unsigned = hash >>> 0
-  return unsigned.toString(36).toUpperCase().padStart(7, '0').slice(0, 7)
-}
-
-function generateStableCustomId(type: UserType, email: string, userId: string): string {
-  const prefix = type === 'consumer' ? 'CON' : 'MER'
-  const normalizedEmail = email.trim().toLowerCase()
-  const stable = stableIdSeed(`${type}:${normalizedEmail}:${userId}`)
-  return `${prefix}-${stable}`
-}
-
-function fallbackName(email: string): string {
-  const [local] = email.split('@')
-  return local || 'SafeBill User'
-}
+import type { CognitoAuthResult } from '@/lib/cognito'
+import { useRef } from 'react'
 
 function LoadingState({ message }: { message: string }) {
   return (
@@ -68,180 +39,172 @@ function ErrorState({ message }: { message: string }) {
   )
 }
 
+function decodeStateUserType(encoded: string | null): UserType | null {
+  if (!encoded) return null
+  try {
+    const normalized = encoded.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4)
+    const decoded = typeof window !== 'undefined' ? atob(padded) : ''
+    const parsed = JSON.parse(decoded) as { userType?: string }
+    return parsed.userType === 'merchant' ? 'merchant' : parsed.userType === 'consumer' ? 'consumer' : null
+  } catch {
+    return null
+  }
+}
+
+function readCookie(name: string): string | null {
+  if (typeof document === 'undefined') return null
+  const found = document.cookie
+    .split(';')
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(`${name}=`))
+  if (!found) return null
+  return found.substring(name.length + 1) || null
+}
+
+function readPersistedUserType(): UserType {
+  const cookieType = readCookie('sb_user_type')
+  if (cookieType === 'merchant') return 'merchant'
+  if (typeof window === 'undefined') return 'consumer'
+  try {
+    const raw = localStorage.getItem('auth-storage')
+    if (!raw) return 'consumer'
+    const parsed = JSON.parse(raw) as { state?: { user?: { userType?: string } } }
+    return parsed?.state?.user?.userType === 'merchant' ? 'merchant' : 'consumer'
+  } catch {
+    return 'consumer'
+  }
+}
+
+function hasSessionToken(): boolean {
+  if (readCookie('sb_access_token')) return true
+  if (typeof window === 'undefined') return false
+  try {
+    const raw = localStorage.getItem('auth-storage')
+    if (!raw) return false
+    const parsed = JSON.parse(raw) as { state?: { token?: string | null } }
+    return Boolean(String(parsed?.state?.token || '').trim())
+  } catch {
+    return false
+  }
+}
+
 function AuthCallbackContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const { setAuth } = useAuthStore()
   const [error, setError] = useState<string | null>(null)
+  const startedRef = useRef(false)
+  const goToPostLogin = useCallback((type: UserType) => {
+    const target = type === 'merchant' ? '/merchant-dashboard' : '/locker'
+    router.replace(target)
+  }, [router])
 
   useEffect(() => {
-    let isActive = true
-    let unsubscribe: (() => void) | null = null
-
-    const requestedUserType =
-      (searchParams.get('user_type') || localStorage.getItem('login_user_type') || 'consumer') === 'merchant'
-        ? 'merchant'
-        : 'consumer'
-    localStorage.removeItem('login_user_type')
-
-    const finalizeSession = async (session: Session) => {
-      const user = session.user
-      const userEmail = (user.email || '').trim().toLowerCase()
-      const defaultName = user.user_metadata?.full_name || user.user_metadata?.name || fallbackName(userEmail)
-      const baseProfileQuery = 'id, user_id, email, custom_id, full_name, user_type, created_at'
-
-      const { data: byUserId, error: byUserIdError } = await supabase
-        .from('user_profiles')
-        .select(baseProfileQuery)
-        .eq('user_id', user.id)
-        .order('created_at', { ascending: true })
-        .limit(1)
-        .maybeSingle()
-      if (byUserIdError) {
-        throw byUserIdError
-      }
-
-      let existingProfile = byUserId
-      if (!existingProfile && userEmail) {
-        const { data: byEmail, error: byEmailError } = await supabase
-          .from('user_profiles')
-          .select(baseProfileQuery)
-          .eq('email', userEmail)
-          .order('created_at', { ascending: true })
-          .limit(1)
-          .maybeSingle()
-        if (byEmailError) {
-          throw byEmailError
-        }
-        existingProfile = byEmail
-      }
-
-      const resolvedUserType = (existingProfile?.user_type || requestedUserType) as UserType
-      const stableFallbackId = generateStableCustomId(resolvedUserType, userEmail, user.id)
-      const resolvedCustomId =
-        existingProfile?.custom_id ||
-        user.user_metadata?.custom_id ||
-        stableFallbackId ||
-        generateCustomId(resolvedUserType)
-      const resolvedName = existingProfile?.full_name || defaultName
-
-      if (!existingProfile) {
-        const { error: insertError } = await supabase.from('user_profiles').insert({
-          user_id: user.id,
-          custom_id: resolvedCustomId,
-          email: userEmail,
-          full_name: resolvedName,
-          user_type: resolvedUserType,
-        })
-        if (insertError) {
-          // Handle race/duplicate case: fetch existing profile by email and continue.
-          const { data: retryProfile, error: retryError } = await supabase
-            .from('user_profiles')
-            .select(baseProfileQuery)
-            .eq('email', userEmail)
-            .order('created_at', { ascending: true })
-            .limit(1)
-            .maybeSingle()
-          if (retryError || !retryProfile) {
-            throw insertError
-          }
-          existingProfile = retryProfile
-        }
-      }
-
-      if (existingProfile) {
-        const profilePatch: Record<string, string> = {}
-        if (!existingProfile.custom_id) {
-          profilePatch.custom_id = resolvedCustomId
-        }
-        if (!existingProfile.full_name) {
-          profilePatch.full_name = resolvedName
-        }
-        if (!existingProfile.user_type) {
-          profilePatch.user_type = resolvedUserType
-        }
-        if (!existingProfile.user_id || existingProfile.user_id !== user.id) {
-          profilePatch.user_id = user.id
-        }
-        if (!existingProfile.email || existingProfile.email.toLowerCase() !== userEmail) {
-          profilePatch.email = userEmail
-        }
-
-        if (Object.keys(profilePatch).length > 0) {
-          const { error: updateError } = await supabase
-            .from('user_profiles')
-            .update(profilePatch)
-            .eq('id', existingProfile.id)
-          if (updateError) {
-            throw updateError
-          }
-        }
-      }
-
-      await supabase.auth.updateUser({
-        data: {
-          full_name: resolvedName,
-          user_type: resolvedUserType,
-          custom_id: resolvedCustomId,
-        },
-      })
-      const { data: refreshedSessionData } = await supabase.auth.refreshSession()
-      const activeSession = refreshedSessionData.session || session
-
-      if (!isActive) return
-      await setAuth(
-        {
-          userId: user.id,
-          email: userEmail,
-          name: resolvedName,
-          userType: resolvedUserType,
-          customId: resolvedCustomId,
-        },
-        activeSession.access_token
-      )
-
-      router.push(resolvedUserType === 'merchant' ? '/merchant-dashboard' : '/locker')
-    }
+    let isMounted = true
 
     const handleCallback = async () => {
       try {
+        if (startedRef.current) return
+        startedRef.current = true
+
         const errorParam = searchParams.get('error')
         const errorDescription = searchParams.get('error_description')
         if (errorParam) {
           throw new Error(errorDescription || errorParam)
         }
 
-        const { data, error: sessionError } = await supabase.auth.getSession()
-        if (sessionError) {
-          throw sessionError
-        }
-        if (data?.session) {
-          await finalizeSession(data.session)
-          return
+        const code = String(searchParams.get('code') || '').trim()
+        if (!code) {
+          throw new Error('Authorization code missing in callback URL.')
         }
 
-        const { data: listener } = supabase.auth.onAuthStateChange(async (event, session) => {
-          if (event === 'SIGNED_IN' && session) {
-            await finalizeSession(session)
+        const lockKey = `sb_cognito_exchange_state_${code}`
+        if (typeof window !== 'undefined') {
+          const existingState = sessionStorage.getItem(lockKey)
+          if (existingState === 'done') {
+            if (hasSessionToken()) {
+              goToPostLogin(readPersistedUserType())
+              return
+            }
           }
+          if (existingState === 'inflight') {
+            const waitStart = Date.now()
+            while (Date.now() - waitStart < 4000) {
+              await new Promise((resolve) => setTimeout(resolve, 200))
+              if (hasSessionToken()) {
+                goToPostLogin(readPersistedUserType())
+                return
+              }
+            }
+            sessionStorage.removeItem(lockKey)
+          }
+          sessionStorage.setItem(lockKey, 'inflight')
+        }
+
+        const stateType = decodeStateUserType(searchParams.get('state'))
+        const localType = localStorage.getItem('login_user_type')
+        const requestedUserType: UserType =
+          stateType || (localType === 'merchant' ? 'merchant' : 'consumer')
+        localStorage.removeItem('login_user_type')
+
+        const exchangeResponse = await fetch('/api/auth/cognito/exchange', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            code,
+            userType: requestedUserType,
+          }),
+          signal: AbortSignal.timeout(15000),
+        }).catch((fetchError) => {
+          if (fetchError instanceof Error && fetchError.name === 'TimeoutError') {
+            throw new Error('Sign-in request timed out. Please try login again.')
+          }
+          throw fetchError
         })
-        unsubscribe = () => listener.subscription.unsubscribe()
+        const exchangeData = (await exchangeResponse.json().catch(() => null)) as (CognitoAuthResult & { error?: string }) | null
+        if (!exchangeResponse.ok || !exchangeData?.accessToken || !exchangeData.user?.userId) {
+          const exchangeError = String(exchangeData?.error || 'Authentication failed').trim()
+          if (hasSessionToken()) {
+            sessionStorage.setItem(lockKey, 'done')
+            goToPostLogin(readPersistedUserType())
+            return
+          }
+          if (typeof window !== 'undefined') sessionStorage.removeItem(lockKey)
+          throw new Error(exchangeError)
+        }
+
+        await setAuth(
+          {
+            userId: exchangeData.user.userId,
+            email: exchangeData.user.email,
+            name: exchangeData.user.name,
+            userType: exchangeData.user.userType,
+            customId: exchangeData.user.customId,
+            picture: exchangeData.user.picture,
+            provider: exchangeData.user.provider,
+          },
+          exchangeData.accessToken
+        )
+
+        document.cookie = `sb_access_token=${exchangeData.accessToken}; path=/; max-age=${60 * 60 * 24 * 7}`
+        document.cookie = `sb_user_type=${exchangeData.user.userType}; path=/; max-age=${60 * 60 * 24 * 7}`
+        if (typeof window !== 'undefined') sessionStorage.setItem(lockKey, 'done')
+
+        goToPostLogin(exchangeData.user.userType === 'merchant' ? 'merchant' : 'consumer')
       } catch (callbackError) {
-        if (!isActive) return
+        if (!isMounted) return
         setError(callbackError instanceof Error ? callbackError.message : 'Authentication failed')
       }
     }
 
     handleCallback()
     return () => {
-      isActive = false
-      if (unsubscribe) unsubscribe()
+      isMounted = false
     }
-  }, [router, searchParams, setAuth])
+  }, [goToPostLogin, searchParams, setAuth])
 
-  if (error) {
-    return <ErrorState message={error} />
-  }
+  if (error) return <ErrorState message={error} />
   return <LoadingState message="Completing sign in..." />
 }
 

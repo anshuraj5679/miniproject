@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import base64
 import io
 import os
 import re
@@ -26,6 +27,18 @@ try:
 except Exception:  # pragma: no cover - optional runtime dependency
     pytesseract = None
 
+try:
+    import httpx
+except Exception:  # pragma: no cover - optional runtime dependency
+    httpx = None  # type: ignore[assignment]
+
+try:
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from google.oauth2 import service_account
+except Exception:  # pragma: no cover - optional runtime dependency
+    GoogleAuthRequest = None  # type: ignore[assignment]
+    service_account = None  # type: ignore[assignment]
+
 # NOTE: `unstructured` (and its inference stack) is heavy and can add minutes
 # of import time on cold starts. Keep it lazily imported inside
 # `_partition_sections()` so the API can bind its port quickly when
@@ -33,8 +46,10 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 from app.core.config import get_settings
 from app.services.date_utils import add_months
+from app.services.extraction_pipeline import sanitize_merchandise_name
 
 CURRENCY_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
+DECIMAL_AMOUNT_RE = re.compile(r"(?<!\d)([0-9][0-9,]*\.\d{2})(?!\d)")
 
 
 @dataclass
@@ -102,6 +117,44 @@ def _clean_line(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def _looks_like_non_merchandise_label(value: str) -> bool:
+    text = _clean_line(value).lower().strip(":- ")
+    if not text:
+        return False
+
+    blocked_tokens = (
+        "customer number",
+        "customer no",
+        "customer id",
+        "document number",
+        "invoice number",
+        "tax invoice number",
+        "order number",
+        "po number",
+        "purchase order number",
+        "ship to",
+        "bill to",
+        "place of supply",
+        "gstin",
+        "pan",
+        "phone",
+        "mobile",
+        "email",
+        "address",
+        "pincode",
+        "postal code",
+        "hsn code",
+        "item number",
+        "tax rate",
+    )
+    if any(token in text for token in blocked_tokens):
+        return True
+
+    if re.fullmatch(r"(?:customer|invoice|document|order|po|gst|pan|hsn|item)\s*(?:no|number|id|code)", text):
+        return True
+    return False
+
+
 def _extract_labeled_value(text: str, labels: list[str]) -> str | None:
     joined = "|".join(labels)
     match = re.search(rf"(?im)^\s*(?:{joined})\s*[:\-]\s*(.+?)\s*$", text)
@@ -128,24 +181,42 @@ def _extract_labeled_date(text: str, labels: list[str]) -> date | None:
 
 
 def _extract_bill_id(text: str, filename: str) -> str:
-    patterns = [
-        r"(?im)\b(?:invoice\s*\/\s*bill|bill\s*\/\s*invoice)\s*(?:no|number|#|id)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})",
-        r"(?im)\b(?:invoice|bill|receipt)\s*(?:no|number|#|id)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})",
-        r"(?im)\binvoice\s*[:\-]\s*([A-Z0-9][A-Z0-9\-\/]{2,})",
-        r"(?im)\binv\s*(?:no|number|#)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})",
-        r"(?im)\border\s*(?:no|number|#)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{5,})",
+    patterns: list[tuple[int, str]] = [
+        (65, r"(?im)\b(?:apple\s*)?document\s*number\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{4,})"),
+        (60, r"(?im)\btax\s*invoice\s*number\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{4,})"),
+        (40, r"(?im)\b(?:invoice\s*\/\s*bill|bill\s*\/\s*invoice)\s*(?:no|number|#|id)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})"),
+        (40, r"(?im)\binvoice\s*(?:no\.?|number|#|id)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})"),
+        (35, r"(?im)\binv\s*(?:no\.?|number|#)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})"),
+        (30, r"(?im)\b(INV[\-\/]?[A-Z0-9]{3,})\b"),
+        (10, r"(?im)\b(?:bill|receipt)\s*(?:no|number|#|id)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})"),
+        (5, r"(?im)\border\s*(?:no|number|#)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{5,})"),
     ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if not match:
-            continue
-        value = _clean_line(match.group(1)).strip(".,;:")
-        if not value:
-            continue
-        if value.lower() in {"document", "invoice", "bill", "receipt"}:
-            continue
-        if value:
-            return value[:128]
+    candidates: list[tuple[int, str]] = []
+    for priority, pattern in patterns:
+        for match in re.finditer(pattern, text):
+            value = _clean_line(match.group(1)).strip(".,;:")
+            if not value:
+                continue
+            if value.lower() in {"document", "invoice", "bill", "receipt", "original", "recipient"}:
+                continue
+            # Skip purchase-order references masquerading as invoice number.
+            full_match = _clean_line(match.group(0)).lower()
+            if "po bill" in full_match or "purchase order" in full_match or "original for recipient" in full_match:
+                continue
+            prefix = text[max(0, match.start() - 24): match.start()].lower()
+            if "po " in prefix or "purchase order" in prefix:
+                continue
+            if value.isdigit() and len(value) >= 15:
+                continue
+            score = priority
+            if value.upper().startswith("INV"):
+                score += 10
+            if any(ch.isalpha() for ch in value):
+                score += 3
+            candidates.append((score, value[:128]))
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+        return candidates[0][1]
     return os.path.splitext(filename)[0][:128]
 
 
@@ -181,6 +252,12 @@ def _extract_vendor(text: str, lines: list[str]) -> str:
         "invoice",
         "bill",
         "receipt",
+        "recipient",
+        "tax invoice",
+        "original for recipient",
+        "bill to",
+        "shipping to",
+        "additional details",
         "gst",
         "tax",
         "date",
@@ -201,6 +278,8 @@ def _extract_vendor(text: str, lines: list[str]) -> str:
             continue
         if any(token in lowered for token in ignored_tokens):
             continue
+        if lowered in {"original for recipient", "tax invoice", "invoice"}:
+            continue
         if re.search(r"\d{4,}", line):
             continue
         if re.fullmatch(r"[\W_]+", line):
@@ -211,30 +290,116 @@ def _extract_vendor(text: str, lines: list[str]) -> str:
 
 
 def _extract_total_amount(text: str) -> float | None:
-    currency = r"(?:inr|rs\.?|usd|eur|\$|₹|\u20b9)"
-    candidate_patterns = [
-        rf"(?im)(grand\s*total)\s*[:\-]?\s*{currency}?\s*([0-9][0-9,]*(?:\.\d{{1,2}})?)",
-        rf"(?im)(final\s*amount)\s*[:\-]?\s*{currency}?\s*([0-9][0-9,]*(?:\.\d{{1,2}})?)",
-        rf"(?im)(total\s*amount|amount\s*due|amount\s*paid|invoice\s*total)\s*[:\-]?\s*{currency}?\s*([0-9][0-9,]*(?:\.\d{{1,2}})?)",
-        rf"(?im)(?:^|\b)(total)\s*[:\-]?\s*{currency}?\s*([0-9][0-9,]*(?:\.\d{{1,2}})?)",
+    line_priorities: list[tuple[int, tuple[str, ...]]] = [
+        (7, ("total amount after tax",)),
+        (6, ("amount after tax",)),
+        (5, ("grand total",)),
+        (4, ("invoice total", "final amount")),
+        (3, ("total amount", "amount due", "amount paid")),
+        (2, ("total price",)),
+        (1, ("total",)),
     ]
+    numeric_token_re = re.compile(r"(?i)(?:inr|rs\.?|\$|₹)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)")
     ranked: list[tuple[int, float]] = []
-    for pattern in candidate_patterns:
-        for match in re.finditer(pattern, text):
-            label = (match.group(1) or "").lower()
-            value = normalize_numeric_field(match.group(2))
-            if value is None:
+
+    for raw_line in text.splitlines():
+        line = _clean_line(raw_line)
+        lowered = line.lower()
+        if not line:
+            continue
+        if any(token in lowered for token in ("taxable amount", "total tax", "gst amount", "cgst", "sgst", "igst")):
+            continue
+        tokens = [normalize_numeric_field(token) for token in numeric_token_re.findall(line)]
+        amounts = [value for value in tokens if value is not None and 0 < value <= 10_000_000]
+        if not amounts:
+            continue
+        for priority, labels in line_priorities:
+            if not any(label in lowered for label in labels):
                 continue
-            priority = 3 if "grand" in label else 2 if "final" in label else 1
-            ranked.append((priority, value))
+            ranked.append((priority, amounts[-1]))
+            break
+
     if not ranked:
         return None
     ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return ranked[0][1]
 
 
+def _extract_summary_amounts_from_lines(lines: list[str]) -> dict[str, float | None]:
+    label_tokens = (
+        "taxable amount",
+        "total tax",
+        "tax amount",
+        "gst amount",
+        "amount after tax",
+        "total amount after",
+        "grand total",
+        "invoice total",
+        "final amount",
+    )
+    label_indexes = [
+        index
+        for index, raw_line in enumerate(lines)
+        if any(token in raw_line.lower() for token in label_tokens)
+    ]
+    if not label_indexes:
+        return {}
+
+    start = max(0, min(label_indexes) - 8)
+    end = min(len(lines), max(label_indexes) + 8)
+    block = lines[start:end]
+    decimal_amounts: list[float] = []
+    for line in block:
+        for token in DECIMAL_AMOUNT_RE.findall(line):
+            value = normalize_numeric_field(token)
+            if value is None or value <= 0 or value > 1_000_000:
+                continue
+            decimal_amounts.append(round(value, 2))
+
+    if not decimal_amounts:
+        return {}
+
+    unique_amounts = sorted(set(decimal_amounts))
+    total_amount = max(unique_amounts)
+    taxable_amount: float | None = None
+    gst_amount: float | None = None
+
+    best_pair: tuple[float, float, float] | None = None
+    for first in unique_amounts:
+        for second in unique_amounts:
+            larger = max(first, second)
+            smaller = min(first, second)
+            if larger >= total_amount or smaller <= 0:
+                continue
+            delta = abs((larger + smaller) - total_amount)
+            if delta > 1.0:
+                continue
+            candidate = (delta, -larger, -smaller)
+            if best_pair is None or candidate < best_pair:
+                best_pair = candidate
+                taxable_amount = larger
+                gst_amount = smaller
+
+    if taxable_amount is None and len(unique_amounts) >= 2:
+        taxable_amount = unique_amounts[-2]
+        diff = round(total_amount - taxable_amount, 2)
+        if diff > 0:
+            gst_amount = diff
+
+    gst_rate = None
+    if taxable_amount and gst_amount and taxable_amount > 0:
+        gst_rate = round((gst_amount / taxable_amount) * 100.0, 2)
+
+    return {
+        "total_amount": total_amount,
+        "taxable_amount": taxable_amount,
+        "gst_amount": gst_amount,
+        "gst_rate": gst_rate,
+    }
+
+
 def _extract_tax_breakdown(text: str) -> dict[str, float | None]:
-    currency = r"(?:inr|rs\.?|usd|eur|\$|₹|\u20b9)"
+    currency = r"(?:inr|rs\.?|usd|eur|\$|\u20b9)"
 
     def _extract_amount(patterns: list[str]) -> float | None:
         ranked: list[tuple[int, float]] = []
@@ -272,7 +437,7 @@ def _extract_tax_breakdown(text: str) -> dict[str, float | None]:
     gst_amount = _extract_amount(
         [
             rf"(?im)(?:gst\s*amount|total\s*gst|tax\s*amount)\s*[:\-]?\s*{currency}?\s*([0-9][0-9,]*(?:\.\d{{1,2}})?)",
-            rf"(?im)(?:^|\b)gst\s*[:\-]?\s*{currency}?\s*([0-9][0-9,]*(?:\.\d{{1,2}})?)",
+            rf"(?im)(?:total\s*tax)\s*[:\-]?\s*{currency}?\s*([0-9][0-9,]*(?:\.\d{{1,2}})?)",
         ]
     )
     cgst_amount = _extract_amount(
@@ -311,11 +476,112 @@ def _extract_tax_breakdown(text: str) -> dict[str, float | None]:
 
 
 def _extract_line_items_from_text(lines: list[str]) -> list[dict[str, Any]]:
+    table_header_index = next(
+        (
+            index
+            for index, raw_line in enumerate(lines)
+            if "name of product/service" in raw_line.lower()
+            or "name of product / service" in raw_line.lower()
+            or ("name of product" in raw_line.lower() and "qty" in raw_line.lower())
+        ),
+        -1,
+    )
+    if table_header_index >= 0:
+        section_end = len(lines)
+        for index in range(table_header_index + 1, min(len(lines), table_header_index + 40)):
+            lowered = lines[index].lower()
+            if any(
+                token in lowered
+                for token in (
+                    "total in words",
+                    "terms and conditions",
+                    "customer signature",
+                    "authorised signatory",
+                    "bank:",
+                )
+            ):
+                section_end = index
+                break
+
+        section_lines = lines[table_header_index + 1 : section_end]
+        table_names: list[str] = []
+        table_amounts: list[float] = []
+        seen_names: set[str] = set()
+        for raw_line in section_lines:
+            line = _clean_line(raw_line)
+            lowered = line.lower()
+            if not line:
+                continue
+            if any(
+                token in lowered
+                for token in (
+                    "hsn/sac",
+                    "hsn",
+                    "sac",
+                    "qty",
+                    "rate",
+                    "taxable value",
+                    "igst",
+                    "cgst",
+                    "sgst",
+                    "amount",
+                    "total",
+                    "name of product",
+                )
+            ):
+                continue
+            if lowered in {"sr.", "sr", "no.", "no", "qty", "rate", "amount", "igst", "%", "total"}:
+                continue
+            if re.fullmatch(r"\d+\s*(?:nos|pcs|pc|unit|units)?", lowered):
+                continue
+            if re.fullmatch(r"[a-z0-9/-]{6,}", lowered) and any(ch.isdigit() for ch in lowered):
+                continue
+            candidate = sanitize_merchandise_name(line)
+            if candidate:
+                alpha_tokens = re.findall(r"[A-Za-z]{2,}", candidate)
+                if len(alpha_tokens) >= 2 and not _looks_like_non_merchandise_label(candidate):
+                    key = candidate.lower()
+                    if key not in seen_names:
+                        seen_names.add(key)
+                        table_names.append(candidate)
+            for token in DECIMAL_AMOUNT_RE.findall(line):
+                value = normalize_numeric_field(token)
+                if value is None or value <= 0 or value > 1_000_000:
+                    continue
+                table_amounts.append(round(value, 2))
+
+        if table_names:
+            paired_amounts = table_amounts[-len(table_names) :] if len(table_amounts) >= len(table_names) else []
+            recovered: list[dict[str, Any]] = []
+            for index, name in enumerate(table_names):
+                entry: dict[str, Any] = {"name": name}
+                if index < len(paired_amounts):
+                    entry["amount"] = paired_amounts[index]
+                recovered.append(entry)
+            if recovered:
+                return recovered[:50]
+
     items: list[dict[str, Any]] = []
     ignored_tokens = (
         "invoice",
+        "inv",
         "bill",
         "receipt",
+        "document number",
+        "invoice number",
+        "tax invoice number",
+        "customer number",
+        "bill to",
+        "ship to",
+        "shipping to",
+        "shipping details",
+        "place of supply",
+        "account number",
+        "ifsc",
+        "bank details",
+        "po bill",
+        "purchase order",
+        "date",
         "total",
         "subtotal",
         "tax",
@@ -329,24 +595,89 @@ def _extract_line_items_from_text(lines: list[str]) -> list[dict[str, Any]]:
         "warranty",
     )
     amount_re = re.compile(r"(?i)(?:inr|rs\.?|\$)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*$")
+    numeric_re = re.compile(r"(?i)(?:inr|rs\.?|\$|₹)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)")
+    currency_re = re.compile(r"(?i)\b(?:inr|rs\.?)\b|[₹$]")
 
     for raw_line in lines:
         line = _clean_line(raw_line)
         if len(line) < 5 or len(line) > 120:
             continue
         lowered = line.lower()
+        if _looks_like_non_merchandise_label(line):
+            continue
         if any(token in lowered for token in ignored_tokens):
             continue
 
-        amount_match = amount_re.search(line)
-        if not amount_match:
+        numeric_tokens = numeric_re.findall(line)
+        numeric_candidates = [normalize_numeric_field(token) for token in numeric_tokens]
+        numeric_candidates = [value for value in numeric_candidates if value is not None and 0 < value <= 1_000_000]
+        if not numeric_candidates:
             continue
-        amount = normalize_numeric_field(amount_match.group(1))
+        amount_match = amount_re.search(line)
+        amount = normalize_numeric_field(amount_match.group(1)) if amount_match else None
+        decimal_candidates = [
+            normalize_numeric_field(token)
+            for token in numeric_tokens
+            if "." in token or "," in token
+        ]
+        decimal_candidates = [value for value in decimal_candidates if value is not None and 0 < value <= 1_000_000]
+        if decimal_candidates:
+            amount = decimal_candidates[-1]
+            if amount is not None and amount <= 100 and len(decimal_candidates) >= 2:
+                amount = max(decimal_candidates[:-1])
+        elif amount is None:
+            amount = numeric_candidates[-1]
         if amount is None or amount <= 0:
             continue
+        has_currency = bool(currency_re.search(line))
+        if len(numeric_candidates) == 1 and not has_currency:
+            if ":" in line:
+                continue
+            if amount >= 100_000:
+                continue
+        if re.fullmatch(r"\d+\s*(?:nos|pcs|pc|unit|units)", lowered):
+            continue
+        if amount > 1_000_000:
+            continue
 
-        name = _clean_line(line[: amount_match.start()]).strip(":- ")
+        name = _clean_line(
+            re.sub(
+                r"\s+[0-9][0-9,]*(?:\.\d{1,2})?(?:\s+[0-9][0-9,]*(?:\.\d{1,2})?){0,6}\s*$",
+                "",
+                line,
+            )
+        ).strip(":- ")
+        if not name and amount_match:
+            name = _clean_line(line[: amount_match.start()]).strip(":- ")
         if len(name) < 2:
+            continue
+        sanitized_name = sanitize_merchandise_name(name)
+        if not sanitized_name:
+            continue
+        name = str(sanitized_name).strip(":- ")
+        if re.fullmatch(r"[A-Z0-9\-/]{6,}", name) and any(ch.isdigit() for ch in name):
+            continue
+        if re.fullmatch(r"\d+\s*(?:NOS|PCS|PC|UNIT|UNITS)", name.upper()):
+            continue
+        if len(re.findall(r"[A-Za-z]{2,}", name)) < 2:
+            continue
+        if _looks_like_non_merchandise_label(name):
+            continue
+        if ":" in name and any(
+            token in name.lower()
+            for token in (
+                "date",
+                "account",
+                "ifsc",
+                "invoice",
+                "bill",
+                "order",
+                "customer",
+                "document",
+                "ship to",
+                "place of supply",
+            )
+        ):
             continue
 
         items.append(
@@ -379,11 +710,14 @@ def _extract_vendor_tax_id(text: str) -> str | None:
 
 def _extract_serial_number(text: str) -> str | None:
     match = re.search(
-        r"(?im)(?:serial(?:\s*(?:no|number))?|s\/n|imei(?:\s*(?:no|number))?)\s*[:\-]?\s*([A-Z0-9\-\/]{4,64})",
+        r"(?im)(?:serial\s*(?:no|number)\b|s\/n\b|imei(?:\s*(?:no|number))?)\s*[:\-]?\s*([A-Z0-9\-\/]{4,64})",
         text,
     )
     if match:
-        return _clean_line(match.group(1))
+        candidate = _clean_line(match.group(1))
+        if candidate.lower() in {"number", "numbers", "item"}:
+            return None
+        return candidate
     return None
 
 
@@ -401,10 +735,43 @@ def _extract_product_name(text: str, lines: list[str], vendor: str) -> str | Non
     if labeled:
         return labeled[:255]
 
+    # Prefer table-like item rows (name + HSN/item code + qty + amounts).
+    for raw_line in lines:
+        line = _clean_line(raw_line)
+        row_match = re.search(
+            r"(?i)^(.+?)\s+\d{4,10}\s+\d+(?:\s+[A-Z]{1,5})?\s+[0-9][0-9,]*(?:\.\d+)?(?:\s+[0-9][0-9,]*(?:\.\d+)?){1,5}\s*$",
+            line,
+        )
+        if not row_match:
+            continue
+        candidate = _clean_line(row_match.group(1)).strip(":- ")
+        candidate = str(sanitize_merchandise_name(candidate) or candidate).strip(":- ")
+        if len(candidate) < 4:
+            continue
+        if any(token in candidate.lower() for token in ("total", "tax", "gst", "shipping", "bank")):
+            continue
+        return candidate[:255]
+
     ignored_tokens = (
         "invoice",
+        "inv",
         "bill",
         "receipt",
+        "document number",
+        "invoice number",
+        "tax invoice number",
+        "customer number",
+        "order number",
+        "purchase order",
+        "po bill",
+        "ship to",
+        "account number",
+        "ifsc",
+        "bank details",
+        "original for recipient",
+        "bill to",
+        "shipping to",
+        "place of supply",
         "total",
         "subtotal",
         "tax",
@@ -427,11 +794,32 @@ def _extract_product_name(text: str, lines: list[str], vendor: str) -> str | Non
             continue
         if lowered == lowered_vendor:
             continue
+        if _looks_like_non_merchandise_label(line):
+            continue
+        if any(token in lowered for token in ("enterprise", "corporation", "limited", "ltd", "pvt", "private", "llp", "inc")):
+            continue
         if any(token in lowered for token in ignored_tokens):
             continue
         if re.search(r"\b\d{6,}\b", line):
             continue
         if re.search(r"(?:inr|rs\.?|usd|\$)\s*[0-9]", lowered):
+            continue
+        if ":" in line and any(
+            marker in lowered
+            for marker in (
+                "order",
+                "invoice no",
+                "bill no",
+                "gstin",
+                "account",
+                "ifsc",
+                "customer number",
+                "document number",
+                "ship to",
+                "bill to",
+                "place of supply",
+            )
+        ):
             continue
         if re.fullmatch(r"[A-Z0-9\-\/]{4,}", line):
             continue
@@ -561,10 +949,24 @@ def extract_invoice_metadata(text: str, filename: str) -> dict[str, Any]:
     serial_number = _extract_serial_number(normalized)
     warranty_months = _extract_warranty_months(normalized)
 
+    line_items = _extract_line_items_from_text(lines)
+    summary_amounts = _extract_summary_amounts_from_lines(lines)
+    if summary_amounts.get("total_amount") is not None:
+        total_amount = summary_amounts["total_amount"]
+    if summary_amounts.get("taxable_amount") is not None:
+        tax_breakdown["taxable_amount"] = summary_amounts["taxable_amount"]
+    if summary_amounts.get("gst_amount") is not None:
+        tax_breakdown["gst_amount"] = summary_amounts["gst_amount"]
+    if summary_amounts.get("gst_rate") is not None:
+        tax_breakdown["gst_rate"] = summary_amounts["gst_rate"]
+
     product_name = _extract_product_name(normalized, lines, vendor)
+    if line_items:
+        first_item_name = str(line_items[0].get("name") or "").strip()
+        if first_item_name and str(product_name or "").strip().lower() != first_item_name.lower():
+            product_name = first_item_name
     brand = _extract_brand(normalized, product_name, vendor)
     category = _derive_category(product_name, brand, vendor)
-    line_items = _extract_line_items_from_text(lines)
 
     if warranty_start is None:
         warranty_start = purchase_date
@@ -615,17 +1017,97 @@ def _table_to_rows(table_data: list[list[str | None]]) -> list[TableRow]:
     return rows
 
 
-def _ocr_page_text(page: pdfplumber.page.Page) -> str:
-    if pytesseract is None:
-        return ""
+def _google_vision_auth_context() -> tuple[dict[str, str], dict[str, str] | None, str]:
     settings = get_settings()
-    if settings.tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
+    creds_file = (settings.google_vision_credentials_file or "").strip()
+    if creds_file:
+        if service_account is None or GoogleAuthRequest is None:
+            return {}, None, "service_account"
+        try:
+            scopes = [str(settings.google_vision_scope or "").strip() or "https://www.googleapis.com/auth/cloud-platform"]
+            creds = service_account.Credentials.from_service_account_file(creds_file, scopes=scopes)
+            creds.refresh(GoogleAuthRequest())
+            token = str(creds.token or "").strip()
+            if token:
+                return {"Authorization": f"Bearer {token}"}, None, "service_account"
+        except Exception:
+            return {}, None, "none"
+    api_key = (settings.google_vision_api_key or "").strip()
+    if api_key:
+        endpoint = (settings.google_vision_endpoint or "").strip()
+        params = None if "key=" in endpoint else {"key": api_key}
+        return {}, params, "api_key"
+    return {}, None, "none"
+
+
+def _extract_text_with_google_vision(image_bytes: bytes) -> str:
+    settings = get_settings()
+    if not image_bytes or httpx is None:
+        return ""
+    auth_headers, params, auth_mode = _google_vision_auth_context()
+    if auth_mode == "none":
+        return ""
+    if auth_mode == "service_account" and (service_account is None or GoogleAuthRequest is None):
+        return ""
+
+    endpoint = (settings.google_vision_endpoint or "").strip() or "https://vision.googleapis.com/v1/images:annotate"
+    payload = {
+        "requests": [
+            {
+                "image": {"content": base64.b64encode(image_bytes).decode("ascii")},
+                "features": [{"type": "DOCUMENT_TEXT_DETECTION", "maxResults": 1}],
+            }
+        ]
+    }
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            response = client.post(endpoint, params=params, headers=auth_headers, json=payload)
+            response.raise_for_status()
+            parsed = response.json()
+    except Exception:
+        return ""
+
+    responses = parsed.get("responses", []) if isinstance(parsed, dict) else []
+    first = responses[0] if isinstance(responses, list) and responses else {}
+    if not isinstance(first, dict):
+        return ""
+    if isinstance(first.get("error"), dict):
+        return ""
+    full_text = first.get("fullTextAnnotation", {})
+    if isinstance(full_text, dict):
+        text = str(full_text.get("text") or "").strip()
+        if text:
+            return text
+    text_annotations = first.get("textAnnotations", [])
+    if isinstance(text_annotations, list) and text_annotations:
+        first_ann = text_annotations[0]
+        if isinstance(first_ann, dict):
+            return str(first_ann.get("description") or "").strip()
+    return ""
+
+
+def _ocr_page_text(
+    page: pdfplumber.page.Page,
+    *,
+    allow_google: bool = True,
+    allow_local_fallback: bool = False,
+) -> str:
+    settings = get_settings()
     try:
         image = page.to_image(resolution=250).original
-        return pytesseract.image_to_string(image)
+        if allow_google:
+            with io.BytesIO() as buffer:
+                image.save(buffer, format="PNG")
+                google_text = _extract_text_with_google_vision(buffer.getvalue()).strip()
+            if google_text:
+                return google_text
+        if allow_local_fallback and pytesseract is not None:
+            if settings.tesseract_cmd:
+                pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
+            return pytesseract.image_to_string(image)
+        return ""
     except Exception:
-        # OCR is best-effort; ingestion should continue even if tesseract is unavailable.
+        # OCR is best-effort; ingestion should continue even if engines are unavailable.
         return ""
 
 
@@ -667,7 +1149,7 @@ def _partition_sections(file_bytes: bytes) -> list[PageSection]:
     return sections
 
 
-def parse_pdf_document(file_bytes: bytes, filename: str) -> ParsedDocument:
+def parse_pdf_document(file_bytes: bytes, filename: str, ocr_mode_override: str | None = None) -> ParsedDocument:
     if pdfplumber is None:
         raise ImportError("pdfplumber is required for PDF ingestion.")
 
@@ -710,6 +1192,9 @@ def parse_pdf_document(file_bytes: bytes, filename: str) -> ParsedDocument:
                 )
 
     raw_text = "\n".join(part for part in raw_text_parts if part.strip())
+    requested_mode = str(ocr_mode_override or "").strip().lower()
+    force_cloud_ocr = requested_mode in {"auto", "cloud", "cloud_only", "google", "google_only", "vision", "vision_only"}
+    force_local_ocr = requested_mode in {"local", "local_only", "tesseract", "tesseractjs"}
     is_scanned = len(raw_text.replace("\n", "").strip()) < 80
 
     top_counter = Counter(top_lines)
@@ -752,20 +1237,36 @@ def parse_pdf_document(file_bytes: bytes, filename: str) -> ParsedDocument:
                 )
             )
 
-    if is_scanned and get_settings().ocr_enabled:
+    should_run_ocr = get_settings().ocr_enabled and (is_scanned or force_cloud_ocr or force_local_ocr)
+    ocr_segments: list[str] = []
+    if should_run_ocr:
+        ocr_source = "google_vision" if not force_local_ocr else "google_vision_or_tesseract"
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page_number, page in enumerate(pdf.pages, start=1):
-                ocr_text = _ocr_page_text(page).strip()
+                ocr_text = _ocr_page_text(
+                    page,
+                    allow_google=not force_local_ocr,
+                    allow_local_fallback=force_local_ocr,
+                ).strip()
                 if ocr_text:
+                    ocr_segments.append(ocr_text)
                     sections.append(
                         PageSection(
                             page_number=page_number,
                             section_type="ocr_body",
                             text=ocr_text,
-                            metadata={"source": "pytesseract"},
+                            metadata={"source": ocr_source},
                         )
                     )
-                    raw_text += f"\n{ocr_text}"
+    if ocr_segments:
+        ocr_text = "\n".join(ocr_segments).strip()
+        # In cloud OCR mode, prefer Google OCR text over potentially noisy hidden PDF text layers.
+        if force_cloud_ocr:
+            raw_text = ocr_text
+        elif raw_text:
+            raw_text += f"\n{ocr_text}"
+        else:
+            raw_text = ocr_text
 
     if get_settings().use_unstructured_partition:
         for element in _partition_sections(file_bytes):
@@ -780,3 +1281,4 @@ def parse_pdf_document(file_bytes: bytes, filename: str) -> ParsedDocument:
         metadata=metadata,
         is_scanned=is_scanned,
     )
+

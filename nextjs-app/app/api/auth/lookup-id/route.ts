@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getSupabaseAdminClient } from '@/lib/supabase-admin'
+import { backendApiFetch } from '@/lib/backend-api'
 
 export const runtime = 'nodejs'
 
@@ -10,7 +10,6 @@ interface LookupRequestBody {
 
 export async function POST(request: NextRequest) {
   try {
-    const supabaseAdmin = getSupabaseAdminClient()
     const body = (await request.json()) as LookupRequestBody
     const customId = String(body.customId || '').trim().toUpperCase()
     const userType = String(body.userType || '').trim().toLowerCase()
@@ -21,34 +20,33 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const { data, error } = await supabaseAdmin
-      .from('user_profiles')
-      .select('user_id, email, full_name, user_type, custom_id')
-      .eq('custom_id', customId)
-      .eq('user_type', userType)
-      .limit(1)
-      .maybeSingle()
-
-    if (error || !data) {
-      return NextResponse.json({ error: 'Account not found' }, { status: 404 })
-    }
-    const row = data as {
-      user_id: string
+    const payload = await backendApiFetch<{
+      userId: string
       email: string
-      full_name: string
-      user_type: string
-      custom_id: string
-    }
+      fullName: string
+      userType: string
+      customId: string
+    }>('/auth/lookup-id', {
+      method: 'POST',
+      body: JSON.stringify({ customId, userType }),
+    })
 
     return NextResponse.json({
-      userId: row.user_id,
-      email: row.email,
-      fullName: row.full_name,
-      userType: row.user_type,
-      customId: row.custom_id,
+      userId: payload.userId,
+      email: payload.email,
+      fullName: payload.fullName,
+      userType: payload.userType,
+      customId: payload.customId,
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Lookup failed'
-    return NextResponse.json({ error: message }, { status: 500 })
+    const status =
+      typeof error === 'object' &&
+      error !== null &&
+      'status' in error &&
+      typeof (error as { status: unknown }).status === 'number'
+        ? (error as { status: number }).status
+        : 500
+    return NextResponse.json({ error: message }, { status })
   }
 }

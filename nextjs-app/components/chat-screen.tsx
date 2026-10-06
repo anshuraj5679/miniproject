@@ -88,26 +88,24 @@ export function ChatScreen() {
   }
 
   return (
-    <div ref={rootRef} className="min-h-screen bg-base-200 flex flex-col">
+    <div ref={rootRef} className="dashboard-shell flex flex-col">
       {/* Navbar */}
-      <div data-gsap="hero" className="navbar bg-primary text-primary-content shadow-lg sticky top-0 z-50">
-        <div className="navbar-start">
-          <button onClick={() => router.back()} className="btn btn-ghost btn-circle text-primary-content">
+      <div data-gsap="hero" className="dashboard-navbar flex items-center px-4 py-3">
+        <div className="flex-none">
+          <button onClick={() => router.back()} className="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-600 hover:bg-blue-50 transition-colors">
             <ArrowLeft className="w-5 h-5" />
           </button>
         </div>
-        <div className="navbar-center gap-2">
-          <div className="avatar placeholder">
-            <div className="bg-primary-content/20 rounded-full w-9">
-              <Bot className="w-5 h-5" />
-            </div>
+        <div className="flex-1 flex items-center justify-center gap-2">
+          <div className="w-9 h-9 rounded-full bg-blue-50 border border-blue-100 flex items-center justify-center">
+            <Bot className="w-5 h-5 text-blue-600" />
           </div>
           <div>
-            <p className="font-bold text-sm">Warranty Assistant</p>
-            <p className="text-xs opacity-70">Powered by AI</p>
+            <p className="font-bold text-sm text-slate-900">Warranty Assistant</p>
+            <p className="text-xs text-slate-400">Powered by AI</p>
           </div>
         </div>
-        <div className="navbar-end"></div>
+        <div className="flex-none w-10"></div>
       </div>
 
       {/* Messages */}
@@ -119,17 +117,17 @@ export function ChatScreen() {
             className={`chat ${message.role === 'user' ? 'chat-end' : 'chat-start'}`}
           >
             <div className="chat-image avatar placeholder">
-              <div className={`w-8 rounded-full ${message.role === 'user' ? 'bg-primary/10' : 'bg-base-300'}`}>
+              <div className={`w-8 rounded-full ${message.role === 'user' ? 'bg-blue-100' : 'bg-slate-200'}`}>
                 {message.role === 'user' ? (
-                  <User className="w-4 h-4 text-primary" />
+                  <User className="w-4 h-4 text-blue-600" />
                 ) : (
-                  <Bot className="w-4 h-4 text-base-content/60" />
+                  <Bot className="w-4 h-4 text-slate-500" />
                 )}
               </div>
             </div>
             <div className={`chat-bubble text-sm ${message.role === 'user'
-                ? 'chat-bubble-primary'
-                : 'bg-base-100 text-base-content'
+              ? 'bg-blue-600 text-white'
+              : 'bg-white border border-slate-200 text-slate-700'
               }`}>
               {message.content}
             </div>
@@ -138,11 +136,11 @@ export function ChatScreen() {
         {isLoading && (
           <div className="chat chat-start">
             <div className="chat-image avatar placeholder">
-              <div className="w-8 rounded-full bg-base-300">
-                <Bot className="w-4 h-4 text-base-content/60" />
+              <div className="w-8 rounded-full bg-slate-200">
+                <Bot className="w-4 h-4 text-slate-500" />
               </div>
             </div>
-            <div className="chat-bubble bg-base-100 text-base-content">
+            <div className="chat-bubble bg-white border border-slate-200 text-slate-700">
               <span className="loading loading-dots loading-sm"></span>
             </div>
           </div>
@@ -151,20 +149,20 @@ export function ChatScreen() {
       </div>
 
       {/* Input */}
-      <form onSubmit={handleSend} data-gsap="panel" className="p-4 bg-base-100 border-t border-base-300">
+      <form onSubmit={handleSend} data-gsap="panel" className="p-4 bg-white/90 backdrop-blur-sm border-t border-slate-200">
         <div className="flex gap-2">
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder="Ask about warranties, claims..."
-            className="input input-bordered flex-1"
+            className="dashboard-input"
           />
           <button
             type="submit"
             disabled={!input.trim() || isLoading}
             data-gsap-hover="lift"
-            className="btn btn-primary btn-circle"
+            className="inline-flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 text-white shadow-lg shadow-blue-200/60 hover:from-blue-700 hover:to-blue-800 disabled:cursor-not-allowed disabled:opacity-60 transition-all"
           >
             <Send className="w-4 h-4" />
           </button>

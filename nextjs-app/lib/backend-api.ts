@@ -35,6 +35,38 @@ export class BackendApiError extends Error {
   }
 }
 
+function toErrorMessage(payload: unknown): string | null {
+  if (typeof payload === 'string') return payload
+  if (!payload || typeof payload !== 'object') return null
+
+  const record = payload as Record<string, unknown>
+  const detail = record.detail
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (detail && typeof detail === 'object') {
+    const nested = detail as Record<string, unknown>
+    const candidates = [nested.message, nested.error, nested.reason, nested.detail]
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && candidate.trim()) {
+        return candidate
+      }
+    }
+    try {
+      return JSON.stringify(detail)
+    } catch {
+      return String(detail)
+    }
+  }
+
+  const candidates = [record.error, record.message, record.reason]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate
+    }
+  }
+
+  return null
+}
+
 function buildHeaders(
   body: BodyInit | null | undefined,
   headers?: HeadersInit,
@@ -67,7 +99,10 @@ export async function backendApiFetch<T>(
 ): Promise<T> {
   const preferredToken = (authToken || '').trim()
   const fallbackToken = backendServiceToken.trim()
-  const initialToken = preferredToken || fallbackToken
+  const allowDevAuthRetry = process.env.NODE_ENV !== 'production'
+  const initialToken =
+    preferredToken ||
+    (authToken === undefined ? fallbackToken : '')
   if (!initialToken) {
     throw new BackendApiError('Missing backend authorization token', 401, { detail: 'Unauthorized' })
   }
@@ -101,34 +136,19 @@ export async function backendApiFetch<T>(
     let payload = await parseResponse(response)
 
     if (
+      !response.ok &&
       response.status === 401 &&
+      allowDevAuthRetry &&
       preferredToken &&
       fallbackToken &&
       preferredToken !== fallbackToken
     ) {
-      try {
-        response = await doFetch(fallbackToken)
-      } catch (error) {
-        const isAbortError =
-          error instanceof Error &&
-          (error.name === 'AbortError' || controller.signal.aborted)
-        if (isAbortError) {
-          throw new BackendApiError(
-            `Backend request timed out after ${requestTimeoutMs}ms`,
-            504,
-            { detail: 'Gateway Timeout' }
-          )
-        }
-        throw error
-      }
+      response = await doFetch(fallbackToken)
       payload = await parseResponse(response)
     }
 
     if (!response.ok) {
-      const message =
-        (typeof payload === 'object' && payload && 'detail' in payload
-          ? String((payload as { detail: unknown }).detail)
-          : null) || `Backend request failed with status ${response.status}`
+      const message = toErrorMessage(payload) || `Backend request failed with status ${response.status}`
       throw new BackendApiError(message, response.status, payload)
     }
     return payload as T
@@ -153,7 +173,7 @@ export function resolveRequestAuthToken(request: NextRequest): string | null {
   const cookieToken = request.cookies.get(ACCESS_TOKEN_COOKIE)?.value?.trim()
   if (cookieToken) return cookieToken
 
-  return backendServiceToken || null
+  return null
 }
 
 export function withQuery(path: string, params: Record<string, string | number | undefined | null>): string {

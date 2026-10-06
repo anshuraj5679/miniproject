@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SafeBill backend on AWS Lambda + API Gateway HTTP API
+
+Parameters:
+  AppName:
+    Type: String
+    Default: safebill-backend
+  StageName:
+    Type: String
+    Default: prod
+  PythonRuntime:
+    Type: String
+    Default: python3.12
+  LambdaMemorySize:
+    Type: Number
+    Default: 1024
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+  CorsAllowedOrigins:
+    Type: String
+    Default: http://localhost:3000
+  DocumentsBucketName:
+    Type: String
+    Default: ""
+  AsyncExtractionCallbackToken:
+    Type: String
+    NoEcho: true
+    Default: change-me
+
+Conditions:
+  HasCustomDocumentsBucketName: !Not [!Equals [!Ref DocumentsBucketName, ""]]
+
+Globals:
+  Function:
+    Runtime: !Ref PythonRuntime
+    Timeout: !Ref LambdaTimeout
+    MemorySize: !Ref LambdaMemorySize
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        ENVIRONMENT: prod
+        AWS_ONLY_MODE: "true"
+        DISABLE_IN_APP_NOTIFICATION_WORKER: "true"
+        CORS_ALLOWED_ORIGINS: !Ref CorsAllowedOrigins
+        AUTH_PROVIDER: cognito
+        AI_PROVIDER: bedrock
+        STORAGE_PROVIDER: s3
+        EMAIL_PROVIDER: ses
+        SMS_PROVIDER: sns
+        PUSH_PROVIDER: sns
+        WHATSAPP_PROVIDER: sns
+        S3_KEY_PREFIX: documents
+        S3_BUCKET_NAME: !If
+          - HasCustomDocumentsBucketName
+          - !Ref DocumentsBucketName
+          - !Sub "${AppName}-documents-${AWS::AccountId}-${AWS::Region}"
+        ASYNC_EXTRACTION_ENABLED: "true"
+        ASYNC_EXTRACTION_SOURCE_PREFIX: async-extraction
+        ASYNC_EXTRACTION_CALLBACK_TOKEN: !Ref AsyncExtractionCallbackToken
+        ASYNC_EXTRACTION_OCR_MODE: hybrid
+        LOCAL_ASYNC_EXTRACTION_WORKER_ENABLED: "false"
+
+Resources:
+  SafeBillHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref CorsAllowedOrigins
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - PATCH
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - "*"
+
+  SafeBillDocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - HasCustomDocumentsBucketName
+        - !Ref DocumentsBucketName
+        - !Sub "${AppName}-documents-${AWS::AccountId}-${AWS::Region}"
+
+  SafeBillBackendFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref AppName
+      CodeUri: ../../
+      Handler: app.lambda_handler.handler
+      Events:
+        HttpProxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SafeBillHttpApi
+            Path: /{proxy+}
+            Method: ANY
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:ListBucket
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - textract:DetectDocumentText
+                - textract:AnalyzeExpense
+                - cognito-idp:ListUsers
+                - ses:SendEmail
+                - ses:SendRawEmail
+                - sns:Publish
+                - secretsmanager:GetSecretValue
+                - ssm:GetParameter
+                - ssm:GetParameters
+                - ssm:GetParametersByPath
+              Resource: "*"
+
+  SafeBillAsyncExtractorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-async-extractor"
+      CodeUri: ../../
+      Handler: app.lambda_async_extractor.handler
+      Timeout: 180
+      MemorySize: 2048
+      Environment:
+        Variables:
+          ASYNC_EXTRACTION_BACKEND_CALLBACK_URL: !Sub "https://${SafeBillHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+      Events:
+        AsyncExtractionUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref SafeBillDocumentsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: documents/async-extraction/
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - textract:DetectDocumentText
+                - textract:AnalyzeExpense
+                - secretsmanager:GetSecretValue
+                - ssm:GetParameter
+                - ssm:GetParameters
+                - ssm:GetParametersByPath
+              Resource: "*"
+
+Outputs:
+  HttpApiUrl:
+    Description: HTTP API invoke URL
+    Value: !Sub "https://${SafeBillHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+  DocumentsBucket:
+    Description: Documents bucket for source uploads and async extraction input
+    Value: !Ref SafeBillDocumentsBucket

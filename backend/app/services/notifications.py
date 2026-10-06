@@ -1,25 +1,24 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
 import re
-import smtplib
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
-from email.message import EmailMessage
-from email.utils import formataddr, parseaddr, parsedate_to_datetime
+from email.utils import formataddr, parseaddr
 from string import Formatter
-from threading import Lock
-from time import perf_counter, sleep
+from time import perf_counter
 from typing import Any
 from uuid import UUID
 
-import httpx
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+
+try:
+    import boto3
+except Exception:  # pragma: no cover - optional runtime dependency
+    boto3 = None  # type: ignore[assignment]
 
 from app.core.config import get_settings
 from app.models import (
@@ -126,26 +125,6 @@ def _is_valid_email_address(value: str) -> bool:
     if not candidate:
         return False
     return bool(EMAIL_ADDRESS_PATTERN.fullmatch(candidate))
-
-
-def _parse_retry_after_seconds(value: str | None) -> int | None:
-    if value is None:
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    if text.isdigit():
-        return max(1, int(text))
-    try:
-        retry_at = parsedate_to_datetime(text)
-    except (TypeError, ValueError):
-        return None
-    if retry_at.tzinfo is None:
-        retry_at = retry_at.replace(tzinfo=DEFAULT_TIMEZONE)
-    delta_seconds = int((retry_at.astimezone(DEFAULT_TIMEZONE) - datetime.now(DEFAULT_TIMEZONE)).total_seconds())
-    if delta_seconds <= 0:
-        return None
-    return delta_seconds
 
 
 class _SafeFormatter(Formatter):
@@ -312,16 +291,6 @@ class NotificationService:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.template_engine = TemplateEngine()
-        self._email_webhook_min_interval_seconds = max(
-            0.0,
-            float(getattr(self.settings, "email_webhook_min_interval_seconds", 0.0)),
-        )
-        self._resend_api_base_url = (
-            str(getattr(self.settings, "resend_api_base_url", "https://api.resend.com")).strip().rstrip("/")
-            or "https://api.resend.com"
-        )
-        self._email_webhook_next_allowed_at = 0.0
-        self._email_webhook_rate_lock = Lock()
 
     def _utcnow(self) -> datetime:
         return datetime.now(DEFAULT_TIMEZONE)
@@ -1122,19 +1091,7 @@ class NotificationService:
         sender_name = (parsed_name or "").strip() or (self.settings.email_from_name or "").strip()
         return formataddr((sender_name, sender_email)) if sender_name else sender_email
 
-    def _apply_email_webhook_rate_limit(self) -> None:
-        min_interval = self._email_webhook_min_interval_seconds
-        if min_interval <= 0:
-            return
-        with self._email_webhook_rate_lock:
-            now = perf_counter()
-            wait_seconds = self._email_webhook_next_allowed_at - now
-            if wait_seconds > 0:
-                sleep(wait_seconds)
-                now = perf_counter()
-            self._email_webhook_next_allowed_at = now + min_interval
-
-    def _send_via_resend(
+    def _send_via_ses(
         self,
         *,
         from_value: str,
@@ -1142,194 +1099,212 @@ class NotificationService:
         subject: str,
         body: str,
     ) -> dict[str, object]:
-        api_key = (getattr(self.settings, "resend_api_key", "") or "").strip()
-        if not api_key:
+        if boto3 is None:
             raise NotificationDeliveryError(
-                "Resend API key is not configured. Set RESEND_API_KEY.",
+                "boto3 is unavailable for SES delivery.",
                 permanent=True,
             )
 
-        payload = {
-            "from": from_value,
-            "to": [recipient_email],
-            "subject": subject,
-            "text": body,
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        self._apply_email_webhook_rate_limit()
-        endpoint = f"{self._resend_api_base_url}/emails"
-        with httpx.Client(timeout=20.0) as client:
-            response = client.post(endpoint, headers=headers, json=payload)
-        if response.status_code >= 400:
+        region = (self.settings.ses_region or self.settings.aws_region or "").strip()
+        if not region:
             raise NotificationDeliveryError(
-                f"Resend API failed with status {response.status_code}: {response.text[:400]}",
-                status_code=response.status_code,
-                retry_after_seconds=_parse_retry_after_seconds(response.headers.get("Retry-After")),
-                permanent=response.status_code in {400, 401, 403, 404, 422},
+                "SES region is not configured. Set SES_REGION or AWS_REGION.",
+                permanent=True,
             )
 
-        message_id: str | None = None
-        try:
-            parsed = response.json()
-            if isinstance(parsed, dict):
-                raw_id = parsed.get("id") or parsed.get("message_id") or parsed.get("messageId")
-                if raw_id:
-                    message_id = str(raw_id)[:128]
-        except Exception:
-            message_id = None
+        parsed_name, parsed_email = parseaddr(from_value)
+        from_address = parsed_email or from_value
+        if not _is_valid_email_address(from_address):
+            raise NotificationDeliveryError(
+                "Invalid SES sender address.",
+                permanent=True,
+            )
+        display_from = formataddr((parsed_name, from_address)) if parsed_name else from_address
 
-        provider_payload: dict[str, object] = {
-            "provider": "resend",
-            "status_code": response.status_code,
+        reply_to_addresses: list[str] = []
+        raw_reply = str(self.settings.ses_reply_to_addresses or "").strip()
+        if raw_reply:
+            reply_to_addresses = [item.strip() for item in raw_reply.split(",") if item.strip()]
+
+        request_payload: dict[str, object] = {
+            "FromEmailAddress": display_from,
+            "Destination": {"ToAddresses": [recipient_email]},
+            "Content": {
+                "Simple": {
+                    "Subject": {"Data": subject, "Charset": "UTF-8"},
+                    "Body": {"Text": {"Data": body, "Charset": "UTF-8"}},
+                }
+            },
         }
+        if reply_to_addresses:
+            request_payload["ReplyToAddresses"] = reply_to_addresses
+        configuration_set = str(self.settings.ses_configuration_set or "").strip()
+        if configuration_set:
+            request_payload["ConfigurationSetName"] = configuration_set
+        source_arn = str(self.settings.ses_source_arn or "").strip()
+        if source_arn:
+            request_payload["FromEmailAddressIdentityArn"] = source_arn
+        from_arn = str(self.settings.ses_from_arn or "").strip()
+        if from_arn:
+            request_payload["FeedbackForwardingEmailAddressIdentityArn"] = from_arn
+
+        try:
+            client = boto3.client("sesv2", region_name=region)
+            response = client.send_email(**request_payload)
+        except Exception as exc:
+            retry_after = None
+            status_code = None
+            permanent = False
+            error_code = ""
+            response_obj = getattr(exc, "response", None)
+            if isinstance(response_obj, dict):
+                metadata = response_obj.get("ResponseMetadata", {})
+                if isinstance(metadata, dict):
+                    status_code = metadata.get("HTTPStatusCode")
+                error_payload = response_obj.get("Error", {})
+                if isinstance(error_payload, dict):
+                    error_code = str(error_payload.get("Code") or "")
+            permanent_codes = {
+                "MessageRejected",
+                "MailFromDomainNotVerifiedException",
+                "AccountSuspendedException",
+                "NotAuthorizedException",
+                "BadRequestException",
+            }
+            if error_code in permanent_codes:
+                permanent = True
+            if isinstance(status_code, int) and 400 <= int(status_code) < 500 and int(status_code) != 429:
+                permanent = True
+            raise NotificationDeliveryError(
+                f"SES send failed: {str(exc)[:400]}",
+                status_code=(int(status_code) if isinstance(status_code, int) else None),
+                retry_after_seconds=retry_after,
+                permanent=permanent,
+            ) from exc
+
+        message_id = str(response.get("MessageId") or "").strip() or None
+        payload: dict[str, object] = {"provider": "aws_ses", "status_code": 200}
         if message_id:
-            provider_payload["message_id"] = message_id
-        return provider_payload
+            payload["message_id"] = message_id[:128]
+        return payload
 
     def _send_email(self, *, recipient_email: str, subject: str, body: str) -> dict[str, object]:
         from_value = self._resolve_email_sender()
-        resend_api_key = (getattr(self.settings, "resend_api_key", "") or "").strip()
-        if resend_api_key:
-            return self._send_via_resend(
+        provider = str(self.settings.email_provider or "ses").strip().lower()
+        if provider in {"ses", "aws_ses"}:
+            return self._send_via_ses(
                 from_value=from_value,
                 recipient_email=recipient_email,
                 subject=subject,
                 body=body,
             )
-        webhook_url = (self.settings.email_webhook_url or "").strip()
 
-        # Many PaaS providers block outbound SMTP ports; allow HTTPS delivery via a webhook
-        # compatible with Resend's API shape (`/emails`), while keeping SMTP as the default.
-        if webhook_url:
-            self._apply_email_webhook_rate_limit()
-            headers = {"Content-Type": "application/json"}
-            token = (self.settings.email_webhook_api_key or "").strip()
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-            payload = {
-                "from": from_value,
-                "to": [recipient_email],
-                "subject": subject,
-                "text": body,
-            }
-            with httpx.Client(timeout=20.0) as client:
-                response = client.post(webhook_url, headers=headers, json=payload)
-            if response.status_code >= 400:
-                raise NotificationDeliveryError(
-                    f"Email webhook failed with status {response.status_code}: {response.text[:400]}",
-                    status_code=response.status_code,
-                    retry_after_seconds=_parse_retry_after_seconds(response.headers.get("Retry-After")),
-                )
-            message_id: str | None = None
-            try:
-                parsed = response.json()
-                if isinstance(parsed, dict):
-                    raw_id = parsed.get("id") or parsed.get("message_id") or parsed.get("messageId")
-                    if raw_id:
-                        message_id = str(raw_id)[:128]
-            except Exception:
-                message_id = None
-            provider_payload: dict[str, object] = {
-                "provider": "email_webhook",
-                "status_code": response.status_code,
-            }
-            if message_id:
-                provider_payload["message_id"] = message_id
-            return provider_payload
+        raise NotificationDeliveryError(
+            "Email provider is not configured for AWS SES. Set EMAIL_PROVIDER=ses and SES configuration.",
+            permanent=True,
+        )
 
-        if not self.settings.smtp_host:
+    def _send_sms_via_sns(self, *, recipient: str, message: str) -> dict[str, object]:
+        if boto3 is None:
             raise NotificationDeliveryError(
-                "SMTP settings are incomplete. Configure SMTP_HOST (or EMAIL_WEBHOOK_URL).",
+                "boto3 is unavailable for SNS SMS delivery.",
                 permanent=True,
             )
+        region = (self.settings.sns_region or self.settings.aws_region or "").strip()
+        if not region:
+            raise NotificationDeliveryError(
+                "SNS region is not configured. Set SNS_REGION or AWS_REGION.",
+                permanent=True,
+            )
+        phone_number = _normalize_phone(recipient)
+        if not phone_number:
+            raise NotificationDeliveryError(
+                "Invalid SMS recipient phone number.",
+                permanent=True,
+            )
+        attributes: dict[str, str] = {
+            "AWS.SNS.SMS.SMSType": str(self.settings.sns_sms_type or "Transactional").strip() or "Transactional",
+        }
+        sender_id = str(self.settings.sns_sms_sender_id or "").strip()
+        if sender_id:
+            attributes["AWS.SNS.SMS.SenderID"] = sender_id[:11]
+        try:
+            client = boto3.client("sns", region_name=region)
+            response = client.publish(
+                PhoneNumber=phone_number,
+                Message=message,
+                MessageAttributes={
+                    key: {"DataType": "String", "StringValue": value}
+                    for key, value in attributes.items()
+                    if value
+                },
+            )
+        except Exception as exc:
+            permanent = False
+            status_code = None
+            response_obj = getattr(exc, "response", None)
+            if isinstance(response_obj, dict):
+                metadata = response_obj.get("ResponseMetadata", {})
+                if isinstance(metadata, dict):
+                    raw_status = metadata.get("HTTPStatusCode")
+                    if isinstance(raw_status, int):
+                        status_code = raw_status
+                error_payload = response_obj.get("Error", {})
+                code = str(error_payload.get("Code") if isinstance(error_payload, dict) else "").strip()
+                if code in {"InvalidParameter", "AuthorizationError", "OptedOut", "ThrottlingException"}:
+                    permanent = code in {"InvalidParameter", "AuthorizationError", "OptedOut"}
+            if isinstance(status_code, int) and 400 <= status_code < 500 and status_code != 429:
+                permanent = True
+            raise NotificationDeliveryError(
+                f"SNS SMS failed: {str(exc)[:400]}",
+                status_code=status_code,
+                permanent=permanent,
+            ) from exc
 
-        message = EmailMessage()
-        message["From"] = from_value
-        message["To"] = recipient_email
-        message["Subject"] = subject
-        message.set_content(body)
+        message_id = str(response.get("MessageId") or "").strip() or None
+        payload: dict[str, object] = {"provider": "aws_sns_sms", "status_code": 200}
+        if message_id:
+            payload["message_id"] = message_id[:128]
+        return payload
 
-        host = self.settings.smtp_host
-        port = int(self.settings.smtp_port)
-        username = (self.settings.smtp_username or "").strip()
-        password = self.settings.smtp_password or ""
-        timeout_seconds = 20
-
-        if self.settings.smtp_use_ssl:
-            with smtplib.SMTP_SSL(host=host, port=port, timeout=timeout_seconds) as smtp:
-                if username:
-                    smtp.login(username, password)
-                smtp.send_message(message)
-            return {"provider": "smtp"}
-
-        with smtplib.SMTP(host=host, port=port, timeout=timeout_seconds) as smtp:
-            if self.settings.smtp_use_tls:
-                smtp.starttls()
-            if username:
-                smtp.login(username, password)
-            smtp.send_message(message)
-        return {"provider": "smtp"}
-
-    def _channel_webhook_url(self, channel: str) -> str:
-        if channel == CHANNEL_SMS:
-            return self.settings.sms_webhook_url.strip()
-        if channel == CHANNEL_PUSH:
-            return self.settings.push_webhook_url.strip()
-        if channel == CHANNEL_WHATSAPP:
-            return self.settings.whatsapp_webhook_url.strip()
-        return ""
-
-    def _send_webhook_channel(
+    def _publish_to_sns_topic(
         self,
         *,
-        channel: str,
-        recipient: str,
+        topic_arn: str,
         subject: str,
-        payload: dict[str, object],
-        job_id: str,
-        event_type: str | None,
+        message: str,
+        attributes: dict[str, str] | None = None,
     ) -> dict[str, object]:
-        webhook_url = self._channel_webhook_url(channel)
-        if not webhook_url:
-            raise NotificationDeliveryError(
-                f"{channel} webhook URL is not configured.",
-                permanent=True,
-            )
-
-        body = {
-            "channel": channel,
-            "recipient": recipient,
-            "subject": subject,
-            "payload": payload,
-            "job_id": job_id,
-            "event_type": event_type,
-        }
-        raw = json.dumps(body, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        secret = (self.settings.notification_webhook_secret or "").strip()
-        if secret:
-            signature = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
-            headers["X-SafeBill-Signature"] = signature
-
-        with httpx.Client(timeout=20.0) as client:
-            response = client.post(webhook_url, content=raw, headers=headers)
-        if response.status_code >= 400:
-            raise NotificationDeliveryError(
-                f"{channel} webhook failed with status {response.status_code}",
-                status_code=response.status_code,
-                retry_after_seconds=_parse_retry_after_seconds(response.headers.get("Retry-After")),
-            )
-        payload_json: dict[str, object] | None = None
+        if boto3 is None:
+            raise NotificationDeliveryError("boto3 is unavailable for SNS delivery.", permanent=True)
+        region = (self.settings.sns_region or self.settings.aws_region or "").strip()
+        if not region:
+            raise NotificationDeliveryError("SNS region is not configured.", permanent=True)
+        if not topic_arn:
+            raise NotificationDeliveryError("SNS topic ARN is not configured.", permanent=True)
         try:
-            parsed = response.json()
-            if isinstance(parsed, dict):
-                payload_json = parsed
-        except Exception:
-            payload_json = {"raw": response.text[:500]}
-        return payload_json or {"status": "ok"}
+            client = boto3.client("sns", region_name=region)
+            response = client.publish(
+                TopicArn=topic_arn,
+                Subject=subject[:100] if subject else "SafeBill Notification",
+                Message=message,
+                MessageAttributes={
+                    key: {"DataType": "String", "StringValue": value}
+                    for key, value in (attributes or {}).items()
+                    if value
+                },
+            )
+        except Exception as exc:
+            raise NotificationDeliveryError(
+                f"SNS publish failed: {str(exc)[:400]}",
+                permanent=False,
+            ) from exc
+
+        message_id = str(response.get("MessageId") or "").strip() or None
+        payload: dict[str, object] = {"provider": "aws_sns", "status_code": 200}
+        if message_id:
+            payload["message_id"] = message_id[:128]
+        return payload
 
     def _send_notification_job(self, job: NotificationJob) -> dict[str, object]:
         payload = job.payload if isinstance(job.payload, dict) else {}
@@ -1348,14 +1323,55 @@ class NotificationService:
             )
             return self._send_email(recipient_email=job.recipient_email, subject=job.subject, body=body)
 
-        if job.channel in {CHANNEL_SMS, CHANNEL_PUSH, CHANNEL_WHATSAPP}:
-            return self._send_webhook_channel(
-                channel=job.channel,
-                recipient=job.recipient_email,
-                subject=job.subject,
-                payload=payload,
-                job_id=str(job.id),
-                event_type=job.event_type,
+        if job.channel == CHANNEL_SMS:
+            sms_provider = str(self.settings.sms_provider or "sns").strip().lower()
+            if sms_provider in {"sns", "aws_sns"}:
+                sms_text = f"{job.subject}\n{message}"
+                return self._send_sms_via_sns(recipient=job.recipient_email, message=sms_text[:1400])
+            raise NotificationDeliveryError("Unsupported SMS provider.", permanent=True)
+
+        if job.channel == CHANNEL_PUSH:
+            push_provider = str(self.settings.push_provider or "sns").strip().lower()
+            if push_provider not in {"sns", "aws_sns"}:
+                raise NotificationDeliveryError("Unsupported push provider.", permanent=True)
+            topic_arn = str(self.settings.sns_push_topic_arn or "").strip()
+            message = json.dumps(
+                {
+                    "recipient": job.recipient_email,
+                    "subject": job.subject,
+                    "payload": payload,
+                    "job_id": str(job.id),
+                    "event_type": job.event_type,
+                },
+                ensure_ascii=True,
+            )
+            return self._publish_to_sns_topic(
+                topic_arn=topic_arn,
+                subject=(job.subject or "SafeBill Push")[:100],
+                message=message,
+                attributes={"channel": "push"},
+            )
+
+        if job.channel == CHANNEL_WHATSAPP:
+            whatsapp_provider = str(self.settings.whatsapp_provider or "sns").strip().lower()
+            if whatsapp_provider not in {"sns", "aws_sns"}:
+                raise NotificationDeliveryError("Unsupported WhatsApp provider.", permanent=True)
+            topic_arn = str(self.settings.sns_whatsapp_topic_arn or "").strip()
+            message = json.dumps(
+                {
+                    "recipient": job.recipient_email,
+                    "subject": job.subject,
+                    "payload": payload,
+                    "job_id": str(job.id),
+                    "event_type": job.event_type,
+                },
+                ensure_ascii=True,
+            )
+            return self._publish_to_sns_topic(
+                topic_arn=topic_arn,
+                subject=(job.subject or "SafeBill WhatsApp")[:100],
+                message=message,
+                attributes={"channel": "whatsapp"},
             )
 
         raise RuntimeError(f"Unsupported notification channel: {job.channel}")

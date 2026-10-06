@@ -12,6 +12,7 @@ interface ChatRequestPayload {
     longitude: number
   }
   docContext?: {
+    docId?: string
     invoiceNumber?: string
     store?: string
   }
@@ -57,6 +58,22 @@ interface AskResponsePayload {
   }>
 }
 
+interface FallbackDocument {
+  sellerName?: string
+  items?: Array<{
+    invoiceNo?: string
+    purchaseDate?: string
+    purchasePrice?: number | null
+    productName?: string
+    warrantyEnd?: string
+  }>
+}
+
+function isNoGroundedRecords(answer: string | undefined): boolean {
+  const text = String(answer || '').trim().toLowerCase()
+  return text.includes('no relevant grounded records were found')
+}
+
 export async function POST(request: NextRequest) {
   try {
     const authToken = resolveRequestAuthToken(request)
@@ -70,8 +87,12 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Message is required' }, { status: 400 })
     }
 
+    const normalizedUserId =
+      body.userId && body.userId.trim().toLowerCase() !== 'anonymous'
+        ? body.userId.trim()
+        : ''
     const filters: Record<string, string> = {}
-    if (body.userId) filters.user_id = body.userId
+    if (normalizedUserId) filters.user_id = normalizedUserId
     if (body.docContext?.invoiceNumber) filters.bill_id = body.docContext.invoiceNumber
     if (body.docContext?.store) filters.vendor = body.docContext.store
 
@@ -83,7 +104,7 @@ export async function POST(request: NextRequest) {
       user_longitude: body.location?.longitude,
     }
 
-    const answer = await backendApiFetch<AskResponsePayload>(
+    let answer = await backendApiFetch<AskResponsePayload>(
       '/ask',
       {
         method: 'POST',
@@ -92,6 +113,55 @@ export async function POST(request: NextRequest) {
       CHAT_BACKEND_TIMEOUT_MS,
       authToken
     )
+
+    if (isNoGroundedRecords(answer.answer) && (filters.bill_id || filters.vendor)) {
+      const relaxedPayload = {
+        query: message,
+        top_k: 8,
+        filters: normalizedUserId ? { user_id: normalizedUserId } : {},
+        user_latitude: body.location?.latitude,
+        user_longitude: body.location?.longitude,
+      }
+      answer = await backendApiFetch<AskResponsePayload>(
+        '/ask',
+        {
+          method: 'POST',
+          body: JSON.stringify(relaxedPayload),
+        },
+        CHAT_BACKEND_TIMEOUT_MS,
+        authToken
+      )
+    }
+
+    if (isNoGroundedRecords(answer.answer) && body.docContext?.docId) {
+      try {
+        const doc = await backendApiFetch<FallbackDocument>(
+          `/documents/${body.docContext.docId}`,
+          { method: 'GET' },
+          CHAT_BACKEND_TIMEOUT_MS,
+          authToken
+        )
+        const item = doc.items?.[0]
+        const parts = [
+          item?.productName ? `Product: ${item.productName}` : '',
+          item?.invoiceNo ? `Invoice: ${item.invoiceNo}` : '',
+          doc.sellerName ? `Vendor: ${doc.sellerName}` : '',
+          item?.purchaseDate ? `Purchase date: ${item.purchaseDate}` : '',
+          item?.purchasePrice !== null && item?.purchasePrice !== undefined
+            ? `Amount: INR ${item.purchasePrice}`
+            : '',
+          item?.warrantyEnd ? `Warranty end: ${item.warrantyEnd}` : '',
+        ].filter(Boolean)
+        if (parts.length) {
+          answer = {
+            ...answer,
+            answer: `I could not use grounded chunks for this query, but from this document: ${parts.join(' | ')}`,
+          }
+        }
+      } catch {
+        // Keep original answer when fallback fetch fails.
+      }
+    }
 
     const timestamp = new Date().toISOString()
     return NextResponse.json({

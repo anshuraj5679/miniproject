@@ -4,9 +4,9 @@ import json
 from typing import Any
 
 try:
-    from openai import OpenAI
+    import boto3
 except Exception:  # pragma: no cover - optional runtime dependency
-    OpenAI = None  # type: ignore[assignment]
+    boto3 = None  # type: ignore[assignment]
 
 from app.core.config import get_settings
 from app.services.planner import Plan
@@ -16,8 +16,14 @@ from app.services.retrieval import RetrievalHit
 class GroundedAnswerGenerator:
     def __init__(self) -> None:
         settings = get_settings()
-        self.model = settings.openai_chat_model
-        self.client = OpenAI(api_key=settings.openai_api_key) if (settings.openai_api_key and OpenAI) else None
+        self.aws_only_mode = settings.aws_only_mode
+        self.model = settings.bedrock_chat_model
+        self.bedrock = None
+        if boto3:
+            try:
+                self.bedrock = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+            except Exception:
+                self.bedrock = None
 
     @staticmethod
     def _context_block(hits: list[RetrievalHit]) -> str:
@@ -70,7 +76,9 @@ class GroundedAnswerGenerator:
                 "numeric_claims": [],
             }
 
-        if not self.client:
+        if not self.bedrock:
+            if self.aws_only_mode:
+                raise RuntimeError("AWS-only mode: Bedrock runtime client is unavailable.")
             return self._fallback_answer(query, hits, calculations, policy)
 
         prompt = (
@@ -90,20 +98,34 @@ class GroundedAnswerGenerator:
         }
 
         try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0,
-                response_format={"type": "json_object"},
+            response = self.bedrock.converse(
+                modelId=self.model,
+                system=[{"text": prompt}],
                 messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": json.dumps(user_data, default=str)},
+                    {
+                        "role": "user",
+                        "content": [{"text": json.dumps(user_data, default=str)}],
+                    }
                 ],
+                inferenceConfig={"temperature": 0.0, "maxTokens": 1200},
             )
-            payload = json.loads(completion.choices[0].message.content or "{}")
+            content_blocks = (
+                response.get("output", {})
+                .get("message", {})
+                .get("content", [])
+            )
+            response_text = "".join(
+                str(block.get("text", ""))
+                for block in content_blocks
+                if isinstance(block, dict)
+            ).strip()
+            payload = json.loads(response_text or "{}")
             payload.setdefault("answer", "")
             payload.setdefault("claims", [])
             payload.setdefault("citation_chunk_ids", [])
             payload.setdefault("numeric_claims", [])
             return payload
         except Exception:
+            if self.aws_only_mode:
+                raise
             return self._fallback_answer(query, hits, calculations, policy)

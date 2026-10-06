@@ -42,3 +42,5 @@ dist/
 nextjs-app/build_log.txt
 nextjs-app/lint.txt
 backend/temp_test_invoice.pdf
+backend/.tmp-pip/
+backend/infra/aws-lambda/.aws-sam/

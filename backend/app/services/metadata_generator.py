@@ -6,9 +6,9 @@ from collections import Counter
 from typing import Any
 
 try:
-    from openai import OpenAI
+    import boto3
 except Exception:  # pragma: no cover - optional runtime dependency
-    OpenAI = None  # type: ignore[assignment]
+    boto3 = None  # type: ignore[assignment]
 
 from app.core.config import get_settings
 
@@ -37,8 +37,14 @@ STOPWORDS = {
 class MetadataGenerator:
     def __init__(self) -> None:
         settings = get_settings()
-        self.model = settings.openai_chat_model
-        self.client = OpenAI(api_key=settings.openai_api_key) if (settings.openai_api_key and OpenAI) else None
+        self.aws_only_mode = settings.aws_only_mode
+        self.model = settings.bedrock_chat_model
+        self.bedrock = None
+        if boto3:
+            try:
+                self.bedrock = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+            except Exception:
+                self.bedrock = None
 
     @staticmethod
     def _fallback_metadata(content: str, chunk_type: str) -> dict[str, Any]:
@@ -60,7 +66,9 @@ class MetadataGenerator:
         }
 
     def generate(self, content: str, chunk_type: str, document_id: str, chunk_id: str) -> dict[str, Any]:
-        if not self.client:
+        if not self.bedrock:
+            if self.aws_only_mode:
+                raise RuntimeError("AWS-only mode: Bedrock runtime client is unavailable.")
             return self._fallback_metadata(content, chunk_type)
 
         prompt = (
@@ -77,16 +85,22 @@ class MetadataGenerator:
             f"{content}"
         )
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": user_input},
-                ],
+            response = self.bedrock.converse(
+                modelId=self.model,
+                system=[{"text": prompt}],
+                messages=[{"role": "user", "content": [{"text": user_input}]}],
+                inferenceConfig={"temperature": 0.0, "maxTokens": 500},
             )
-            raw = response.choices[0].message.content or "{}"
+            content_blocks = (
+                response.get("output", {})
+                .get("message", {})
+                .get("content", [])
+            )
+            raw = "".join(
+                str(block.get("text", ""))
+                for block in content_blocks
+                if isinstance(block, dict)
+            ).strip()
             parsed = json.loads(raw)
             summary = str(parsed.get("summary", "")).strip()
             keywords = [str(keyword).lower().strip() for keyword in parsed.get("keywords", []) if str(keyword).strip()]
@@ -104,4 +118,6 @@ class MetadataGenerator:
                 "hypothetical_questions": questions[:3],
             }
         except Exception:
+            if self.aws_only_mode:
+                raise
             return self._fallback_metadata(content, chunk_type)

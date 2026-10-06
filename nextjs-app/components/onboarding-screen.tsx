@@ -52,7 +52,7 @@ export function OnboardingScreen() {
                       Date Found
                     </div>
                     <div className="badge badge-info badge-sm absolute bottom-6 left-6 gap-1">
-                      OpenAI Analysis
+                      AI Analysis
                     </div>
                   </div>
                 </div>

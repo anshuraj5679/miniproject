@@ -1,6 +1,6 @@
-# Quick Deployment Guide
+# Quick AWS Deploy (Frontend)
 
-## 1. Push to GitHub
+## 1) Push Code
 
 ```powershell
 cd nextjs-app
@@ -9,29 +9,20 @@ git branch -M main
 git push -u origin main
 ```
 
-## 2. Deploy to Vercel
+## 2) Deploy on AWS Amplify
 
-1. Open `https://vercel.com/new`
-2. Import your repository
-3. Add env vars:
+1. Open AWS Amplify Console.
+2. Connect your GitHub repo.
+3. Set app root to `nextjs-app`.
+4. Confirm `amplify.yml` is used.
+5. Add environment variables from `DEPLOYMENT.md`.
+6. Deploy.
 
-```env
-NEXT_PUBLIC_SUPABASE_URL=your-supabase-url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
-SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
-NEXT_PUBLIC_APP_API_BASE_URL=/api
-BACKEND_API_BASE_URL=https://your-backend-domain
-BACKEND_API_SERVICE_TOKEN=
-BACKEND_API_TIMEOUT_MS=45000
-```
+## 3) Verify
 
-4. Click Deploy
+- Cognito login works.
+- `/locker` loads assets.
+- `/scan` uploads invoice.
+- `/chat` returns grounded answers.
 
-## 3. Done Checklist
-
-- Scan page can upload PDF/image
-- Locker shows ingested documents
-- Chat returns grounded answers
-- Reminders list renders
-
-For full details, see `DEPLOYMENT.md`.
+For full setup, use `DEPLOYMENT.md`.

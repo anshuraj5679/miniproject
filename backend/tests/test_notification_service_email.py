@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -8,35 +9,17 @@ from app.core.config import get_settings
 from app.services.notifications import NotificationDeliveryError, NotificationService
 
 
-class _FakeResponse:
-    def __init__(
-        self,
-        *,
-        status_code: int,
-        text: str = "",
-        json_payload: dict[str, Any] | None = None,
-        headers: dict[str, str] | None = None,
-    ) -> None:
-        self.status_code = status_code
-        self.text = text
-        self._json_payload = json_payload or {}
-        self.headers = headers or {}
-
-    def json(self) -> dict[str, Any]:
-        return self._json_payload
-
-
 def _configure_service(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> NotificationService:
     settings = get_settings()
     baseline = {
         "email_from": "alerts@example.com",
         "email_from_name": "SafeBill",
-        "resend_api_key": "",
-        "resend_api_base_url": "https://api.resend.com",
-        "email_webhook_url": "",
-        "email_webhook_api_key": "",
-        "email_webhook_min_interval_seconds": 0.0,
-        "smtp_host": "",
+        "email_provider": "ses",
+        "ses_region": "ap-southeast-2",
+        "ses_configuration_set": "",
+        "ses_source_arn": "",
+        "ses_from_arn": "",
+        "ses_reply_to_addresses": "",
     }
     merged = {**baseline, **overrides}
     for key, value in merged.items():
@@ -63,163 +46,61 @@ def test_send_email_rejects_invalid_email_from(monkeypatch: pytest.MonkeyPatch) 
     assert err.permanent is True
 
 
-def test_send_email_uses_parsed_name_from_email_from(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_send_email_uses_ses_when_provider_is_ses(monkeypatch: pytest.MonkeyPatch) -> None:
     captured_payload: dict[str, Any] = {}
 
-    class _FakeClient:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            _ = args, kwargs
+    class _FakeSESClient:
+        def send_email(self, **kwargs: Any) -> dict[str, Any]:
+            captured_payload["kwargs"] = kwargs
+            return {"MessageId": "ses_123"}
 
-        def __enter__(self) -> "_FakeClient":
-            return self
-
-        def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
-            _ = exc_type, exc, tb
-            return None
-
-        def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any]) -> _FakeResponse:
-            captured_payload["url"] = url
-            captured_payload["headers"] = headers
-            captured_payload["json"] = json
-            return _FakeResponse(status_code=200, json_payload={"id": "msg_123"})
-
-    monkeypatch.setattr("app.services.notifications.httpx.Client", _FakeClient)
+    monkeypatch.setattr(
+        "app.services.notifications.boto3",
+        SimpleNamespace(client=lambda service_name, region_name=None: _FakeSESClient()),
+    )
     service = _configure_service(
         monkeypatch,
-        email_from="Alert Team <alerts@example.com>",
-        email_from_name="",
-        resend_api_key="",
-        email_webhook_url="https://email.example.com/emails",
-        email_webhook_api_key="test_key",
+        email_provider="ses",
+        email_from="SafeBill <alerts@example.com>",
+        ses_region="ap-southeast-2",
     )
 
-    result = service._send_email(
-        recipient_email="user@example.com",
-        subject="Subject",
-        body="Body",
+    result = service._send_email(recipient_email="user@example.com", subject="Subject", body="Body")
+
+    assert result["provider"] == "aws_ses"
+    assert result["message_id"] == "ses_123"
+    assert "kwargs" in captured_payload
+    assert captured_payload["kwargs"]["FromEmailAddress"] == "SafeBill <alerts@example.com>"
+
+
+def test_send_email_marks_ses_message_rejected_as_permanent(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _SESFailure(Exception):
+        def __init__(self) -> None:
+            self.response = {
+                "Error": {"Code": "MessageRejected", "Message": "Address not verified"},
+                "ResponseMetadata": {"HTTPStatusCode": 400},
+            }
+            super().__init__("MessageRejected")
+
+    class _FakeSESClient:
+        def send_email(self, **kwargs: Any) -> dict[str, Any]:
+            _ = kwargs
+            raise _SESFailure()
+
+    monkeypatch.setattr(
+        "app.services.notifications.boto3",
+        SimpleNamespace(client=lambda service_name, region_name=None: _FakeSESClient()),
     )
-
-    assert captured_payload["json"]["from"] == "Alert Team <alerts@example.com>"
-    assert result["provider"] == "email_webhook"
-    assert result["message_id"] == "msg_123"
-
-
-def test_send_email_surfaces_retry_after_on_429(monkeypatch: pytest.MonkeyPatch) -> None:
-    class _FakeClient:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            _ = args, kwargs
-
-        def __enter__(self) -> "_FakeClient":
-            return self
-
-        def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
-            _ = exc_type, exc, tb
-            return None
-
-        def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any]) -> _FakeResponse:
-            _ = url, headers, json
-            return _FakeResponse(
-                status_code=429,
-                text='{"statusCode":429,"name":"rate_limit_exceeded"}',
-                headers={"Retry-After": "7"},
-            )
-
-    monkeypatch.setattr("app.services.notifications.httpx.Client", _FakeClient)
     service = _configure_service(
         monkeypatch,
+        email_provider="ses",
         email_from="alerts@example.com",
-        resend_api_key="",
-        email_webhook_url="https://email.example.com/emails",
+        ses_region="ap-southeast-2",
     )
 
     with pytest.raises(NotificationDeliveryError) as exc:
-        service._send_email(
-            recipient_email="user@example.com",
-            subject="Subject",
-            body="Body",
-        )
+        service._send_email(recipient_email="user@example.com", subject="Subject", body="Body")
 
     err = exc.value
-    assert err.status_code == 429
-    assert err.retry_after_seconds == 7
-    assert err.permanent is False
-
-
-def test_send_email_uses_resend_when_api_key_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured_payload: dict[str, Any] = {}
-
-    class _FakeClient:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            _ = args, kwargs
-
-        def __enter__(self) -> "_FakeClient":
-            return self
-
-        def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
-            _ = exc_type, exc, tb
-            return None
-
-        def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any]) -> _FakeResponse:
-            captured_payload["url"] = url
-            captured_payload["headers"] = headers
-            captured_payload["json"] = json
-            return _FakeResponse(status_code=200, json_payload={"id": "res_123"})
-
-    monkeypatch.setattr("app.services.notifications.httpx.Client", _FakeClient)
-    service = _configure_service(
-        monkeypatch,
-        email_from="SafeBill <onboarding@resend.dev>",
-        resend_api_key="resend_test_key",
-        resend_api_base_url="https://api.resend.com",
-        email_webhook_url="https://email.example.com/emails",
-    )
-
-    result = service._send_email(
-        recipient_email="user@example.com",
-        subject="Subject",
-        body="Body",
-    )
-
-    assert captured_payload["url"] == "https://api.resend.com/emails"
-    assert captured_payload["headers"]["Authorization"] == "Bearer resend_test_key"
-    assert captured_payload["json"]["from"] == "SafeBill <onboarding@resend.dev>"
-    assert result["provider"] == "resend"
-    assert result["message_id"] == "res_123"
-
-
-def test_send_email_marks_resend_422_as_permanent(monkeypatch: pytest.MonkeyPatch) -> None:
-    class _FakeClient:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            _ = args, kwargs
-
-        def __enter__(self) -> "_FakeClient":
-            return self
-
-        def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
-            _ = exc_type, exc, tb
-            return None
-
-        def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any]) -> _FakeResponse:
-            _ = url, headers, json
-            return _FakeResponse(
-                status_code=422,
-                text='{"statusCode":422,"name":"validation_error"}',
-            )
-
-    monkeypatch.setattr("app.services.notifications.httpx.Client", _FakeClient)
-    service = _configure_service(
-        monkeypatch,
-        email_from="onboarding@resend.dev",
-        resend_api_key="resend_test_key",
-    )
-
-    with pytest.raises(NotificationDeliveryError) as exc:
-        service._send_email(
-            recipient_email="user@example.com",
-            subject="Subject",
-            body="Body",
-        )
-
-    err = exc.value
-    assert err.status_code == 422
+    assert err.status_code == 400
     assert err.permanent is True

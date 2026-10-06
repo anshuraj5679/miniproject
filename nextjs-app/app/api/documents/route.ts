@@ -10,7 +10,11 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const userId = request.nextUrl.searchParams.get('userId') || undefined
+    const rawUserId = request.nextUrl.searchParams.get('userId') || undefined
+    const userId =
+      rawUserId && rawUserId.trim().toLowerCase() !== 'anonymous'
+        ? rawUserId.trim()
+        : undefined
     const merchantUserId = request.nextUrl.searchParams.get('merchantUserId') || undefined
     const limit = request.nextUrl.searchParams.get('limit') || undefined
     const path = withQuery('/documents', {

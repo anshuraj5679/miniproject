@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation'
 import { Check, Copy, ShieldCheck, UserPlus } from 'lucide-react'
 import { ThemeToggle } from './theme-toggle'
 import { useAuthStore } from '@/lib/store/auth-store'
-import { supabase } from '@/lib/supabase'
+import { buildHostedUiAuthorizeUrl, type CognitoAuthResult } from '@/lib/cognito'
 import { useGsapReveal } from '@/lib/gsap-helpers'
 
 type UserType = 'consumer' | 'merchant'
@@ -44,44 +44,49 @@ export function SignupScreen() {
       const normalizedEmail = email.trim().toLowerCase()
       const customId = buildCustomId(userType)
 
-      const { data: authData, error: authError } = await supabase.auth.signUp({
-        email: normalizedEmail,
-        password,
-        options: { data: { name: name.trim(), user_type: userType, custom_id: customId } },
+      const signupResponse = await fetch('/api/auth/cognito/signup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: normalizedEmail,
+          password,
+          name: name.trim(),
+          userType,
+          customId,
+        }),
       })
-      if (authError) throw authError
-
-      const userId = authData.user?.id
-      if (!userId) throw new Error('Signup failed.')
-
-      const { error: profileError } = await supabase.from('user_profiles').insert({
-        user_id: userId,
-        custom_id: customId,
-        email: normalizedEmail,
-        full_name: name.trim(),
-        user_type: userType,
-      })
-      if (profileError) {
-        // Handle race if profile exists already.
-        const { data: existing, error: readError } = await supabase
-          .from('user_profiles')
-          .select('custom_id, full_name, user_type')
-          .eq('user_id', userId)
-          .maybeSingle()
-        if (readError || !existing?.custom_id) throw profileError
+      const signupPayload = (await signupResponse.json().catch(() => null)) as
+        | { userSub?: string; userConfirmed?: boolean; error?: string }
+        | null
+      if (!signupResponse.ok) {
+        throw new Error(signupPayload?.error || 'Signup failed.')
       }
 
-      const session = authData.session
-      if (session?.access_token) {
+      const loginResponse = await fetch('/api/auth/cognito/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: normalizedEmail,
+          password,
+          userType,
+          customId,
+          name: name.trim(),
+        }),
+      })
+      const loginPayload = (await loginResponse.json().catch(() => null)) as (CognitoAuthResult & { error?: string }) | null
+
+      if (loginResponse.ok && loginPayload?.accessToken && loginPayload.user?.userId) {
         await setAuth(
           {
-            userId,
+            userId: loginPayload.user.userId,
             email: normalizedEmail,
-            name: name.trim(),
+            name: loginPayload.user.name || name.trim(),
             userType,
             customId,
+            picture: loginPayload.user.picture,
+            provider: loginPayload.user.provider,
           },
-          session.access_token
+          loginPayload.accessToken
         )
       }
 
@@ -94,15 +99,12 @@ export function SignupScreen() {
   }
 
   const handleGoogleSignUp = async () => {
-    setLoading(true)
-    setError(null)
+      setLoading(true)
+      setError(null)
     try {
       localStorage.setItem('login_user_type', userType)
-      const { error: oauthError } = await supabase.auth.signInWithOAuth({
-        provider: 'google',
-        options: { redirectTo: `${window.location.origin}/auth/callback?user_type=${userType}` },
-      })
-      if (oauthError) throw oauthError
+      const authorizeUrl = buildHostedUiAuthorizeUrl(userType)
+      window.location.assign(authorizeUrl)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Google sign-up failed.')
       setLoading(false)
@@ -146,7 +148,7 @@ export function SignupScreen() {
               data-gsap-hover="lift"
               className="btn btn-primary w-full"
             >
-              Continue to {userType === 'merchant' ? 'Dashboard' : 'Locker'}
+              Continue to {userType === 'merchant' ? 'Dashboard' : 'SafeBill'}
             </button>
           </div>
         </div>

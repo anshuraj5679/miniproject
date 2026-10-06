@@ -66,10 +66,27 @@ REVIEW_FIELDS = {
 }
 ENGINE_WEIGHTS = {
     "manual_override": 1.0,
-    "openai_vision": 0.93,
+    "aws_bedrock_vision": 0.94,
     "aws_textract": 0.9,
-    "google_docai": 0.9,
+    "aws_textract_proxy": 0.89,
+    "google_vision": 0.88,
     "tesseract_regex": 0.72,
+}
+GROUNDED_OCR_FIELDS = {
+    "bill_id",
+    "vendor",
+    "date",
+    "total_amount",
+    "vendor_tax_id",
+    "taxable_amount",
+    "gst_amount",
+    "gst_rate",
+    "cgst_amount",
+    "sgst_amount",
+    "igst_amount",
+    "product_name",
+    "serial_number",
+    "line_items",
 }
 
 _DATE_LIKE_RE = re.compile(
@@ -167,6 +184,156 @@ def _normalize_category(value: object) -> str | None:
     return None
 
 
+def _looks_like_non_merchandise_line_item(name: str | None) -> bool:
+    text = (name or "").strip().lower()
+    if not text:
+        return False
+    compact = re.sub(r"\s+", " ", text)
+
+    blocked_tokens = (
+        "customer number",
+        "customer no",
+        "customer id",
+        "document number",
+        "invoice number",
+        "tax invoice number",
+        "order number",
+        "po number",
+        "purchase order number",
+        "ship to",
+        "bill to",
+        "place of supply",
+        "gstin",
+        "pan",
+        "address",
+        "pincode",
+        "postal code",
+        "phone",
+        "email",
+        "tax rate",
+        "item number",
+        "hsn",
+    )
+    if any(token in compact for token in blocked_tokens):
+        return True
+
+    if re.fullmatch(r"(?:customer|invoice|document|order|po|gst|pan|hsn|item)\s*(?:no|number|id|code)", compact):
+        return True
+    return False
+
+
+def _looks_like_address_text(value: str | None) -> bool:
+    text = (value or "").strip().lower()
+    if len(text) < 12:
+        return False
+
+    location_tokens = (
+        "plot no",
+        "road",
+        "rd",
+        "street",
+        "lane",
+        "nagar",
+        "estate",
+        "industrial",
+        "indl",
+        "building",
+        "tower",
+        "floor",
+        "mumbai",
+        "maharashtra",
+        "bengaluru",
+        "bangalore",
+        "karnataka",
+        "kerala",
+        "india",
+    )
+    has_location_signal = any(token in text for token in location_tokens)
+    has_pincode = re.search(r"\b[1-9][0-9]{5}\b", text) is not None
+    if has_location_signal and (has_pincode or text.count(",") >= 2):
+        return True
+    if text.count(",") >= 3 and has_location_signal:
+        return True
+    return False
+
+
+def _is_inventory_code_token(token: str) -> bool:
+    cleaned = token.strip().strip("()[]{}.,;:")
+    if not cleaned:
+        return False
+    if re.fullmatch(r"\d{4,}", cleaned):
+        return True
+    if "/" in cleaned and any(ch.isdigit() for ch in cleaned):
+        return True
+    if re.fullmatch(r"[A-Z]{1,4}\d{3,}[A-Z0-9\-]*", cleaned):
+        return True
+    if re.fullmatch(r"[A-Z0-9\-]{6,}", cleaned) and any(ch.isdigit() for ch in cleaned):
+        # Keep compact capacity tokens like 128GB.
+        if re.fullmatch(r"\d{2,4}[A-Z]{1,4}", cleaned):
+            return False
+        return True
+    return False
+
+
+def sanitize_merchandise_name(value: object) -> str | None:
+    text = _normalize_text(value)
+    if not text:
+        return None
+
+    cleaned = re.sub(r"\s+", " ", text).strip(":- ")
+    cleaned = re.sub(
+        r"(?i)^(?:item|product|description|material|model)\s*(?:no|number|name|code)?\s*[:\-]\s*",
+        "",
+        cleaned,
+    ).strip(":- ")
+
+    # Drop trailing tabular numeric columns (qty/rate/amount/tax).
+    cleaned = re.sub(
+        r"\s+[0-9][0-9,]*(?:\.\d{1,2})?(?:\s+[0-9][0-9,]*(?:\.\d{1,2})?){1,6}\s*$",
+        "",
+        cleaned,
+    ).strip(":- ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(":- ")
+    if not cleaned:
+        return None
+
+    tokens = cleaned.split()
+    removed = 0
+    while len(tokens) >= 3 and removed < 2 and re.fullmatch(r"\d{1,2}", tokens[0]):
+        tokens.pop(0)
+        removed += 1
+    while len(tokens) >= 3 and removed < 2 and _is_inventory_code_token(tokens[0]):
+        tokens.pop(0)
+        removed += 1
+    while len(tokens) >= 4 and re.fullmatch(r"\d{1,3}", tokens[-2]) and tokens[-1].upper() in {"NOS", "PCS", "PC", "UNIT", "UNITS"}:
+        tokens = tokens[:-2]
+    while len(tokens) >= 3 and tokens[-1].upper() in {"NOS", "PCS", "PC", "UNIT", "UNITS"}:
+        tokens.pop()
+    while len(tokens) >= 3 and _is_inventory_code_token(tokens[-1]):
+        tokens.pop()
+    while len(tokens) >= 3 and re.fullmatch(r"\d{5,10}", tokens[-1]):
+        tokens.pop()
+    if len(tokens) >= 3 and tokens[-1].upper() in {"CN", "IN", "US", "EU", "UK"}:
+        tokens.pop()
+
+    normalized = " ".join(tokens).strip(":- ")
+    if not normalized:
+        return None
+    if re.fullmatch(r"\d+\s*(?:NOS|PCS|PC|UNIT|UNITS)", normalized.upper()):
+        return None
+    if len(tokens) <= 2 and any(_is_inventory_code_token(token) for token in tokens):
+        return None
+    if _looks_like_non_merchandise_line_item(normalized):
+        return None
+    if _looks_like_address_text(normalized):
+        return None
+    if _safe_date_iso(normalized) is not None and len(normalized) <= 24:
+        return None
+    if len(re.findall(r"[A-Za-z]", normalized)) < 2:
+        return None
+    return normalized[:255]
+
+
 class StrictLineItem(BaseModel):
     name: str | None = None
     quantity: float | None = None
@@ -182,6 +349,9 @@ class StrictLineItem(BaseModel):
     @field_validator("name", mode="before")
     @classmethod
     def _coerce_name(cls, value: object) -> str | None:
+        cleaned = sanitize_merchandise_name(value)
+        if cleaned:
+            return cleaned
         text = _normalize_text(value)
         return text[:255] if text else None
 
@@ -272,6 +442,70 @@ class StrictInvoiceExtraction(BaseModel):
             context = " ".join(context_parts)
             if _looks_like_dimension_amount(self.total_amount, context):
                 self.total_amount = None
+
+        sanitized_items: list[StrictLineItem] = []
+        for item in self.line_items:
+            item.name = sanitize_merchandise_name(item.name)
+            name = (item.name or "").strip()
+            if _looks_like_non_merchandise_line_item(name):
+                continue
+            amount = _safe_float(item.amount)
+            if amount is not None and (amount <= 0 or amount > 10_000_000):
+                item.amount = None
+                amount = None
+            if not name:
+                continue
+            sanitized_items.append(item)
+        self.line_items = sanitized_items[:50]
+
+        self.product_name = sanitize_merchandise_name(self.product_name)
+        if not self.product_name:
+            for item in self.line_items:
+                candidate = sanitize_merchandise_name(item.name)
+                if candidate:
+                    self.product_name = candidate
+                    break
+
+        taxable_amount = _safe_float(self.taxable_amount)
+        gst_amount = _safe_float(self.gst_amount)
+        if gst_amount is None:
+            split_gst = sum(
+                part
+                for part in (
+                    _safe_float(self.cgst_amount),
+                    _safe_float(self.sgst_amount),
+                    _safe_float(self.igst_amount),
+                )
+                if part is not None and part > 0
+            )
+            if split_gst > 0:
+                gst_amount = round(split_gst, 2)
+                self.gst_amount = gst_amount
+
+        computed_total: float | None = None
+        if taxable_amount is not None and taxable_amount > 0 and gst_amount is not None and gst_amount >= 0:
+            computed_total = round(taxable_amount + gst_amount, 2)
+        elif gst_amount is not None and gst_amount > 0 and self.line_items:
+            line_total = sum(
+                amount
+                for amount in (_safe_float(item.amount) for item in self.line_items)
+                if amount is not None and amount > 0
+            )
+            if line_total > 0:
+                computed_total = round(line_total + gst_amount, 2)
+
+        if computed_total is not None:
+            total_amount = _safe_float(self.total_amount)
+            if total_amount is None:
+                self.total_amount = computed_total
+            elif taxable_amount is not None and abs(total_amount - taxable_amount) <= max(1.0, taxable_amount * 0.02):
+                # Replace taxable-value captures with invoice total when GST is available.
+                self.total_amount = computed_total
+            elif computed_total > 0 and (
+                total_amount > computed_total * 2.5 or total_amount < computed_total * 0.4
+            ):
+                # Replace obvious outliers like pincodes or partial amounts when tax math is stronger.
+                self.total_amount = computed_total
         return self
 
 
@@ -432,6 +666,38 @@ def merge_engine_results(
     return strict, confidence_map, source_map
 
 
+def prefer_grounded_ocr_fields(
+    merged_metadata: dict[str, Any],
+    grounded_metadata: dict[str, Any],
+    *,
+    confidence_map: dict[str, float] | None = None,
+    source_map: dict[str, str] | None = None,
+    grounded_confidence_map: dict[str, float] | None = None,
+    grounded_source_map: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], dict[str, float], dict[str, str]]:
+    stabilized = ensure_strict_extraction(merged_metadata)
+    grounded = ensure_strict_extraction(grounded_metadata)
+    merged_confidences = dict(confidence_map or {})
+    merged_sources = dict(source_map or {})
+    grounded_confidences = dict(grounded_confidence_map or {})
+    grounded_sources = dict(grounded_source_map or {})
+
+    for field in GROUNDED_OCR_FIELDS:
+        value = grounded.get(field)
+        if not _is_meaningful(value):
+            continue
+        stabilized[field] = value
+        grounded_confidence = _safe_float(grounded_confidences.get(field))
+        if grounded_confidence is not None:
+            merged_confidences[field] = max(0.0, min(grounded_confidence, 1.0))
+        grounded_source = str(grounded_sources.get(field) or "").strip()
+        if grounded_source:
+            merged_sources[field] = grounded_source
+
+    stabilized = ensure_strict_extraction(stabilized)
+    return stabilized, merged_confidences, merged_sources
+
+
 def build_review_fields(
     field_confidences: dict[str, float],
     *,
@@ -523,6 +789,27 @@ def estimate_claim_readiness(
         label = "ready"
         summary = "Claim packet quality is strong with healthy deadline buffer."
 
+    if days_left <= 0:
+        deadline_risk = "expired"
+    elif days_left <= 7:
+        deadline_risk = "critical"
+    elif days_left <= 30:
+        deadline_risk = "watch"
+    else:
+        deadline_risk = "stable"
+
+    recommended_actions: list[str] = []
+    if "invoice_number" in missing:
+        recommended_actions.append("Upload or verify invoice number before raising claim.")
+    if "serial_number" in missing:
+        recommended_actions.append("Add product serial number photo to strengthen claim validation.")
+    if "service_center" in missing:
+        recommended_actions.append("Find nearby authorized service center and attach service reference.")
+    if deadline_risk in {"critical", "watch"}:
+        recommended_actions.append("Raise claim request today to avoid missing warranty deadline.")
+    if not recommended_actions:
+        recommended_actions.append("Claim packet looks ready. Submit issue summary with attachments.")
+
     return {
         "score": score,
         "label": label,
@@ -530,4 +817,6 @@ def estimate_claim_readiness(
         "factors": factors,
         "missing": missing,
         "days_left": days_left,
+        "deadline_risk": deadline_risk,
+        "recommended_actions": recommended_actions[:5],
     }

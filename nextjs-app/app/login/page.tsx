@@ -4,7 +4,7 @@ import { useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { LogIn, ShieldCheck } from 'lucide-react'
 import { useAuthStore } from '@/lib/store/auth-store'
-import { supabase } from '@/lib/supabase'
+import { buildHostedUiAuthorizeUrl, type CognitoAuthResult } from '@/lib/cognito'
 
 type UserType = 'consumer' | 'merchant'
 
@@ -49,72 +49,46 @@ export default function LoginPage() {
             })
             const lookupData = (await lookupResponse.json().catch(() => null)) as LookupApiResponse | null
 
-            if (lookupResponse.ok && lookupData?.email) {
-                resolvedEmail = lookupData.email
-                resolvedType = (lookupData.userType || userType) as UserType
-                resolvedCustomId = lookupData.customId || normalizedCustomId
-                resolvedName = lookupData.fullName || ''
-            } else {
-                const idField = userType === 'consumer' ? 'consumer_id' : 'merchant_id'
-                const { data: legacyProfile, error: legacyLookupError } = await supabase
-                    .from('profiles')
-                    .select('id, email, name, user_type, consumer_id, merchant_id')
-                    .eq(idField, normalizedCustomId)
-                    .single()
-
-                if (legacyLookupError || !legacyProfile?.email) {
-                    throw new Error(`No account found for this ${userType} ID.`)
-                }
-
-                resolvedEmail = String(legacyProfile.email)
-                resolvedType = ((legacyProfile.user_type as UserType | null) || userType) as UserType
-                resolvedCustomId =
-                    (String(legacyProfile.consumer_id || legacyProfile.merchant_id || '').trim() || normalizedCustomId)
-                resolvedName = String(legacyProfile.name || '').trim()
+            if (!lookupResponse.ok || !lookupData?.email) {
+                throw new Error(`No account found for this ${userType} ID.`)
             }
+            resolvedEmail = lookupData.email
+            resolvedType = (lookupData.userType || userType) as UserType
+            resolvedCustomId = lookupData.customId || normalizedCustomId
+            resolvedName = lookupData.fullName || ''
 
-            const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
-                email: resolvedEmail,
-                password: password,
+            const authResponse = await fetch('/api/auth/cognito/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    email: resolvedEmail,
+                    password,
+                    userType: resolvedType,
+                    customId: resolvedCustomId,
+                    name: resolvedName,
+                }),
             })
+            const authData = (await authResponse.json().catch(() => null)) as (CognitoAuthResult & { error?: string }) | null
 
-            if (authError) throw authError
-
-            const userId = authData.user?.id
-            if (!userId) throw new Error('Login failed.')
-            const sessionToken = authData.session?.access_token || ''
-
-            const { data: currentProfile } = await supabase
-                .from('user_profiles')
-                .select('custom_id, full_name, user_type')
-                .eq('user_id', userId)
-                .maybeSingle()
-
-            if (currentProfile) {
-                resolvedType = (currentProfile.user_type as UserType | null) || resolvedType
-                resolvedCustomId = currentProfile.custom_id || resolvedCustomId
-                resolvedName = currentProfile.full_name || resolvedName
-            } else {
-                try {
-                    await supabase.from('user_profiles').insert({
-                        user_id: userId,
-                        custom_id: resolvedCustomId,
-                        email: resolvedEmail,
-                        full_name: resolvedName || authData.user?.user_metadata?.name || resolvedEmail.split('@')[0] || 'User',
-                        user_type: resolvedType,
-                    })
-                } catch {
-                    // Ignore repair failures; auth session is still valid.
-                }
+            if (!authResponse.ok || !authData?.accessToken || !authData.user?.userId) {
+                throw new Error(authData?.error || 'Login failed.')
             }
+            const userId = authData.user.userId
+            if (!userId) throw new Error('Login failed.')
+            const sessionToken = authData.accessToken || ''
+            resolvedType = authData.user.userType || resolvedType
+            resolvedCustomId = authData.user.customId || resolvedCustomId
+            resolvedName = authData.user.name || resolvedName
 
             await setAuth(
                 {
                     userId,
-                    email: authData.user?.email || resolvedEmail,
+                    email: authData.user.email || resolvedEmail,
                     userType: resolvedType,
                     customId: resolvedCustomId || undefined,
-                    name: resolvedName || authData.user?.user_metadata?.name || '',
+                    name: resolvedName || '',
+                    picture: authData.user.picture,
+                    provider: authData.user.provider,
                 },
                 sessionToken
             )
@@ -137,11 +111,8 @@ export default function LoginPage() {
         setError(null)
         try {
             localStorage.setItem('login_user_type', userType)
-            const { error: oauthError } = await supabase.auth.signInWithOAuth({
-                provider: 'google',
-                options: { redirectTo: `${window.location.origin}/auth/callback?user_type=${userType}` },
-            })
-            if (oauthError) throw oauthError
+            const authorizeUrl = buildHostedUiAuthorizeUrl(userType)
+            window.location.assign(authorizeUrl)
         } catch (err: unknown) {
             setError(err instanceof Error ? err.message : 'Google sign-in failed.')
             setLoading(false)

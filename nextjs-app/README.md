@@ -52,9 +52,17 @@ cp .env.local.example .env.local
 
 3. Update `.env.local` with your configuration:
 ```env
-NEXT_PUBLIC_SUPABASE_URL=your-supabase-url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
-SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
+NEXT_PUBLIC_COGNITO_REGION=your-aws-region
+NEXT_PUBLIC_COGNITO_DOMAIN=your-cognito-domain
+NEXT_PUBLIC_COGNITO_CLIENT_ID=your-cognito-client-id
+NEXT_PUBLIC_COGNITO_REDIRECT_URI=http://localhost:3000/auth/callback
+NEXT_PUBLIC_COGNITO_LOGOUT_URI=http://localhost:3000/login
+NEXT_PUBLIC_COGNITO_SCOPE=openid email profile
+COGNITO_REGION=your-aws-region
+COGNITO_DOMAIN=your-cognito-domain
+COGNITO_CLIENT_ID=your-cognito-client-id
+COGNITO_CLIENT_SECRET=your-cognito-client-secret
+COGNITO_REDIRECT_URI=http://localhost:3000/auth/callback
 NEXT_PUBLIC_APP_API_BASE_URL=/api
 BACKEND_API_BASE_URL=http://localhost:8000
 BACKEND_API_SERVICE_TOKEN=
@@ -70,7 +78,7 @@ npm run dev
 
 ### Deployment
 
-#### Quick Deploy to Vercel
+#### Quick Deploy to AWS Amplify
 
 1. **Push to GitHub** (see `GITHUB_SETUP.md`):
    ```bash
@@ -79,16 +87,17 @@ npm run dev
    git push -u origin main
    ```
 
-2. **Deploy to Vercel**:
-   - Go to [vercel.com/new](https://vercel.com/new)
-   - Import your GitHub repository
+2. **Deploy to AWS Amplify**:
+   - Open AWS Amplify Console
+   - Connect your GitHub repository
+   - Set app root to `nextjs-app`
    - Add environment variables (see `DEPLOYMENT.md`)
-   - Click Deploy
+   - Deploy
 
 For detailed instructions, see:
 - `QUICK_DEPLOY.md` - Fast deployment guide
 - `GITHUB_SETUP.md` - GitHub setup
-- `DEPLOYMENT.md` - Complete deployment guide
+- `DEPLOYMENT.md` - Complete AWS deployment guide
 
 ## Project Structure
 
@@ -165,9 +174,11 @@ npm run lint
 
 ## Environment Variables
 
-- `NEXT_PUBLIC_SUPABASE_URL` - Supabase URL for auth/profile flows
-- `NEXT_PUBLIC_SUPABASE_ANON_KEY` - Supabase anon key
-- `SUPABASE_SERVICE_ROLE_KEY` - Required for secure custom ID lookup route
+- `NEXT_PUBLIC_COGNITO_REGION` - AWS region for Cognito
+- `NEXT_PUBLIC_COGNITO_DOMAIN` - Cognito hosted UI domain
+- `NEXT_PUBLIC_COGNITO_CLIENT_ID` - Cognito app client id
+- `NEXT_PUBLIC_COGNITO_REDIRECT_URI` - OAuth callback URL
+- `COGNITO_CLIENT_SECRET` - Cognito app client secret for server-side code exchange
 - `NEXT_PUBLIC_APP_API_BASE_URL` - Frontend API base (default `/api`)
 - `BACKEND_API_BASE_URL` - Backend RAG origin (local or deployed)
 - `BACKEND_API_SERVICE_TOKEN` - Optional backend token for server-only fallback calls

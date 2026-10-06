@@ -20,52 +20,20 @@ from app.models import Chunk, Document
 from app.parsers.pdf_parser import parse_pdf_document
 from app.services.chunking import structure_aware_chunking
 from app.services.date_utils import add_months
-from app.services.embeddings import EmbeddingService, build_embedding_text
 from app.services.metadata_generator import MetadataGenerator
-from app.services.vector_store import PineconeVectorStore
 
 
 class IngestionService:
     def __init__(
         self,
         metadata_generator: MetadataGenerator | None = None,
-        embedding_service: EmbeddingService | None = None,
-        vector_store: PineconeVectorStore | None = None,
+        embedding_service: object | None = None,
+        vector_store: object | None = None,
     ) -> None:
+        _ = vector_store  # Backward-compatible no-op; Pinecone path removed.
+        _ = embedding_service  # Backward-compatible no-op; vectorless retrieval path.
         self.settings = get_settings()
         self.metadata_generator = metadata_generator or MetadataGenerator()
-        self.embedding_service = embedding_service or EmbeddingService()
-        self.vector_store = vector_store or PineconeVectorStore()
-
-    def _upsert_pinecone_vectors(self, doc: Document, chunks: list[Chunk]) -> None:
-        if not self.vector_store.enabled:
-            return
-
-        vectors = []
-        for chunk in chunks:
-            raw_vector = chunk.embedding_vector
-            if raw_vector is None:
-                continue
-            if hasattr(raw_vector, "tolist"):
-                values = raw_vector.tolist()
-            else:
-                values = list(raw_vector)
-            if not values:
-                continue
-            vectors.append(
-                {
-                    "id": str(chunk.id),
-                    "values": values,
-                    "metadata": {
-                        "document_id": str(doc.id),
-                        "bill_id": doc.bill_id,
-                        "vendor": doc.vendor,
-                        "chunk_type": chunk.chunk_type,
-                    },
-                }
-            )
-        if vectors:
-            self.vector_store.upsert(vectors)
 
     @staticmethod
     def _coalesce(value: Any, fallback: Any) -> Any:
@@ -173,10 +141,11 @@ class IngestionService:
         vendor: str | None = None,
         document_date: date | None = None,
         total_amount: float | None = None,
+        ocr_mode: str | None = None,
         version: int = 1,
         references: dict[str, Any] | None = None,
     ) -> tuple[Document, int]:
-        parsed = parse_pdf_document(file_bytes=file_bytes, filename=filename)
+        parsed = parse_pdf_document(file_bytes=file_bytes, filename=filename, ocr_mode_override=ocr_mode)
         chunks = structure_aware_chunking(parsed)
         if len(chunks) > self.settings.max_chunks_per_document:
             raise ValueError("Document exceeds configured chunk limit.")
@@ -292,8 +261,6 @@ class IngestionService:
         db.flush()
 
         chunk_records: list[Chunk] = []
-        embedding_inputs: list[str] = []
-
         for draft in chunks:
             chunk_id = uuid.uuid4()
             metadata = self.metadata_generator.generate(
@@ -301,14 +268,6 @@ class IngestionService:
                 chunk_type=draft.chunk_type,
                 document_id=str(doc.id),
                 chunk_id=str(chunk_id),
-            )
-            embedding_inputs.append(
-                build_embedding_text(
-                    content=draft.content,
-                    summary=metadata["summary"],
-                    keywords=metadata["keywords"],
-                    hypothetical_questions=metadata["hypothetical_questions"],
-                )
             )
             chunk_records.append(
                 Chunk(
@@ -323,14 +282,11 @@ class IngestionService:
                 )
             )
 
-        embeddings = self.embedding_service.embed_batch(embedding_inputs)
-        for chunk, vector in zip(chunk_records, embeddings):
-            chunk.embedding_vector = vector
+        for chunk in chunk_records:
             db.add(chunk)
 
         db.commit()
         db.refresh(doc)
-        self._upsert_pinecone_vectors(doc, chunk_records)
         return doc, len(chunk_records)
 
     def ingest_vendor_table(
@@ -339,6 +295,7 @@ class IngestionService:
         file_bytes: bytes,
         filename: str,
         version: int = 1,
+        source_references: dict[str, Any] | None = None,
     ) -> tuple[list[Document], int]:
         if pd is None:
             raise ImportError("pandas is required for vendor table ingestion.")
@@ -350,7 +307,6 @@ class IngestionService:
             raise ValueError("Unsupported tabular format. Use CSV/XLSX/XLS.")
 
         created_docs: list[Document] = []
-        pinecone_upserts: list[tuple[Document, Chunk]] = []
         row_count = 0
         for index, row in df.fillna("").iterrows():
             row_count += 1
@@ -370,7 +326,12 @@ class IngestionService:
                 date=doc_date,
                 total_amount=float(total_amount) if total_amount not in (None, "") else None,
                 version=version,
-                references={"filename": filename, "source": "vendor_table", "row_number": index + 1},
+                references={
+                    "filename": filename,
+                    "source": "vendor_table",
+                    "row_number": index + 1,
+                    **(source_references or {}),
+                },
             )
             db.add(doc)
             db.flush()
@@ -382,16 +343,6 @@ class IngestionService:
                 document_id=str(doc.id),
                 chunk_id=str(uuid.uuid4()),
             )
-            vector = self.embedding_service.embed_batch(
-                [
-                    build_embedding_text(
-                        content=content,
-                        summary=metadata["summary"],
-                        keywords=metadata["keywords"],
-                        hypothetical_questions=metadata["hypothetical_questions"],
-                    )
-                ]
-            )[0]
             chunk = Chunk(
                 id=uuid.uuid4(),
                 document_id=doc.id,
@@ -400,14 +351,10 @@ class IngestionService:
                 summary=metadata["summary"],
                 keywords=metadata["keywords"],
                 hypothetical_questions=metadata["hypothetical_questions"],
-                embedding_vector=vector,
                 metadata_json={"row_number": index + 1},
             )
             db.add(chunk)
             created_docs.append(doc)
-            pinecone_upserts.append((doc, chunk))
 
         db.commit()
-        for doc, chunk in pinecone_upserts:
-            self._upsert_pinecone_vectors(doc, [chunk])
         return created_docs, row_count

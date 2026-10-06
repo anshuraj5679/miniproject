@@ -51,14 +51,14 @@ function SidebarItem({
       onClick={onClick}
       data-gsap="list-item"
       className={`flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 w-full ${active
-        ? 'bg-primary/15 text-primary font-medium'
-        : 'text-base-content/60 hover:bg-base-200 hover:text-base-content'
+        ? 'bg-blue-100 text-blue-700 font-medium'
+        : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
         }`}
     >
       <Icon className={`w-5 h-5 ${active ? 'stroke-[2.5px]' : 'stroke-2'}`} />
       <span className="whitespace-nowrap">{label}</span>
       {active && (
-        <div className="ml-auto w-1.5 h-1.5 rounded-full bg-primary"></div>
+        <div className="ml-auto w-1.5 h-1.5 rounded-full bg-blue-600"></div>
       )}
     </button>
   )
@@ -81,8 +81,8 @@ function TabButton({
       onClick={onClick}
       data-gsap-hover="lift"
       className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 ${active
-        ? 'bg-primary text-primary-content shadow-md shadow-primary/20'
-        : 'text-base-content/60 hover:bg-base-200 hover:text-base-content'
+        ? 'bg-blue-600 text-white shadow-md shadow-blue-200'
+        : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
         }`}
     >
       <Icon className="w-4 h-4" />
@@ -156,6 +156,12 @@ export function MerchantDashboardScreen() {
   }, [user?.userId])
 
   useEffect(() => { loadActivity() }, [loadActivity])
+  useEffect(() => {
+    if (!user) return
+    if (user.userType !== 'merchant') {
+      router.replace('/locker')
+    }
+  }, [router, user])
   useGsapReveal(rootRef, [activeTab, recentActivity.length, lookupLoading, uploadLoading, manualLoading])
   useGsapCountUp(rootRef, [statsData.totalBills, statsData.consumers])
 
@@ -213,6 +219,7 @@ export function MerchantDashboardScreen() {
       formData.append('consumerCustomId', consumer.customId)
       if (consumer.fullName) formData.append('consumerName', consumer.fullName)
       if (consumer.email) formData.append('consumerEmail', consumer.email)
+      formData.append('ocrMode', 'vision_only')
 
       const response = await fetch('/api/merchant/upload', { method: 'POST', body: formData })
       const data = await response.json().catch(() => null)
@@ -289,36 +296,36 @@ export function MerchantDashboardScreen() {
   }
 
   return (
-    <div ref={rootRef} className="flex h-screen bg-base-200/50 font-sans text-base-content overflow-hidden">
+    <div ref={rootRef} className="dashboard-shell flex h-screen font-sans text-slate-900 overflow-hidden">
       {/* ─── Desktop Sidebar ─── */}
-      <aside data-gsap="panel" className="hidden lg:flex flex-col w-72 bg-base-100 border-r border-base-200 h-full">
-        <div data-gsap="hero" className="p-6 flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-secondary flex items-center justify-center text-secondary-content font-bold shadow-lg shadow-secondary/20">
+      <aside data-gsap="panel" className="hidden lg:flex flex-col w-72 dashboard-sidebar h-full">
+        <div data-gsap="hero" className="p-6 flex items-center gap-3 dashboard-sidebar-header">
+          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-600 to-blue-700 flex items-center justify-center text-white font-bold shadow-lg shadow-blue-200/60">
             <Store className="w-6 h-6" />
           </div>
           <div>
-            <h1 className="font-bold text-lg tracking-tight">SafeBill</h1>
-            <p className="text-xs text-base-content/50 font-medium">Merchant Portal</p>
+            <h1 className="font-bold text-lg tracking-tight text-slate-900">SafeBill</h1>
+            <p className="text-xs text-slate-400 font-medium">Merchant Portal</p>
           </div>
         </div>
 
         <nav className="flex-1 px-4 space-y-1 mt-4">
-          <div className="px-4 mb-2 text-xs font-semibold text-base-content/40 uppercase tracking-wider">Menu</div>
+          <div className="px-4 mb-2 text-xs font-semibold text-slate-500 uppercase tracking-wider">Menu</div>
           <SidebarItem icon={LayoutDashboard} label="Dashboard" active={activeNav === 'dashboard'} onClick={handleDashboardNav} />
           <SidebarItem icon={Clock} label="Activity" active={activeNav === 'activity'} onClick={handleActivityNav} />
         </nav>
 
-        <div data-gsap="panel" className="p-4 border-t border-base-200">
+        <div data-gsap="panel" className="p-4 border-t border-slate-100">
           <SidebarItem icon={Settings} label="Settings" onClick={() => router.push('/settings')} />
           <SidebarItem icon={LogOut} label="Logout" onClick={handleLogout} />
 
-          <div className="mt-4 p-4 rounded-xl bg-base-200/50 border border-base-200 flex items-center gap-3">
-            <div className="w-10 h-10 rounded-full bg-secondary text-secondary-content flex items-center justify-center font-bold text-sm">
+          <div className="mt-4 p-4 rounded-xl bg-gradient-to-br from-slate-50 to-blue-50/40 border border-slate-200/80 flex items-center gap-3">
+            <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-600 to-blue-700 text-white flex items-center justify-center font-bold text-sm shadow-md shadow-blue-200/50">
               {user?.name?.[0]?.toUpperCase() || 'M'}
             </div>
             <div className="flex-1 min-w-0">
-              <p className="text-sm font-bold truncate">{user?.name || 'Merchant'}</p>
-              <p className="text-xs text-base-content/50 truncate">{user?.customId || user?.email}</p>
+              <p className="text-sm font-bold truncate text-slate-900">{user?.name || 'Merchant'}</p>
+              <p className="text-xs text-slate-400 truncate">{user?.customId || user?.email}</p>
             </div>
           </div>
         </div>
@@ -327,15 +334,15 @@ export function MerchantDashboardScreen() {
       {/* ─── Main Content ─── */}
       <main className="flex-1 flex flex-col h-full overflow-hidden relative">
         {/* Mobile Header */}
-        <div data-gsap="hero" className="lg:hidden flex items-center justify-between p-4 bg-base-100 border-b border-base-200">
+        <div data-gsap="hero" className="lg:hidden flex items-center justify-between p-4 dashboard-navbar">
           <div className="flex items-center gap-3">
-            <button onClick={() => setSidebarOpen(true)} className="btn btn-square btn-ghost">
-              <Menu className="w-6 h-6" />
+            <button onClick={() => setSidebarOpen(true)} className="inline-flex h-10 w-10 items-center justify-center rounded-xl hover:bg-blue-50 transition-colors">
+              <Menu className="w-6 h-6 text-slate-700" />
             </button>
-            <span className="font-bold text-lg">Merchant</span>
+            <span className="font-bold text-lg text-slate-900">Merchant</span>
           </div>
-          <button onClick={handleActivityNav} className="btn btn-circle btn-ghost" aria-label="Open activity">
-            <Bell className="w-5 h-5" />
+          <button onClick={handleActivityNav} className="inline-flex h-10 w-10 items-center justify-center rounded-full hover:bg-blue-50 transition-colors" aria-label="Open activity">
+            <Bell className="w-5 h-5 text-slate-600" />
           </button>
         </div>
 
@@ -346,8 +353,8 @@ export function MerchantDashboardScreen() {
             {/* Title Row */}
             <div data-gsap="hero" className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
               <div data-gsap="hero">
-                <p className="text-sm font-medium text-secondary mb-1">Welcome back, {user?.name?.split(' ')[0] || 'Merchant'}</p>
-                <h2 className="text-3xl font-extrabold tracking-tight">Merchant Dashboard</h2>
+                <p className="text-sm font-medium text-blue-600 mb-1">Welcome back, {user?.name?.split(' ')[0] || 'Merchant'}</p>
+                <h2 className="text-3xl font-extrabold tracking-tight text-slate-900">Merchant Dashboard</h2>
               </div>
               <button
                 onClick={() => {
@@ -355,7 +362,7 @@ export function MerchantDashboardScreen() {
                   setActiveTab('upload')
                 }}
                 data-gsap-hover="lift"
-                className="btn btn-sm btn-secondary gap-2 shadow-md shadow-secondary/25"
+                className="inline-flex h-9 items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-3 text-sm font-medium text-white shadow-lg shadow-blue-200/60 hover:from-blue-700 hover:to-blue-800 transition-all"
               >
                 <Upload className="w-4 h-4" />
                 Upload Bill
@@ -364,27 +371,27 @@ export function MerchantDashboardScreen() {
 
             {/* Stats */}
             <div className="grid grid-cols-2 gap-3 lg:gap-4">
-              <div data-gsap="card" data-gsap-hover="lift" className="card bg-base-100 border border-base-200 shadow-sm">
-                <div className="card-body p-5 flex-row items-center gap-4">
-                  <div className="p-3 rounded-2xl bg-primary/10 text-primary">
+              <div data-gsap="card" data-gsap-hover="lift" className="dashboard-stat-card">
+                <div className="p-5 flex items-center gap-4 relative">
+                  <div className="p-3 rounded-2xl bg-blue-50 text-blue-600 border border-blue-100">
                     <FileText className="w-6 h-6" />
                   </div>
                   <div>
-                    <p className="text-xs font-medium text-base-content/50">Bills Created</p>
-                    <h3 className="text-2xl font-bold tracking-tight">
+                    <p className="text-xs font-medium text-slate-500">Bills Created</p>
+                    <h3 className="text-2xl font-bold tracking-tight text-slate-900">
                       <span data-count-to={statsData.totalBills} data-count-decimals="0">{statsData.totalBills}</span>
                     </h3>
                   </div>
                 </div>
               </div>
-              <div data-gsap="card" data-gsap-hover="lift" className="card bg-base-100 border border-base-200 shadow-sm">
-                <div className="card-body p-5 flex-row items-center gap-4">
-                  <div className="p-3 rounded-2xl bg-secondary/10 text-secondary">
+              <div data-gsap="card" data-gsap-hover="lift" className="dashboard-stat-card">
+                <div className="p-5 flex items-center gap-4 relative">
+                  <div className="p-3 rounded-2xl bg-emerald-50 text-emerald-600 border border-emerald-100">
                     <Users className="w-6 h-6" />
                   </div>
                   <div>
-                    <p className="text-xs font-medium text-base-content/50">Consumers</p>
-                    <h3 className="text-2xl font-bold tracking-tight">
+                    <p className="text-xs font-medium text-slate-500">Consumers</p>
+                    <h3 className="text-2xl font-bold tracking-tight text-slate-900">
                       <span data-count-to={statsData.consumers} data-count-decimals="0">{statsData.consumers}</span>
                     </h3>
                   </div>
@@ -397,56 +404,56 @@ export function MerchantDashboardScreen() {
               {/* Left: Actions Panel */}
               <div className="lg:col-span-3 space-y-5">
                 {/* Tab Switcher */}
-                <div className="flex items-center gap-2 p-1.5 bg-base-100 border border-base-200 rounded-2xl">
+                <div className="flex items-center gap-2 p-1.5 bg-white border border-slate-200 rounded-2xl">
                   <TabButton icon={Search} label="Lookup" active={activeTab === 'lookup'} onClick={() => { setActiveNav('dashboard'); setActiveTab('lookup') }} />
                   <TabButton icon={Upload} label="Upload" active={activeTab === 'upload'} onClick={() => { setActiveNav('dashboard'); setActiveTab('upload') }} />
                   <TabButton icon={Plus} label="Manual" active={activeTab === 'manual'} onClick={() => { setActiveNav('dashboard'); setActiveTab('manual') }} />
                 </div>
 
                 {/* Tab Content Card */}
-                <div data-gsap="card" className="card bg-base-100 border border-base-200 shadow-sm">
-                  <div className="card-body gap-5">
+                <div data-gsap="card" className="dashboard-card">
+                  <div className="p-5 space-y-5">
                     {/* ── Lookup Tab ── */}
                     {activeTab === 'lookup' && (
                       <>
                         <div>
                           <h3 className="font-bold text-base">Consumer Lookup</h3>
-                          <p className="text-xs text-base-content/50 mt-0.5">Find a consumer by their SafeBill ID.</p>
+                          <p className="text-xs text-slate-500 mt-0.5">Find a consumer by their SafeBill ID.</p>
                         </div>
                         <div className="flex gap-2">
                           <div className="relative flex-1">
-                            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-base-content/40" />
+                            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                             <input
                               type="text"
                               placeholder="CON-XXXXXX"
                               value={consumerId}
                               onChange={(e) => setConsumerId(e.target.value)}
                               onKeyDown={(e) => e.key === 'Enter' && handleLookup()}
-                              className="input input-bordered w-full pl-10"
+                              className="h-10 w-full rounded-xl border border-slate-300 pl-10 pr-3 text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
                             />
                           </div>
-                          <button onClick={handleLookup} disabled={lookupLoading} data-gsap-hover="lift" className="btn btn-primary gap-2">
+                          <button onClick={handleLookup} disabled={lookupLoading} data-gsap-hover="lift" className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60">
                             {lookupLoading ? <span className="loading loading-spinner loading-sm"></span> : <Search className="w-4 h-4" />}
                             Search
                           </button>
                         </div>
                         {lookupError && (
-                          <div className="alert alert-error text-sm py-2">
+                          <div className="rounded-xl bg-red-50 border border-red-200 p-3 text-sm flex items-center gap-2 text-red-700">
                             <X className="w-4 h-4" />
                             <span>{lookupError}</span>
                           </div>
                         )}
                         {resolvedConsumer && (
-                          <div className="p-4 rounded-xl bg-success/10 border border-success/20">
+                          <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200">
                             <div className="flex items-center gap-3">
-                              <div className="w-10 h-10 rounded-full bg-success/20 text-success flex items-center justify-center font-bold text-sm">
+                              <div className="w-10 h-10 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center font-bold text-sm border border-emerald-200">
                                 {resolvedConsumer.fullName[0]?.toUpperCase() || 'C'}
                               </div>
                               <div>
-                                <p className="font-bold text-sm">{resolvedConsumer.fullName}</p>
-                                <p className="text-xs text-base-content/50">{resolvedConsumer.customId} • {resolvedConsumer.email || 'No email'}</p>
+                                <p className="font-bold text-sm text-slate-900">{resolvedConsumer.fullName}</p>
+                                <p className="text-xs text-slate-500">{resolvedConsumer.customId} • {resolvedConsumer.email || 'No email'}</p>
                               </div>
-                              <Check className="w-5 h-5 text-success ml-auto" />
+                              <Check className="w-5 h-5 text-emerald-600 ml-auto" />
                             </div>
                           </div>
                         )}
@@ -458,42 +465,42 @@ export function MerchantDashboardScreen() {
                       <>
                         <div>
                           <h3 className="font-bold text-base">Upload & Assign Bill</h3>
-                          <p className="text-xs text-base-content/50 mt-0.5">Upload an invoice and assign it to a consumer.</p>
+                          <p className="text-xs text-slate-500 mt-0.5">Upload an invoice and assign it to a consumer.</p>
                         </div>
                         <div className="form-control">
-                          <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-base-content/50">Consumer ID</span></label>
+                          <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-slate-500">Consumer ID</span></label>
                           <input
                             type="text"
                             placeholder="CON-XXXXXX"
                             value={assignConsumerId}
                             onChange={(e) => setAssignConsumerId(e.target.value)}
-                            className="input input-bordered"
+                            className="h-10 w-full rounded-xl border border-slate-300 px-3 text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
                           />
                         </div>
                         <div className="form-control">
-                          <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-base-content/50">Invoice File</span></label>
+                          <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-slate-500">Invoice File</span></label>
                           <input
                             ref={fileInputRef}
                             type="file"
                             accept="image/*,.pdf"
                             onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
-                            className="file-input file-input-bordered w-full"
+                            className="file-input file-input-bordered w-full border-slate-300"
                           />
                         </div>
                         <button
                           onClick={handleUpload}
                           disabled={uploadLoading || !uploadFile || !assignConsumerId.trim()}
                           data-gsap-hover="lift"
-                          className="btn btn-primary gap-2 shadow-md shadow-primary/20"
+                          className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
                         >
                           {uploadLoading ? <span className="loading loading-spinner loading-sm"></span> : <Send className="w-4 h-4" />}
                           Upload & Assign
                         </button>
                         {uploadError && (
-                          <div className="alert alert-error text-sm py-2"><X className="w-4 h-4" /><span>{uploadError}</span></div>
+                          <div className="rounded-xl bg-red-50 border border-red-200 p-3 text-sm flex items-center gap-2 text-red-700"><X className="w-4 h-4" /><span>{uploadError}</span></div>
                         )}
                         {uploadResult && (
-                          <div className="alert alert-success text-sm py-2"><Check className="w-4 h-4" /><span>{uploadResult}</span></div>
+                          <div className="rounded-xl bg-emerald-50 border border-emerald-200 p-3 text-sm flex items-center gap-2 text-emerald-700"><Check className="w-4 h-4" /><span>{uploadResult}</span></div>
                         )}
                       </>
                     )}
@@ -503,48 +510,48 @@ export function MerchantDashboardScreen() {
                       <>
                         <div>
                           <h3 className="font-bold text-base">Manual Bill Entry</h3>
-                          <p className="text-xs text-base-content/50 mt-0.5">Create a warranty record manually.</p>
+                          <p className="text-xs text-slate-500 mt-0.5">Create a warranty record manually.</p>
                         </div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                           <div className="form-control">
-                            <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-base-content/50">Consumer ID *</span></label>
-                            <input type="text" placeholder="CON-XXXXXX" value={manualData.consumerId} onChange={(e) => setManualData({ ...manualData, consumerId: e.target.value })} className="input input-bordered" />
+                            <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-slate-500">Consumer ID *</span></label>
+                            <input type="text" placeholder="CON-XXXXXX" value={manualData.consumerId} onChange={(e) => setManualData({ ...manualData, consumerId: e.target.value })} className="h-10 w-full rounded-xl border border-slate-300 px-3 text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100" />
                           </div>
                           <div className="form-control">
-                            <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-base-content/50">Product Name *</span></label>
-                            <input type="text" placeholder="e.g. Samsung TV" value={manualData.productName} onChange={(e) => setManualData({ ...manualData, productName: e.target.value })} className="input input-bordered" />
+                            <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-slate-500">Product Name *</span></label>
+                            <input type="text" placeholder="e.g. Samsung TV" value={manualData.productName} onChange={(e) => setManualData({ ...manualData, productName: e.target.value })} className="h-10 w-full rounded-xl border border-slate-300 px-3 text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100" />
                           </div>
                           <div className="form-control">
-                            <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-base-content/50">Invoice No.</span></label>
-                            <input type="text" placeholder="INV-12345" value={manualData.invoiceNo} onChange={(e) => setManualData({ ...manualData, invoiceNo: e.target.value })} className="input input-bordered" />
+                            <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-slate-500">Invoice No.</span></label>
+                            <input type="text" placeholder="INV-12345" value={manualData.invoiceNo} onChange={(e) => setManualData({ ...manualData, invoiceNo: e.target.value })} className="h-10 w-full rounded-xl border border-slate-300 px-3 text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100" />
                           </div>
                           <div className="form-control">
-                            <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-base-content/50">Purchase Date</span></label>
-                            <input type="date" value={manualData.purchaseDate} onChange={(e) => setManualData({ ...manualData, purchaseDate: e.target.value })} className="input input-bordered" />
+                            <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-slate-500">Purchase Date</span></label>
+                            <input type="date" value={manualData.purchaseDate} onChange={(e) => setManualData({ ...manualData, purchaseDate: e.target.value })} className="h-10 w-full rounded-xl border border-slate-300 px-3 text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100" />
                           </div>
                           <div className="form-control">
-                            <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-base-content/50">Warranty (months)</span></label>
-                            <input type="number" placeholder="12" value={manualData.warrantyMonths} onChange={(e) => setManualData({ ...manualData, warrantyMonths: e.target.value })} className="input input-bordered" />
+                            <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-slate-500">Warranty (months)</span></label>
+                            <input type="number" placeholder="12" value={manualData.warrantyMonths} onChange={(e) => setManualData({ ...manualData, warrantyMonths: e.target.value })} className="h-10 w-full rounded-xl border border-slate-300 px-3 text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100" />
                           </div>
                           <div className="form-control">
-                            <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-base-content/50">Amount (₹)</span></label>
-                            <input type="number" placeholder="29999" value={manualData.purchasePrice} onChange={(e) => setManualData({ ...manualData, purchasePrice: e.target.value })} className="input input-bordered" />
+                            <label className="label pb-1"><span className="label-text text-xs font-semibold uppercase tracking-wider text-slate-500">Amount (₹)</span></label>
+                            <input type="number" placeholder="29999" value={manualData.purchasePrice} onChange={(e) => setManualData({ ...manualData, purchasePrice: e.target.value })} className="h-10 w-full rounded-xl border border-slate-300 px-3 text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100" />
                           </div>
                         </div>
                         <button
                           onClick={handleManualCreate}
                           disabled={manualLoading || !manualData.consumerId.trim() || !manualData.productName.trim()}
                           data-gsap-hover="lift"
-                          className="btn btn-primary gap-2 shadow-md shadow-primary/20"
+                          className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
                         >
                           {manualLoading ? <span className="loading loading-spinner loading-sm"></span> : <Plus className="w-4 h-4" />}
                           Create Bill
                         </button>
                         {manualError && (
-                          <div className="alert alert-error text-sm py-2"><X className="w-4 h-4" /><span>{manualError}</span></div>
+                          <div className="rounded-xl bg-red-50 border border-red-200 p-3 text-sm flex items-center gap-2 text-red-700"><X className="w-4 h-4" /><span>{manualError}</span></div>
                         )}
                         {manualResult && (
-                          <div className="alert alert-success text-sm py-2"><Check className="w-4 h-4" /><span>{manualResult}</span></div>
+                          <div className="rounded-xl bg-emerald-50 border border-emerald-200 p-3 text-sm flex items-center gap-2 text-emerald-700"><Check className="w-4 h-4" /><span>{manualResult}</span></div>
                         )}
                       </>
                     )}
@@ -554,45 +561,45 @@ export function MerchantDashboardScreen() {
 
               {/* Right: Activity Panel */}
               <div ref={activityPanelRef} className="lg:col-span-2">
-                <div data-gsap="panel" className="card bg-base-100 border border-base-200 shadow-sm">
-                  <div className="p-5 border-b border-base-200 flex items-center justify-between">
+                <div data-gsap="panel" className="dashboard-card">
+                  <div className="p-5 border-b border-slate-100 flex items-center justify-between">
                     <div>
-                      <h3 className="font-bold text-base">Recent Activity</h3>
-                      <p className="text-xs text-base-content/40 mt-0.5">{recentActivity.length} records</p>
+                      <h3 className="font-bold text-base text-slate-900">Recent Activity</h3>
+                      <p className="text-xs text-slate-400 mt-0.5">{recentActivity.length} records</p>
                     </div>
-                    <Clock className="w-4 h-4 text-base-content/30" />
+                    <Clock className="w-4 h-4 text-slate-300" />
                   </div>
 
                   <div className="max-h-[480px] overflow-y-auto">
                     {recentActivity.length === 0 ? (
                       <div className="text-center py-12 px-6">
-                        <Package className="w-10 h-10 text-base-content/20 mx-auto mb-3" />
-                        <p className="text-sm text-base-content/40">No activity yet</p>
-                        <p className="text-xs text-base-content/30 mt-1">Upload your first bill to get started.</p>
+                        <Package className="w-10 h-10 text-slate-300 mx-auto mb-3" />
+                        <p className="text-sm text-slate-400">No activity yet</p>
+                        <p className="text-xs text-slate-300 mt-1">Upload your first bill to get started.</p>
                       </div>
                     ) : (
-                      <div className="divide-y divide-base-200">
+                      <div className="divide-y divide-slate-200">
                         {recentActivity.slice(0, 10).map((activity) => (
                           <div
                             key={activity.activityId}
                             data-gsap="list-item"
-                            className="p-4 hover:bg-base-200/30 transition-colors cursor-pointer"
+                            className="p-4 hover:bg-slate-50 transition-colors cursor-pointer"
                             onClick={() => {
                               if (activity.documentId) router.push(`/document/${activity.documentId}`)
                             }}
                           >
                             <div className="flex items-start gap-3">
-                              <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center shrink-0 mt-0.5">
-                                <Package className="w-4 h-4 text-primary" />
+                              <div className="w-9 h-9 rounded-lg bg-blue-100 flex items-center justify-center shrink-0 mt-0.5">
+                                <Package className="w-4 h-4 text-blue-600" />
                               </div>
                               <div className="flex-1 min-w-0">
                                 <p className="font-semibold text-sm truncate">{activity.title || 'Untitled'}</p>
-                                <p className="text-xs text-base-content/50 mt-0.5">
+                                <p className="text-xs text-slate-500 mt-0.5">
                                   {activity.vendor || 'Unknown'}
                                   {activity.consumerName ? ` • ${activity.consumerName}` : ''}
                                 </p>
                               </div>
-                              <span className="badge badge-sm border-0 bg-base-200 text-base-content/60 font-medium shrink-0">
+                              <span className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600 font-medium shrink-0">
                                 {activity.action || 'updated'}
                               </span>
                             </div>
@@ -613,11 +620,11 @@ export function MerchantDashboardScreen() {
       {sidebarOpen && (
         <div className="fixed inset-0 z-50 lg:hidden">
           <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setSidebarOpen(false)}></div>
-          <aside data-gsap="panel" className="absolute top-0 bottom-0 left-0 w-80 bg-base-100 shadow-2xl p-6 flex flex-col h-full">
+          <aside data-gsap="panel" className="absolute top-0 bottom-0 left-0 w-80 bg-white shadow-2xl p-6 flex flex-col h-full">
             <div className="flex items-center justify-between mb-8">
-              <h2 className="font-bold text-xl">Merchant Menu</h2>
-              <button onClick={() => setSidebarOpen(false)} className="btn btn-circle btn-sm btn-ghost">
-                <X className="w-5 h-5" />
+              <h2 className="font-bold text-xl text-slate-900">Merchant Menu</h2>
+              <button onClick={() => setSidebarOpen(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-full hover:bg-blue-50 transition-colors">
+                <X className="w-5 h-5 text-slate-500" />
               </button>
             </div>
             <nav className="flex-1 space-y-2">
@@ -625,8 +632,8 @@ export function MerchantDashboardScreen() {
               <SidebarItem icon={Clock} label="Activity" active={activeNav === 'activity'} onClick={handleActivityNav} />
               <SidebarItem icon={Settings} label="Settings" onClick={() => { setSidebarOpen(false); router.push('/settings') }} />
             </nav>
-            <div className="pt-6 border-t border-base-200">
-              <button className="btn btn-outline w-full gap-2" onClick={handleLogout}>
+            <div className="pt-6 border-t border-slate-100">
+              <button className="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-medium text-slate-600 hover:bg-red-50 hover:text-red-600 hover:border-red-200 transition-colors" onClick={handleLogout}>
                 <LogOut className="w-4 h-4" /> Logout
               </button>
             </div>
@@ -636,3 +643,5 @@ export function MerchantDashboardScreen() {
     </div>
   )
 }
+
+

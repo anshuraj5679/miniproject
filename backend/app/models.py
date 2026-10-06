@@ -12,7 +12,6 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
-    PickleType,
     String,
     Text,
     UniqueConstraint,
@@ -21,25 +20,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.core.config import get_settings
 from app.core.database import Base
-
-try:
-    from pgvector.sqlalchemy import Vector
-except Exception:  # pragma: no cover - fallback when pgvector is unavailable
-    from sqlalchemy.types import TypeDecorator
-
-    class Vector(TypeDecorator):  # type: ignore[no-redef]
-        impl = PickleType
-        cache_ok = True
-
-        def __init__(self, dimensions: int, *args, **kwargs) -> None:
-            _ = dimensions
-            super().__init__(*args, **kwargs)
-
-
-settings = get_settings()
-
 
 class Document(Base):
     __tablename__ = "documents"
@@ -73,6 +54,10 @@ class Document(Base):
         back_populates="document",
         cascade="all, delete-orphan",
     )
+    extraction_jobs: Mapped[list["ExtractionJob"]] = relationship(
+        "ExtractionJob",
+        back_populates="document",
+    )
     notification_events: Mapped[list["NotificationEvent"]] = relationship(
         "NotificationEvent",
         back_populates="document",
@@ -96,7 +81,6 @@ class Chunk(Base):
     summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
     keywords: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, default=list)
     hypothetical_questions: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, default=list)
-    embedding_vector: Mapped[list[float] | None] = mapped_column(Vector(settings.embedding_dimensions), nullable=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     tsv: Mapped[str] = mapped_column(
         TSVECTOR,
@@ -156,6 +140,44 @@ class ExtractionReview(Base):
     )
 
     document: Mapped["Document"] = relationship("Document", back_populates="extraction_reviews")
+
+
+class ExtractionJob(Base):
+    __tablename__ = "extraction_jobs"
+    __table_args__ = (
+        Index("ix_extraction_jobs_status_created", "status", "created_at"),
+        Index("ix_extraction_jobs_user_status", "user_id", "status"),
+        Index("ix_extraction_jobs_merchant_status", "merchant_user_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued")
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    source_bucket: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source_region: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    merchant_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    request_metadata: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    result_metadata: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    result_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    engines_used: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    document: Mapped["Document | None"] = relationship("Document", back_populates="extraction_jobs")
 
 
 class MerchantAssignmentAudit(Base):

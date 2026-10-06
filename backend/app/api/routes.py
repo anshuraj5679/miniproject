@@ -1,27 +1,43 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
 import mimetypes
 import os
+from pathlib import Path
 import re
+import shutil
 import time
 import uuid
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from datetime import date
-from urllib.parse import quote
+from urllib.parse import urlencode
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Request, Response, UploadFile
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session
+
+try:
+    import boto3
+except Exception:  # pragma: no cover - optional runtime dependency
+    boto3 = None  # type: ignore[assignment]
 
 try:
     import httpx
 except Exception:  # pragma: no cover - optional runtime dependency
     httpx = None  # type: ignore[assignment]
+
+try:
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from google.oauth2 import service_account
+except Exception:  # pragma: no cover - optional runtime dependency
+    GoogleAuthRequest = None  # type: ignore[assignment]
+    service_account = None  # type: ignore[assignment]
 
 from app.api.dependencies import ServiceRegistry, get_services
 from app.core.config import get_settings
@@ -30,6 +46,7 @@ from app.core.security import Principal, enforce_safe_query, require_roles
 from app.models import (
     Chunk,
     Document,
+    ExtractionJob,
     ExtractionReview,
     MerchantAssignmentAudit,
     NotificationDelivery,
@@ -40,13 +57,37 @@ from app.parsers.pdf_parser import extract_invoice_metadata
 from app.schemas import (
     AskRequest,
     AskResponse,
+    AsyncExtractionCallbackRequest,
+    AsyncExtractionJobCreateResponse,
+    AsyncExtractionJobStatusResponse,
+    BharatAIAskRequest,
+    BharatAIAskResponse,
+    BharatAIEnrichRequest,
+    BharatAIEnrichResponse,
+    BharatAITranslateBatchRequest,
+    BharatAITranslateBatchResponse,
+    BharatAITranslateRequest,
+    BharatAITranslateResponse,
     CalendarLinkResponse,
+    ClaimAssistantResponse,
     ClaimPacketResponse,
     Citation,
+    DocumentProductImageGenerateRequest,
+    DocumentProductImageUrlResponse,
+    DocumentProductImageView,
+    DocumentShareMemberView,
+    DocumentShareRequest,
+    DocumentShareResponse,
+    DocumentsResponse,
+    FraudCheckResponse,
+    FraudSignalView,
+    DocumentView,
     ExtractionReviewConfirmRequest,
     ExtractionReviewQueueResponse,
     ExtractionReviewView,
     ExtractionTraceStep,
+    IngestPDFResponse,
+    IngestVendorTableResponse,
     MerchantAssignmentAcceptRequest,
     MerchantAssignmentAuditResponse,
     MerchantAssignmentAuditView,
@@ -55,10 +96,6 @@ from app.schemas import (
     MerchantAssignRequest,
     MerchantIssueBillResponse,
     MerchantManualBillRequest,
-    DocumentsResponse,
-    DocumentView,
-    IngestPDFResponse,
-    IngestVendorTableResponse,
     NotificationAnalyticsResponse,
     NotificationDeliverabilityDashboardResponse,
     NotificationItem,
@@ -71,13 +108,21 @@ from app.schemas import (
     PlannerStep,
     RemindersResponse,
     ReminderView,
+    RenewalProviderWebhookRequest,
+    RenewalPurchaseIntentResponse,
+    RenewalPurchaseRequest,
+    RenewalQuoteResponse,
+    RenewalOptionsResponse,
+    RenewalOptionView,
     SearchRequest,
     SearchResponse,
     SearchResult,
+    SharedVaultResponse,
+    ServiceCentersRecommendationResponse,
     ServiceCenterView,
+    WhatsAppClaimDraftResponse,
     WarrantyItemView,
 )
-from app.services.embeddings import build_embedding_text
 from app.services.date_utils import add_months
 from app.services.extraction_pipeline import (
     build_review_fields,
@@ -87,6 +132,8 @@ from app.services.extraction_pipeline import (
     estimate_text_quality,
     extraction_fingerprint,
     merge_engine_results,
+    prefer_grounded_ocr_fields,
+    sanitize_merchandise_name,
 )
 from app.services.gst_compliance import validate_invoice_compliance
 from app.services.notifications import NotificationService
@@ -107,6 +154,409 @@ except Exception:  # pragma: no cover - optional runtime dependency
 router = APIRouter(prefix="/api/v1", tags=["safebill-rag"])
 _notification_service = NotificationService()
 logger = logging.getLogger(__name__)
+
+
+def _json_default(value: object) -> object:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, Decimal):
+        return float(value)
+    raise TypeError(f"Unsupported JSON value: {value!r}")
+
+
+def _response_model_payload(model: object) -> dict[str, object]:
+    if hasattr(model, "model_dump"):
+        raw = model.model_dump(mode="json")  # type: ignore[attr-defined]
+    elif hasattr(model, "dict"):
+        raw = model.dict()  # type: ignore[attr-defined]
+    else:
+        raw = model
+    normalized = json.loads(json.dumps(raw, default=_json_default, ensure_ascii=True))
+    return normalized if isinstance(normalized, dict) else {}
+
+
+def _store_source_blob(
+    *,
+    services: ServiceRegistry,
+    payload: bytes,
+    filename: str,
+    source: str,
+    principal: Principal | None,
+    user_id: str | None,
+    merchant_user_id: str | None,
+) -> dict[str, object]:
+    store = getattr(services, "object_store", None)
+    if store is None or not getattr(store, "enabled", False):
+        return {}
+    key = store.build_object_key(filename=filename, source=source)
+    content_type = store.guess_content_type(filename)
+    metadata = {
+        "source": source,
+        "filename": filename,
+        "principal_role": str(principal.role if principal else ""),
+        "principal_subject": str(principal.subject if principal and principal.subject else ""),
+        "user_id": str(user_id or ""),
+        "merchant_user_id": str(merchant_user_id or ""),
+    }
+    try:
+        uploaded = store.put_bytes(
+            key=key,
+            payload=payload,
+            filename=filename,
+            content_type=content_type,
+            metadata=metadata,
+        )
+    except Exception:
+        logger.exception("S3 upload failed for source=%s filename=%s", source, filename)
+        if getattr(store, "required", False):
+            raise HTTPException(status_code=500, detail="S3 upload is required but failed.")
+        return {}
+    if uploaded:
+        return uploaded
+    if getattr(store, "required", False):
+        raise HTTPException(status_code=500, detail="S3 upload is required but failed.")
+    return {}
+
+
+def _store_ocr_text_snapshot(
+    *,
+    services: ServiceRegistry,
+    extracted_text: str,
+    filename: str,
+    source: str,
+    document_user_id: str | None,
+    merchant_user_id: str | None,
+) -> dict[str, object]:
+    text = str(extracted_text or "").strip()
+    if not text:
+        return {}
+    store = getattr(services, "object_store", None)
+    if store is None or not getattr(store, "enabled", False):
+        return {}
+    stem = Path(filename or "invoice").stem or "invoice"
+    snapshot_name = f"{stem}-ocr.txt"
+    key = store.build_object_key(filename=snapshot_name, source=f"{source}-ocr")
+    try:
+        uploaded = store.put_bytes(
+            key=key,
+            payload=text.encode("utf-8"),
+            filename=snapshot_name,
+            content_type="text/plain; charset=utf-8",
+            metadata={
+                "source": source,
+                "filename": snapshot_name,
+                "user_id": str(document_user_id or ""),
+                "merchant_user_id": str(merchant_user_id or ""),
+            },
+        )
+    except Exception:
+        logger.exception("Failed to store OCR text snapshot for filename=%s", filename)
+        return {}
+    if not uploaded:
+        return {}
+    return {
+        "ocr_text_storage_key": str(uploaded.get("storage_key") or ""),
+        "ocr_text_storage_bucket": str(uploaded.get("storage_bucket") or ""),
+        "ocr_text_storage_region": str(uploaded.get("storage_region") or ""),
+        "ocr_text_storage_content_type": str(uploaded.get("storage_content_type") or "text/plain"),
+    }
+
+
+def _async_extraction_enabled() -> bool:
+    settings = get_settings()
+    return bool(settings.async_extraction_enabled)
+
+
+def _local_async_extraction_worker_enabled() -> bool:
+    settings = get_settings()
+    return bool(settings.async_extraction_enabled and settings.local_async_extraction_worker_enabled)
+
+
+def _require_async_callback(request: Request) -> None:
+    settings = get_settings()
+    expected = str(settings.async_extraction_callback_token or "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="Async extraction callback token is not configured.")
+    presented = str(request.headers.get("X-Async-Extraction-Token") or "").strip()
+    if not presented or presented != expected:
+        raise HTTPException(status_code=401, detail="Invalid async extraction callback token.")
+
+
+def _serialize_async_extraction_job(job: ExtractionJob) -> AsyncExtractionJobStatusResponse:
+    engines = job.engines_used if isinstance(job.engines_used, list) else []
+    return AsyncExtractionJobStatusResponse(
+        jobId=job.id,
+        status=str(job.status or "queued"),
+        filename=str(job.filename or "uploaded-image"),
+        documentId=job.document_id,
+        error=(str(job.error_message) if job.error_message else None),
+        enginesUsed=[str(engine) for engine in engines],
+        createdAt=job.created_at,
+        updatedAt=(job.updated_at or job.created_at),
+        completedAt=job.completed_at,
+    )
+
+
+def _async_job_in_scope(job: ExtractionJob, *, user_id: str | None, merchant_user_id: str | None) -> bool:
+    if user_id and str(job.user_id or "") != user_id:
+        return False
+    if merchant_user_id and str(job.merchant_user_id or "") != merchant_user_id:
+        return False
+    return True
+
+
+def _load_async_job_image_bytes(job: ExtractionJob, *, services: ServiceRegistry) -> bytes | None:
+    request_metadata = job.request_metadata if isinstance(job.request_metadata, dict) else {}
+    inline_payload = str(request_metadata.get("inline_image_base64") or "").strip()
+    if inline_payload:
+        try:
+            return base64.b64decode(inline_payload.encode("ascii"))
+        except Exception:
+            logger.exception("Failed to decode inline async extraction payload for job_id=%s", str(job.id))
+
+    store = getattr(services, "object_store", None)
+    if store is not None and getattr(store, "enabled", False):
+        key = str(job.source_object_key or "").strip()
+        if key:
+            payload = store.get_bytes(key=key)
+            if payload:
+                return payload
+    return None
+
+
+def _mark_async_job_failed(
+    db: Session,
+    job: ExtractionJob,
+    *,
+    error_message: str,
+    engines_used: list[str] | None = None,
+    services: ServiceRegistry | None = None,
+) -> None:
+    job.status = "failed"
+    job.error_message = (error_message or "Async extraction failed")[:2000]
+    if engines_used is not None:
+        job.engines_used = [str(engine) for engine in engines_used]
+    job.completed_at = datetime.now(timezone.utc)
+    db.add(job)
+    db.commit()
+    if services is not None:
+        _sync_async_extraction_job_mirror(services, job)
+
+
+def _finalize_async_extraction_job(
+    *,
+    db: Session,
+    services: ServiceRegistry,
+    job: ExtractionJob,
+    extracted_text: str,
+    extracted_metadata: dict[str, object],
+    field_confidences: dict[str, float] | None,
+    field_sources: dict[str, str] | None,
+    low_confidence_fields: list[str] | None,
+    engines_used: list[str] | None,
+) -> Document:
+    request_metadata = job.request_metadata if isinstance(job.request_metadata, dict) else {}
+    additional_references: dict[str, object] = {
+        "async_extraction_job_id": str(job.id),
+        "metadata_source": "async_s3_lambda" if job.source_object_key else "async_local_worker",
+    }
+    if job.source_bucket:
+        additional_references["storage_provider"] = "s3"
+        additional_references["storage_bucket"] = str(job.source_bucket)
+    if job.source_region:
+        additional_references["storage_region"] = str(job.source_region)
+    if job.source_object_key:
+        additional_references["storage_key"] = str(job.source_object_key)
+    if request_metadata.get("merchant_name"):
+        additional_references["merchant_name"] = str(request_metadata.get("merchant_name"))
+    if request_metadata.get("merchant_custom_id"):
+        additional_references["merchant_custom_id"] = str(request_metadata.get("merchant_custom_id"))
+    if job.merchant_user_id:
+        additional_references["merchant_user_id"] = job.merchant_user_id
+    if job.user_id:
+        additional_references["user_id"] = job.user_id
+
+    document, _chunk_count = _persist_structured_document(
+        db=db,
+        services=services,
+        filename=job.filename,
+        source="image_ocr_async",
+        user_id=job.user_id,
+        extracted_text=extracted_text,
+        extracted_metadata=extracted_metadata,
+        bill_id=str(request_metadata.get("bill_id") or "").strip() or None,
+        vendor=str(request_metadata.get("vendor") or "").strip() or None,
+        document_date=_coerce_date(request_metadata.get("document_date")),
+        total_amount=_coerce_float(request_metadata.get("total_amount")),
+        field_confidences=dict(field_confidences or {}),
+        field_sources={str(key): str(value) for key, value in dict(field_sources or {}).items()},
+        low_confidence_fields=[str(field) for field in list(low_confidence_fields or [])],
+        extraction_engines=[str(engine) for engine in list(engines_used or [])],
+        additional_references=additional_references,
+    )
+    _schedule_document_notifications(
+        db,
+        document,
+        consumer_user_id=job.user_id,
+        consumer_email=str(request_metadata.get("consumer_email") or "").strip() or None,
+        consumer_name=str(request_metadata.get("consumer_name") or "").strip() or None,
+    )
+
+    job.status = "completed"
+    job.document_id = document.id
+    job.result_metadata = dict(extracted_metadata or {})
+    job.result_text = extracted_text
+    job.error_message = None
+    job.engines_used = [str(engine) for engine in list(engines_used or [])]
+    job.completed_at = datetime.now(timezone.utc)
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    _sync_async_extraction_job_mirror(services, job)
+    return document
+
+
+def process_pending_async_extraction_jobs(
+    *,
+    db: Session,
+    services: ServiceRegistry,
+    limit: int | None = None,
+) -> dict[str, int]:
+    settings = get_settings()
+    batch_size = max(1, int(limit or settings.local_async_extraction_batch_size))
+    stmt = (
+        select(ExtractionJob)
+        .where(ExtractionJob.status.in_(("queued", "processing")))
+        .order_by(ExtractionJob.created_at.asc())
+        .limit(batch_size)
+    )
+    jobs = db.execute(stmt).scalars().all()
+    processed = 0
+    completed = 0
+    failed = 0
+
+    for job in jobs:
+        if str(job.status or "").lower() == "completed":
+            continue
+        processed += 1
+        if str(job.status or "").lower() != "processing":
+            job.status = "processing"
+            job.started_at = job.started_at or datetime.now(timezone.utc)
+            db.add(job)
+            db.commit()
+            _sync_async_extraction_job_mirror(services, job)
+
+        payload = _load_async_job_image_bytes(job, services=services)
+        if not payload:
+            failed += 1
+            _mark_async_job_failed(
+                db,
+                job,
+                error_message="Async extraction source payload is unavailable.",
+                services=services,
+            )
+            continue
+
+        request_metadata = job.request_metadata if isinstance(job.request_metadata, dict) else {}
+        try:
+            routed = _run_image_extraction_router(
+                image_bytes=payload,
+                filename=job.filename,
+                supplied_ocr_text="",
+                ocr_mode_override=str(request_metadata.get("ocr_mode") or settings.async_extraction_ocr_mode or "hybrid"),
+                bill_id=str(request_metadata.get("bill_id") or "").strip() or None,
+                vendor=str(request_metadata.get("vendor") or "").strip() or None,
+                document_date=_coerce_date(request_metadata.get("document_date")),
+                total_amount=_coerce_float(request_metadata.get("total_amount")),
+            )
+            extracted_metadata = routed.get("metadata") if isinstance(routed.get("metadata"), dict) else {}
+            extracted_text = str(routed.get("resolved_text") or "").strip() or _metadata_to_canonical_text(extracted_metadata)
+            _finalize_async_extraction_job(
+                db=db,
+                services=services,
+                job=job,
+                extracted_text=extracted_text,
+                extracted_metadata=extracted_metadata,
+                field_confidences=(routed.get("field_confidences") if isinstance(routed.get("field_confidences"), dict) else {}),
+                field_sources=(routed.get("field_sources") if isinstance(routed.get("field_sources"), dict) else {}),
+                low_confidence_fields=(routed.get("low_confidence_fields") if isinstance(routed.get("low_confidence_fields"), list) else []),
+                engines_used=(routed.get("engines_used") if isinstance(routed.get("engines_used"), list) else []),
+            )
+            completed += 1
+        except Exception as exc:
+            logger.exception("Local async extraction failed for job_id=%s", str(job.id))
+            failed += 1
+            _mark_async_job_failed(
+                db,
+                job,
+                error_message=str(exc),
+                engines_used=["local_async_worker"],
+                services=services,
+            )
+
+    return {
+        "processed": processed,
+        "completed": completed,
+        "failed": failed,
+    }
+
+
+def _cognito_attr_map(user: dict[str, object]) -> dict[str, str]:
+    attrs = user.get("Attributes")
+    if not isinstance(attrs, list):
+        return {}
+    mapped: dict[str, str] = {}
+    for attr in attrs:
+        if not isinstance(attr, dict):
+            continue
+        key = str(attr.get("Name") or "").strip()
+        value = str(attr.get("Value") or "").strip()
+        if key:
+            mapped[key] = value
+    return mapped
+
+
+def _list_cognito_users_by_custom_id(
+    *,
+    client: object,
+    user_pool_id: str,
+    custom_id: str,
+) -> list[dict[str, object]]:
+    escaped = custom_id.replace('"', '\\"')
+    filter_expression = f'custom:custom_id = "{escaped}"'
+    try:
+        response = client.list_users(UserPoolId=user_pool_id, Filter=filter_expression, Limit=20)
+        users = response.get("Users", [])
+        if isinstance(users, list):
+            return [user for user in users if isinstance(user, dict)]
+    except Exception:
+        pass
+
+    # Fallback for pools where custom-attribute filtering is unavailable.
+    matched: list[dict[str, object]] = []
+    pagination_token: str | None = None
+    for _ in range(20):
+        params: dict[str, object] = {"UserPoolId": user_pool_id, "Limit": 60}
+        if pagination_token:
+            params["PaginationToken"] = pagination_token
+        response = client.list_users(**params)
+        users = response.get("Users", [])
+        if isinstance(users, list):
+            for user in users:
+                if not isinstance(user, dict):
+                    continue
+                attrs = _cognito_attr_map(user)
+                if attrs.get("custom:custom_id", "").strip().upper() == custom_id.upper():
+                    matched.append(user)
+        token_value = response.get("PaginationToken")
+        pagination_token = str(token_value).strip() if token_value else None
+        if not pagination_token:
+            break
+    return matched
 
 
 def _safe_session_commit(db: Session) -> None:
@@ -182,6 +632,58 @@ def _rate_limit_or_429(
         )
 
 
+@router.post("/auth/lookup-id")
+def lookup_user_by_custom_id(payload: dict[str, object]) -> dict[str, object]:
+    settings = get_settings()
+    custom_id = str(payload.get("customId") or "").strip().upper()
+    requested_type = str(payload.get("userType") or "").strip().lower()
+    if not custom_id or requested_type not in {"consumer", "merchant"}:
+        raise HTTPException(status_code=400, detail="customId and valid userType are required")
+
+    if not settings.cognito_user_pool_id:
+        raise HTTPException(status_code=500, detail="COGNITO_USER_POOL_ID is not configured")
+    if boto3 is None:
+        raise HTTPException(status_code=500, detail="boto3 dependency is unavailable")
+
+    try:
+        client = boto3.client("cognito-idp", region_name=settings.aws_region)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to initialize Cognito client: {exc}") from exc
+
+    try:
+        users = _list_cognito_users_by_custom_id(
+            client=client,
+            user_pool_id=settings.cognito_user_pool_id,
+            custom_id=custom_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Cognito lookup failed: {exc}") from exc
+
+    for user in users:
+        attrs = _cognito_attr_map(user)
+        discovered_type = str(attrs.get("custom:user_type") or "").strip().lower()
+        if discovered_type and discovered_type != requested_type:
+            continue
+
+        email = str(attrs.get("email") or "").strip().lower()
+        if not email:
+            continue
+        full_name = str(attrs.get("name") or attrs.get("given_name") or "").strip()
+        user_sub = str(attrs.get("sub") or "").strip()
+        resolved_custom_id = str(attrs.get("custom:custom_id") or custom_id).strip().upper()
+        resolved_type = discovered_type if discovered_type in {"consumer", "merchant"} else requested_type
+
+        return {
+            "userId": user_sub,
+            "email": email,
+            "fullName": full_name,
+            "userType": resolved_type,
+            "customId": resolved_custom_id,
+        }
+
+    raise HTTPException(status_code=404, detail="Account not found")
+
+
 def _coerce_date(value: object) -> date | None:
     if isinstance(value, datetime):
         return value.date()
@@ -227,6 +729,42 @@ def _coerce_bool(value: object, default: bool = True) -> bool:
     return bool(value)
 
 
+def _looks_like_non_merchandise_item_name(value: object) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    compact = re.sub(r"\s+", " ", text)
+    blocked_tokens = (
+        "customer number",
+        "customer no",
+        "customer id",
+        "document number",
+        "invoice number",
+        "tax invoice number",
+        "order number",
+        "po number",
+        "purchase order number",
+        "ship to",
+        "bill to",
+        "place of supply",
+        "gstin",
+        "pan",
+        "address",
+        "pincode",
+        "postal code",
+        "phone",
+        "email",
+        "tax rate",
+        "item number",
+        "hsn",
+    )
+    if any(token in compact for token in blocked_tokens):
+        return True
+    return bool(
+        re.fullmatch(r"(?:customer|invoice|document|order|po|gst|pan|hsn|item)\s*(?:no|number|id|code)", compact)
+    )
+
+
 def _first_meaningful_line(text: str, fallback: str) -> str:
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -241,7 +779,18 @@ def _first_meaningful_line(text: str, fallback: str) -> str:
 
 
 def _ocr_image_bytes(image_bytes: bytes) -> str:
-    if not image_bytes or Image is None or pytesseract is None:
+    if not image_bytes:
+        return ""
+
+    google_text = _extract_text_with_google_vision(image_bytes)
+    if google_text:
+        return google_text
+
+    textract_text = _extract_text_with_textract(image_bytes)
+    if textract_text:
+        return textract_text
+
+    if Image is None or pytesseract is None:
         return ""
 
     settings = get_settings()
@@ -253,6 +802,95 @@ def _ocr_image_bytes(image_bytes: bytes) -> str:
             return (pytesseract.image_to_string(image) or "").strip()
     except Exception:
         return ""
+
+
+def _summarize_exception_message(error: Exception, max_len: int = 160) -> str:
+    name = error.__class__.__name__
+    text = str(error).strip().replace("\n", " ")
+    if len(text) > max_len:
+        text = text[: max_len - 3].rstrip() + "..."
+    return f"{name}: {text}" if text else name
+
+
+def _build_image_ocr_diagnostics(image_bytes: bytes) -> str:
+    settings = get_settings()
+    diagnostics: list[str] = ["diag_version=google_vision_v1"]
+
+    tesseract_path = ""
+    configured_cmd = (settings.tesseract_cmd or "").strip()
+    if configured_cmd:
+        tesseract_path = configured_cmd if os.path.exists(configured_cmd) else ""
+    if not tesseract_path:
+        tesseract_path = shutil.which("tesseract") or ""
+
+    if Image is None or pytesseract is None:
+        diagnostics.append("local_ocr=unavailable (missing PIL/pytesseract)")
+    elif not tesseract_path:
+        diagnostics.append("local_ocr=unavailable (tesseract binary not found)")
+    else:
+        diagnostics.append(f"local_ocr=ready ({tesseract_path})")
+
+    if httpx is None:
+        diagnostics.append("google_vision=unavailable (httpx missing)")
+    else:
+        auth_headers, params, auth_mode = _google_vision_auth_context()
+        if auth_mode == "none":
+            diagnostics.append("google_vision=unconfigured (set GOOGLE_VISION_API_KEY or GOOGLE_VISION_CREDENTIALS_FILE)")
+        elif auth_mode == "service_account" and (service_account is None or GoogleAuthRequest is None):
+            diagnostics.append("google_vision=unavailable (google-auth missing)")
+        else:
+            payload = {
+                "requests": [
+                    {
+                        "image": {"content": base64.b64encode(image_bytes).decode("ascii")},
+                        "features": [{"type": "DOCUMENT_TEXT_DETECTION", "maxResults": 1}],
+                    }
+                ]
+            }
+            endpoint = (settings.google_vision_endpoint or "").strip() or "https://vision.googleapis.com/v1/images:annotate"
+            try:
+                with httpx.Client(timeout=20.0) as client:
+                    response = client.post(endpoint, params=params, headers=auth_headers, json=payload)
+                    response.raise_for_status()
+                    parsed = response.json()
+                responses = parsed.get("responses", []) if isinstance(parsed, dict) else []
+                first = responses[0] if isinstance(responses, list) and responses else {}
+                if isinstance(first, dict) and isinstance(first.get("error"), dict):
+                    details = str(first.get("error", {}).get("message") or "unknown error")
+                    diagnostics.append(f"google_vision=error ({details[:140]})")
+                else:
+                    diagnostics.append(f"google_vision=ok ({auth_mode})")
+            except Exception as exc:
+                diagnostics.append(f"google_vision=error ({_summarize_exception_message(exc)})")
+
+    if boto3 is None:
+        diagnostics.append("aws_sdk=unavailable (boto3 missing)")
+        return "; ".join(diagnostics)
+
+    try:
+        textract_client = boto3.client("textract", region_name=settings.aws_region)
+        textract_client.detect_document_text(Document={"Bytes": image_bytes})
+        diagnostics.append("textract=ok")
+    except Exception as exc:
+        diagnostics.append(f"textract=error ({_summarize_exception_message(exc)})")
+
+    model = (settings.bedrock_chat_model or "").strip()
+    if not model:
+        diagnostics.append("bedrock=unconfigured (BEDROCK_CHAT_MODEL empty)")
+    else:
+        try:
+            bedrock_client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+            bedrock_client.converse(
+                modelId=model,
+                system=[{"text": "Return compact JSON only."}],
+                messages=[{"role": "user", "content": [{"text": "Respond with {\"ok\":true}."}]}],
+                inferenceConfig={"temperature": 0.0, "maxTokens": 64},
+            )
+            diagnostics.append("bedrock=ok")
+        except Exception as exc:
+            diagnostics.append(f"bedrock=error ({_summarize_exception_message(exc)})")
+
+    return "; ".join(diagnostics)
 
 
 def _looks_like_ui_screenshot(text: str) -> bool:
@@ -287,14 +925,53 @@ def _merge_invoice_metadata(
     merged = dict(fallback)
     if not preferred:
         return merged
+
+    fallback_bill_id = str(fallback.get("bill_id") or "").strip()
+    fallback_total = _coerce_float(fallback.get("total_amount"))
+    fallback_product = str(sanitize_merchandise_name(fallback.get("product_name")) or "").strip()
+    fallback_line_items = fallback.get("line_items") if isinstance(fallback.get("line_items"), list) else []
+
     for key, value in preferred.items():
         if not _is_meaningful_metadata_value(value):
             continue
+        if key == "bill_id":
+            preferred_bill_id = str(value).strip()[:128]
+            if not preferred_bill_id:
+                continue
+            if fallback_bill_id:
+                normalized_preferred = preferred_bill_id.upper()
+                normalized_fallback = fallback_bill_id.upper()
+                if normalized_preferred.startswith(normalized_fallback):
+                    suffix = normalized_preferred[len(normalized_fallback):].strip()
+                    if suffix and re.fullmatch(r"[-/][A-Z0-9]{3,}", suffix):
+                        continue
+            merged[key] = preferred_bill_id
+            continue
+        if key == "product_name":
+            preferred_product = str(sanitize_merchandise_name(value) or "").strip()
+            if not preferred_product and fallback_product:
+                continue
+            if preferred_product:
+                merged[key] = preferred_product
+            continue
+        if key == "total_amount":
+            preferred_total = _coerce_float(value)
+            if preferred_total is None:
+                continue
+            if fallback_total is not None and fallback_total > 0:
+                if preferred_total > fallback_total * 2.5 or preferred_total < fallback_total * 0.4:
+                    continue
+            merged[key] = preferred_total
+            continue
+        if key == "line_items" and isinstance(value, list):
+            preferred_items = [item for item in value if isinstance(item, dict)]
+            if fallback_line_items and len(preferred_items) < len(fallback_line_items):
+                continue
         merged[key] = value
     return merged
 
 
-def _normalize_openai_invoice_metadata(raw: object) -> dict[str, object]:
+def _normalize_invoice_metadata(raw: object) -> dict[str, object]:
     if not isinstance(raw, dict):
         return {}
 
@@ -325,7 +1002,10 @@ def _normalize_openai_invoice_metadata(raw: object) -> dict[str, object]:
         value = raw.get(key)
         if value is None:
             continue
-        text = str(value).strip()
+        if key == "product_name":
+            text = str(sanitize_merchandise_name(value) or "").strip()
+        else:
+            text = str(value).strip()
         if text:
             normalized[key] = text
 
@@ -344,7 +1024,7 @@ def _normalize_openai_invoice_metadata(raw: object) -> dict[str, object]:
         for item in line_items_value:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name") or "").strip()
+            name = str(sanitize_merchandise_name(item.get("name")) or "").strip()
             amount = _coerce_float(item.get("amount"))
             quantity = _coerce_float(item.get("quantity"))
             unit_price = _coerce_float(item.get("unit_price"))
@@ -371,7 +1051,7 @@ def _metadata_to_canonical_text(metadata: dict[str, object]) -> str:
     vendor = str(metadata.get("vendor") or "").strip()
     invoice_date = str(metadata.get("date") or "").strip()
     total_amount = _coerce_float(metadata.get("total_amount"))
-    product_name = str(metadata.get("product_name") or "").strip()
+    product_name = str(sanitize_merchandise_name(metadata.get("product_name")) or metadata.get("product_name") or "").strip()
     vendor_tax_id = str(metadata.get("vendor_tax_id") or "").strip()
 
     if bill_id:
@@ -393,7 +1073,7 @@ def _metadata_to_canonical_text(metadata: dict[str, object]) -> str:
         for item in line_items[:20]:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name") or "").strip()
+            name = str(sanitize_merchandise_name(item.get("name")) or item.get("name") or "").strip()
             amount = _coerce_float(item.get("amount"))
             if not name and amount is None:
                 continue
@@ -548,19 +1228,27 @@ def _infer_locker_category(
     return "Others"
 
 
-def _extract_image_metadata_with_openai(image_bytes: bytes, filename: str) -> dict[str, object]:
+def _extract_image_metadata_with_bedrock(image_bytes: bytes, filename: str) -> dict[str, object]:
     settings = get_settings()
     if not image_bytes:
         return {}
-    if not settings.openai_api_key or httpx is None:
+    if boto3 is None:
         return {}
     if os.getenv("PYTEST_CURRENT_TEST"):
         return {}
 
-    model = (settings.openai_chat_model or "").strip() or "gpt-4.1-mini"
+    model = (settings.bedrock_chat_model or "").strip()
+    if not model:
+        return {}
     mime_type = mimetypes.guess_type(filename)[0] or "image/png"
-    encoded = base64.b64encode(image_bytes).decode("ascii")
-    data_url = f"data:{mime_type};base64,{encoded}"
+    image_format = "png"
+    if "jpeg" in mime_type or "jpg" in mime_type:
+        image_format = "jpeg"
+    elif "webp" in mime_type:
+        image_format = "webp"
+    elif "gif" in mime_type:
+        image_format = "gif"
+
     system_prompt = (
         "You are an invoice data extraction engine. "
         "Return only JSON. Do not guess missing values. Use null for missing fields. "
@@ -578,44 +1266,244 @@ def _extract_image_metadata_with_openai(image_bytes: bytes, filename: str) -> di
         "Keep original invoice number formatting and correct decimal amounts. "
         "If multiple totals appear, prefer grand total/final total."
     )
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            },
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {settings.openai_api_key}",
-        "Content-Type": "application/json",
-    }
 
     try:
-        with httpx.Client(timeout=30.0) as client:
-            response = client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
-        if response.status_code >= 400:
-            return {}
-        response_payload = response.json()
-        raw_content = (
-            response_payload.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "{}")
+        client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+        response = client.converse(
+            modelId=model,
+            system=[{"text": system_prompt}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"text": user_prompt},
+                        {"image": {"format": image_format, "source": {"bytes": image_bytes}}},
+                    ],
+                }
+            ],
+            inferenceConfig={"temperature": 0.0, "maxTokens": 1000},
         )
-        if not isinstance(raw_content, str):
+        content_blocks = (
+            response.get("output", {})
+            .get("message", {})
+            .get("content", [])
+        )
+        raw_content = "".join(
+            str(block.get("text", ""))
+            for block in content_blocks
+            if isinstance(block, dict)
+        ).strip()
+        if not raw_content:
             return {}
+        if raw_content.startswith("```"):
+            raw_content = raw_content.strip("`")
+            raw_content = raw_content.replace("json\n", "", 1).strip()
         parsed = json.loads(raw_content)
     except Exception:
         return {}
 
-    return _normalize_openai_invoice_metadata(parsed)
+    return _normalize_invoice_metadata(parsed)
+
+
+def _extract_text_with_textract(image_bytes: bytes) -> str:
+    settings = get_settings()
+    if not image_bytes or boto3 is None:
+        return ""
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return ""
+    try:
+        client = boto3.client("textract", region_name=settings.aws_region)
+        response = client.detect_document_text(Document={"Bytes": image_bytes})
+    except Exception:
+        return ""
+    blocks = response.get("Blocks", [])
+    lines: list[str] = []
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("BlockType") or "").upper() != "LINE":
+                continue
+            text = str(block.get("Text") or "").strip()
+            if text:
+                lines.append(text)
+    return "\n".join(lines).strip()
+
+
+def _extract_text_with_google_vision(image_bytes: bytes) -> str:
+    settings = get_settings()
+    if not image_bytes or httpx is None:
+        return ""
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return ""
+    auth_headers, params, auth_mode = _google_vision_auth_context()
+    if auth_mode == "none":
+        return ""
+    if auth_mode == "service_account" and (service_account is None or GoogleAuthRequest is None):
+        return ""
+
+    endpoint = (settings.google_vision_endpoint or "").strip() or "https://vision.googleapis.com/v1/images:annotate"
+    payload = {
+        "requests": [
+            {
+                "image": {"content": base64.b64encode(image_bytes).decode("ascii")},
+                "features": [{"type": "DOCUMENT_TEXT_DETECTION", "maxResults": 1}],
+            }
+        ]
+    }
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(endpoint, params=params, headers=auth_headers, json=payload)
+            response.raise_for_status()
+            parsed = response.json()
+    except Exception:
+        return ""
+
+    responses = parsed.get("responses", []) if isinstance(parsed, dict) else []
+    first = responses[0] if isinstance(responses, list) and responses else {}
+    if not isinstance(first, dict):
+        return ""
+    if isinstance(first.get("error"), dict):
+        return ""
+    full_text = first.get("fullTextAnnotation", {})
+    if isinstance(full_text, dict):
+        text = str(full_text.get("text") or "").strip()
+        if text:
+            return text
+    text_annotations = first.get("textAnnotations", [])
+    if isinstance(text_annotations, list) and text_annotations:
+        first_ann = text_annotations[0]
+        if isinstance(first_ann, dict):
+            return str(first_ann.get("description") or "").strip()
+    return ""
+
+
+def _google_vision_auth_context() -> tuple[dict[str, str], dict[str, str] | None, str]:
+    settings = get_settings()
+    creds_file = (settings.google_vision_credentials_file or "").strip()
+    if creds_file:
+        if service_account is None or GoogleAuthRequest is None:
+            return {}, None, "service_account"
+        try:
+            scopes = [str(settings.google_vision_scope or "").strip() or "https://www.googleapis.com/auth/cloud-platform"]
+            creds = service_account.Credentials.from_service_account_file(creds_file, scopes=scopes)
+            creds.refresh(GoogleAuthRequest())
+            token = str(creds.token or "").strip()
+            if token:
+                return {"Authorization": f"Bearer {token}"}, None, "service_account"
+        except Exception:
+            return {}, None, "none"
+    api_key = (settings.google_vision_api_key or "").strip()
+    if api_key:
+        endpoint = (settings.google_vision_endpoint or "").strip()
+        params = None if "key=" in endpoint else {"key": api_key}
+        return {}, params, "api_key"
+    return {}, None, "none"
+
+
+def _extract_image_metadata_with_google_vision(image_bytes: bytes, filename: str) -> tuple[dict[str, object], str]:
+    text_output = _extract_text_with_google_vision(image_bytes)
+    if not text_output:
+        return {}, ""
+    metadata = ensure_strict_extraction(extract_invoice_metadata(text_output, filename))
+    return metadata, text_output
+
+
+def _extract_image_metadata_with_textract(image_bytes: bytes, filename: str) -> tuple[dict[str, object], str]:
+    settings = get_settings()
+    if not image_bytes or boto3 is None:
+        return {}, ""
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return {}, ""
+
+    text_output = _extract_text_with_textract(image_bytes)
+    extracted = ensure_strict_extraction(extract_invoice_metadata(text_output, filename)) if text_output else {}
+    try:
+        client = boto3.client("textract", region_name=settings.aws_region)
+        expense = client.analyze_expense(Document={"Bytes": image_bytes})
+    except Exception:
+        return extracted, text_output
+
+    summary_fields: list[dict[str, object]] = []
+    line_items: list[dict[str, object]] = []
+    for document in expense.get("ExpenseDocuments", []) if isinstance(expense, dict) else []:
+        if not isinstance(document, dict):
+            continue
+        raw_summary = document.get("SummaryFields", [])
+        if isinstance(raw_summary, list):
+            summary_fields.extend([field for field in raw_summary if isinstance(field, dict)])
+        groups = document.get("LineItemGroups", [])
+        if isinstance(groups, list):
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                for item in group.get("LineItems", []) if isinstance(group.get("LineItems"), list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    fields = item.get("LineItemExpenseFields", [])
+                    if not isinstance(fields, list):
+                        continue
+                    parsed_item: dict[str, object] = {}
+                    for field in fields:
+                        if not isinstance(field, dict):
+                            continue
+                        field_type = str(field.get("Type", {}).get("Text") if isinstance(field.get("Type"), dict) else "").strip().upper()
+                        field_val = str(field.get("ValueDetection", {}).get("Text") if isinstance(field.get("ValueDetection"), dict) else "").strip()
+                        if not field_val:
+                            continue
+                        if field_type in {"ITEM", "ITEM_NAME", "DESCRIPTION"} and "name" not in parsed_item:
+                            parsed_item["name"] = field_val[:255]
+                        elif field_type in {"PRICE", "AMOUNT", "TOTAL"} and "amount" not in parsed_item:
+                            amount = _coerce_float(field_val.replace(",", ""))
+                            if amount is not None:
+                                parsed_item["amount"] = amount
+                        elif field_type in {"QUANTITY", "QTY"} and "quantity" not in parsed_item:
+                            quantity = _coerce_float(field_val.replace(",", ""))
+                            if quantity is not None:
+                                parsed_item["quantity"] = quantity
+                        elif field_type in {"UNIT_PRICE"} and "unit_price" not in parsed_item:
+                            unit_price = _coerce_float(field_val.replace(",", ""))
+                            if unit_price is not None:
+                                parsed_item["unit_price"] = unit_price
+                    if parsed_item:
+                        line_items.append(parsed_item)
+
+    mapped: dict[str, object] = dict(extracted)
+    for field in summary_fields:
+        label = str(field.get("Type", {}).get("Text") if isinstance(field.get("Type"), dict) else "").strip().upper()
+        value_text = str(field.get("ValueDetection", {}).get("Text") if isinstance(field.get("ValueDetection"), dict) else "").strip()
+        if not value_text:
+            continue
+        normalized_value = value_text.replace(",", "")
+        if label in {"INVOICE_RECEIPT_ID", "RECEIPT_ID"} and not mapped.get("bill_id"):
+            mapped["bill_id"] = value_text[:128]
+        elif label in {"VENDOR_NAME"} and not mapped.get("vendor"):
+            mapped["vendor"] = value_text[:255]
+        elif label in {"INVOICE_RECEIPT_DATE"} and not mapped.get("date"):
+            parsed_date = _coerce_date(value_text)
+            if parsed_date:
+                mapped["date"] = parsed_date.isoformat()
+            else:
+                mapped["date"] = value_text[:32]
+        elif label in {"TOTAL"} and mapped.get("total_amount") is None:
+            amount = _coerce_float(normalized_value)
+            if amount is not None:
+                mapped["total_amount"] = amount
+        elif label in {"SUBTOTAL"} and mapped.get("taxable_amount") is None:
+            amount = _coerce_float(normalized_value)
+            if amount is not None:
+                mapped["taxable_amount"] = amount
+        elif label in {"TAX"} and mapped.get("gst_amount") is None:
+            amount = _coerce_float(normalized_value)
+            if amount is not None:
+                mapped["gst_amount"] = amount
+        elif label in {"VENDOR_VAT_NUMBER", "VENDOR_GST_NUMBER"} and not mapped.get("vendor_tax_id"):
+            mapped["vendor_tax_id"] = value_text[:64]
+
+    if line_items and not mapped.get("line_items"):
+        mapped["line_items"] = line_items[:50]
+
+    return ensure_strict_extraction(mapped), text_output
 
 
 def _extract_image_metadata_with_proxy(
@@ -687,17 +1575,30 @@ def _run_image_extraction_router(
     image_bytes: bytes,
     filename: str,
     supplied_ocr_text: str,
+    ocr_mode_override: str | None,
     bill_id: str | None,
     vendor: str | None,
     document_date: date | None,
     total_amount: float | None,
 ) -> dict[str, object]:
     settings = get_settings()
+    requested_mode = str(ocr_mode_override or "").strip().lower()
+    ocr_mode = requested_mode or str(getattr(settings, "image_ocr_mode", "auto") or "auto").strip().lower()
+    local_only_mode = ocr_mode in {"local", "local_only", "tesseract", "tesseractjs"}
+    google_fast_mode = ocr_mode in {"auto", "cloud", "cloud_only", "google", "google_only", "vision", "vision_only"}
+    bedrock_hybrid_mode = ocr_mode in {"hybrid", "cloud_hybrid", "vision_bedrock", "google_bedrock"}
     engine_results: list[dict[str, object]] = []
+    supplied_has_invoice_signals = False
 
     supplied_text = supplied_ocr_text.strip()
     if supplied_text:
         metadata = ensure_strict_extraction(extract_invoice_metadata(supplied_text, filename))
+        supplied_vendor = str(metadata.get("vendor") or "").strip().lower()
+        supplied_has_invoice_signals = (
+            bool(supplied_vendor and supplied_vendor not in {"unknown_vendor", "unknown vendor"})
+            or _is_meaningful_metadata_value(metadata.get("date"))
+            or _is_meaningful_metadata_value(metadata.get("total_amount"))
+        )
         engine_results.append(
             {
                 "engine": "tesseract_regex",
@@ -711,82 +1612,120 @@ def _run_image_extraction_router(
             }
         )
 
-    tesseract_text = _ocr_image_bytes(image_bytes)
-    if tesseract_text and tesseract_text.strip() and tesseract_text.strip() != supplied_text:
-        tesseract_metadata = ensure_strict_extraction(extract_invoice_metadata(tesseract_text, filename))
-        engine_results.append(
-            {
-                "engine": "tesseract_regex",
-                "metadata": tesseract_metadata,
-                "text": tesseract_text,
-                "field_confidences": compute_field_confidences(
-                    metadata=tesseract_metadata,
-                    engine="tesseract_regex",
-                    text_quality=estimate_text_quality(tesseract_text),
-                ),
-            }
-        )
-
-    openai_metadata = ensure_strict_extraction(_extract_image_metadata_with_openai(image_bytes, filename))
-    if any(_is_meaningful_metadata_value(openai_metadata.get(key)) for key in ("bill_id", "vendor", "total_amount", "date")):
-        canonical_text = _metadata_to_canonical_text(openai_metadata)
-        engine_results.append(
-            {
-                "engine": "openai_vision",
-                "metadata": openai_metadata,
-                "text": canonical_text,
-                "field_confidences": compute_field_confidences(
-                    metadata=openai_metadata,
-                    engine="openai_vision",
-                    text_quality=estimate_text_quality(canonical_text),
-                ),
-            }
-        )
-
-    if settings.textract_proxy_url:
-        textract_metadata, textract_text = _extract_image_metadata_with_proxy(
-            image_bytes=image_bytes,
-            filename=filename,
-            proxy_url=settings.textract_proxy_url.strip(),
-            proxy_api_key=settings.textract_proxy_api_key,
-        )
+    def _append_bedrock_engine_result() -> None:
+        bedrock_metadata = ensure_strict_extraction(_extract_image_metadata_with_bedrock(image_bytes, filename))
         if any(
-            _is_meaningful_metadata_value(textract_metadata.get(key))
+            _is_meaningful_metadata_value(bedrock_metadata.get(key))
             for key in ("bill_id", "vendor", "total_amount", "date")
         ):
+            canonical_text = _metadata_to_canonical_text(bedrock_metadata)
             engine_results.append(
                 {
-                    "engine": "aws_textract",
-                    "metadata": textract_metadata,
-                    "text": (textract_text or _metadata_to_canonical_text(textract_metadata)),
+                    "engine": "aws_bedrock_vision",
+                    "metadata": bedrock_metadata,
+                    "text": canonical_text,
                     "field_confidences": compute_field_confidences(
-                        metadata=textract_metadata,
-                        engine="aws_textract",
-                        text_quality=estimate_text_quality(textract_text),
+                        metadata=bedrock_metadata,
+                        engine="aws_bedrock_vision",
+                        text_quality=estimate_text_quality(canonical_text),
                     ),
                 }
             )
 
-    if settings.docai_proxy_url:
-        docai_metadata, docai_text = _extract_image_metadata_with_proxy(
-            image_bytes=image_bytes,
-            filename=filename,
-            proxy_url=settings.docai_proxy_url.strip(),
-            proxy_api_key=settings.docai_proxy_api_key,
+    if not local_only_mode:
+        google_metadata, google_text = _extract_image_metadata_with_google_vision(image_bytes, filename)
+        google_vendor = str(google_metadata.get("vendor") or "").strip().lower()
+        google_has_invoice_signals = (
+            bool(google_vendor and google_vendor not in {"unknown_vendor", "unknown vendor"})
+            or _is_meaningful_metadata_value(google_metadata.get("date"))
+            or _is_meaningful_metadata_value(google_metadata.get("total_amount"))
         )
-        if any(_is_meaningful_metadata_value(docai_metadata.get(key)) for key in ("bill_id", "vendor", "total_amount", "date")):
+        if any(
+            _is_meaningful_metadata_value(google_metadata.get(key))
+            for key in ("bill_id", "vendor", "total_amount", "date")
+        ):
+            canonical_google_text = google_text or _metadata_to_canonical_text(google_metadata)
             engine_results.append(
                 {
-                    "engine": "google_docai",
-                    "metadata": docai_metadata,
-                    "text": (docai_text or _metadata_to_canonical_text(docai_metadata)),
+                    "engine": "google_vision",
+                    "metadata": google_metadata,
+                    "text": canonical_google_text,
                     "field_confidences": compute_field_confidences(
-                        metadata=docai_metadata,
-                        engine="google_docai",
-                        text_quality=estimate_text_quality(docai_text),
+                        metadata=google_metadata,
+                        engine="google_vision",
+                        text_quality=estimate_text_quality(canonical_google_text),
                     ),
                 }
             )
+
+        needs_bedrock_fast_fallback = google_fast_mode and (
+            _looks_like_ui_screenshot(supplied_text or google_text)
+            or (not supplied_has_invoice_signals and not google_has_invoice_signals)
+        )
+        if bedrock_hybrid_mode or needs_bedrock_fast_fallback:
+            _append_bedrock_engine_result()
+
+        if not google_fast_mode and not bedrock_hybrid_mode:
+            textract_metadata, textract_text = _extract_image_metadata_with_textract(image_bytes, filename)
+            if any(
+                _is_meaningful_metadata_value(textract_metadata.get(key))
+                for key in ("bill_id", "vendor", "total_amount", "date")
+            ):
+                canonical_textract_text = textract_text or _metadata_to_canonical_text(textract_metadata)
+                engine_results.append(
+                    {
+                        "engine": "aws_textract",
+                        "metadata": textract_metadata,
+                        "text": canonical_textract_text,
+                        "field_confidences": compute_field_confidences(
+                            metadata=textract_metadata,
+                            engine="aws_textract",
+                            text_quality=estimate_text_quality(canonical_textract_text),
+                        ),
+                    }
+                )
+
+            tesseract_text = _ocr_image_bytes(image_bytes)
+            if tesseract_text and tesseract_text.strip() and tesseract_text.strip() != supplied_text:
+                tesseract_metadata = ensure_strict_extraction(extract_invoice_metadata(tesseract_text, filename))
+                engine_results.append(
+                    {
+                        "engine": "tesseract_regex",
+                        "metadata": tesseract_metadata,
+                        "text": tesseract_text,
+                        "field_confidences": compute_field_confidences(
+                            metadata=tesseract_metadata,
+                            engine="tesseract_regex",
+                            text_quality=estimate_text_quality(tesseract_text),
+                        ),
+                    }
+                )
+
+            _append_bedrock_engine_result()
+
+            if settings.textract_proxy_url:
+                textract_proxy_metadata, textract_proxy_text = _extract_image_metadata_with_proxy(
+                    image_bytes=image_bytes,
+                    filename=filename,
+                    proxy_url=settings.textract_proxy_url.strip(),
+                    proxy_api_key=settings.textract_proxy_api_key,
+                )
+                if any(
+                    _is_meaningful_metadata_value(textract_proxy_metadata.get(key))
+                    for key in ("bill_id", "vendor", "total_amount", "date")
+                ):
+                    engine_results.append(
+                        {
+                            "engine": "aws_textract_proxy",
+                            "metadata": textract_proxy_metadata,
+                            "text": (textract_proxy_text or _metadata_to_canonical_text(textract_proxy_metadata)),
+                            "field_confidences": compute_field_confidences(
+                                metadata=textract_proxy_metadata,
+                                engine="aws_textract",
+                                text_quality=estimate_text_quality(textract_proxy_text),
+                            ),
+                        }
+                    )
 
     manual_overrides = _manual_override_metadata(
         bill_id=bill_id,
@@ -812,6 +1751,31 @@ def _run_image_extraction_router(
         engine_results,
         manual_overrides=manual_overrides,
     )
+    grounded_engine_names = {
+        "google_vision",
+        "aws_textract",
+        "aws_textract_proxy",
+        "tesseract_regex",
+        "manual_override",
+    }
+    grounded_results = [
+        result
+        for result in engine_results
+        if str(result.get("engine") or "").strip().lower() in grounded_engine_names
+    ]
+    if grounded_results:
+        grounded_metadata, grounded_confidences, grounded_sources = merge_engine_results(
+            grounded_results,
+            manual_overrides=manual_overrides,
+        )
+        merged_metadata, field_confidences, field_sources = prefer_grounded_ocr_fields(
+            merged_metadata,
+            grounded_metadata,
+            confidence_map=field_confidences,
+            source_map=field_sources,
+            grounded_confidence_map=grounded_confidences,
+            grounded_source_map=grounded_sources,
+        )
     low_conf_fields = build_review_fields(
         field_confidences,
         threshold=float(settings.extraction_review_required_threshold),
@@ -875,9 +1839,45 @@ def _persist_structured_document(
     resolved_vendor = str(vendor or metadata.get("vendor") or "UNKNOWN_VENDOR")[:256]
     resolved_date = document_date if document_date is not None else _coerce_date(metadata.get("date"))
     resolved_total = total_amount if total_amount is not None else _coerce_float(metadata.get("total_amount"))
+    if resolved_total is None:
+        taxable_amount = _coerce_float(metadata.get("taxable_amount"))
+        gst_amount = _coerce_float(metadata.get("gst_amount"))
+        if taxable_amount is not None and taxable_amount > 0 and gst_amount is not None and gst_amount >= 0:
+            resolved_total = round(taxable_amount + gst_amount, 2)
 
     title_fallback = filename.rsplit(".", 1)[0] if filename else "Uploaded Document"
-    extracted_product_name = str(metadata.get("product_name") or "").strip()
+    extracted_product_name = str(sanitize_merchandise_name(metadata.get("product_name")) or "").strip()
+    metadata_line_items = metadata.get("line_items")
+    sanitized_line_items: list[dict[str, object]] = []
+    if isinstance(metadata_line_items, list):
+        for item in metadata_line_items[:50]:
+            if not isinstance(item, dict):
+                continue
+            entry_name = sanitize_merchandise_name(item.get("name") or item.get("product_name"))
+            if not entry_name:
+                continue
+            normalized_item: dict[str, object] = {"name": entry_name}
+            amount = _coerce_float(item.get("amount"))
+            quantity = _coerce_float(item.get("quantity"))
+            unit_price = _coerce_float(item.get("unit_price"))
+            gst_component = _coerce_float(item.get("gst_amount"))
+            if amount is not None:
+                normalized_item["amount"] = amount
+            if quantity is not None:
+                normalized_item["quantity"] = quantity
+            if unit_price is not None:
+                normalized_item["unit_price"] = unit_price
+            if gst_component is not None:
+                normalized_item["gst_amount"] = gst_component
+            sanitized_line_items.append(normalized_item)
+    if not extracted_product_name:
+        for item in sanitized_line_items:
+            candidate = str(item.get("name") or "").strip()
+            if candidate:
+                extracted_product_name = candidate
+                break
+    if extracted_product_name:
+        metadata["product_name"] = extracted_product_name
     title = extracted_product_name or _first_meaningful_line(extracted_text, fallback=title_fallback)
     existing_id = (
         db.execute(select(Document.id).where(Document.bill_id == resolved_bill_id, Document.version == version).limit(1))
@@ -893,16 +1893,11 @@ def _persist_structured_document(
     extracted_warranty_end = _coerce_date(metadata.get("warranty_end"))
     if extracted_warranty_end is None and extracted_warranty_start:
         extracted_warranty_end = add_months(extracted_warranty_start, extracted_warranty_months)
-    metadata_line_items = metadata.get("line_items")
     inferred_category = _infer_locker_category(
         product_name=(extracted_product_name or title),
         brand=str(metadata.get("brand") or resolved_vendor),
         vendor=resolved_vendor,
-        line_items=(
-            [item for item in metadata_line_items if isinstance(item, dict)]
-            if isinstance(metadata_line_items, list)
-            else None
-        ),
+        line_items=(sanitized_line_items or None),
         source_category=metadata.get("category"),
     )
     extraction_confidences = dict(field_confidences or {})
@@ -921,6 +1916,14 @@ def _persist_structured_document(
             extraction_confidences,
             threshold=float(settings.extraction_review_required_threshold),
         )
+    ocr_snapshot_references = _store_ocr_text_snapshot(
+        services=services,
+        extracted_text=extracted_text,
+        filename=filename,
+        source=source,
+        document_user_id=user_id,
+        merchant_user_id=str((additional_references or {}).get("merchant_user_id") or "").strip() or None,
+    )
 
     fingerprint = extraction_fingerprint(metadata, extracted_text)
     duplicate_count = 0
@@ -966,14 +1969,16 @@ def _persist_structured_document(
             if value is None or value == "":
                 continue
             references[key] = value
+    if ocr_snapshot_references:
+        references.update(ocr_snapshot_references)
     if metadata.get("vendor_tax_id"):
         references["vendor_tax_id"] = str(metadata["vendor_tax_id"])
     for tax_key in ("taxable_amount", "gst_amount", "gst_rate", "cgst_amount", "sgst_amount", "igst_amount"):
         tax_value = _coerce_float(metadata.get(tax_key))
         if tax_value is not None and references.get(tax_key) is None:
             references[tax_key] = tax_value
-    if isinstance(metadata_line_items, list) and metadata_line_items and not references.get("line_items"):
-        references["line_items"] = [item for item in metadata_line_items if isinstance(item, dict)][:50]
+    if sanitized_line_items and not references.get("line_items"):
+        references["line_items"] = sanitized_line_items[:50]
     if metadata.get("serial_number") and not references.get("serial_number"):
         references["serial_number"] = str(metadata["serial_number"])
     if extracted_warranty_start and not references.get("warranty_start"):
@@ -1053,24 +2058,20 @@ def _persist_structured_document(
         if line_items_content and line_items_content != "[]":
             chunk_inputs.append(("line_items", line_items_content[:12000], {"section": "line_items", "source": source}))
 
+    # For image OCR flows, keep ingestion fast by avoiding per-chunk Bedrock calls.
+    fast_chunk_metadata = source in {"image_ocr", "image_ocr_router"}
     chunk_records: list[Chunk] = []
-    embedding_inputs: list[str] = []
     for chunk_type, content, metadata_json in chunk_inputs:
         chunk_id = uuid.uuid4()
-        generated = services.ingestion.metadata_generator.generate(
-            content=content,
-            chunk_type=chunk_type,
-            document_id=str(document.id),
-            chunk_id=str(chunk_id),
-        )
-        embedding_inputs.append(
-            build_embedding_text(
+        if fast_chunk_metadata:
+            generated = services.ingestion.metadata_generator._fallback_metadata(content, chunk_type)  # type: ignore[attr-defined]
+        else:
+            generated = services.ingestion.metadata_generator.generate(
                 content=content,
-                summary=generated["summary"],
-                keywords=generated["keywords"],
-                hypothetical_questions=generated["hypothetical_questions"],
+                chunk_type=chunk_type,
+                document_id=str(document.id),
+                chunk_id=str(chunk_id),
             )
-        )
         chunk_records.append(
             Chunk(
                 id=chunk_id,
@@ -1084,9 +2085,7 @@ def _persist_structured_document(
             )
         )
 
-    vectors = services.ingestion.embedding_service.embed_batch(embedding_inputs)
-    for chunk, vector in zip(chunk_records, vectors):
-        chunk.embedding_vector = vector
+    for chunk in chunk_records:
         db.add(chunk)
 
     review_record: ExtractionReview | None = None
@@ -1125,16 +2124,26 @@ def _persist_structured_document(
             db.refresh(review_record)
         except Exception:
             pass
-    try:
-        services.ingestion._upsert_pinecone_vectors(document, chunk_records)  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    _sync_document_mirror(services, document)
     return document, len(chunk_records)
 
 
 def _safe_references(document: Document) -> dict:
     references = getattr(document, "references", None)
     return references if isinstance(references, dict) else {}
+
+
+def _serialize_product_image_state(document: Document) -> DocumentProductImageView:
+    references = _safe_references(document)
+    payload = references.get("product_image") if isinstance(references.get("product_image"), dict) else {}
+    storage_key = str(payload.get("storage_key") or "").strip()
+    return DocumentProductImageView(
+        docId=str(document.id),
+        productImageAvailable=bool(storage_key),
+        generatedAt=(str(payload["generated_at"]) if payload.get("generated_at") else None),
+        subject=(str(payload["subject"]) if payload.get("subject") else None),
+        modelUsed=(str(payload["model_id"]) if payload.get("model_id") else None),
+    )
 
 
 def _schedule_document_notifications(
@@ -1383,6 +2392,68 @@ def _document_in_scope(document: Document, *, user_id: str | None, merchant_user
     return True
 
 
+def _shared_members_from_references(references: dict[str, object]) -> list[dict[str, str]]:
+    raw = references.get("shared_with")
+    if not isinstance(raw, list):
+        return []
+    members: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        user_id = str(item.get("user_id") or "").strip()
+        if not user_id:
+            continue
+        members.append(
+            {
+                "user_id": user_id[:128],
+                "permission": (str(item.get("permission") or "view").strip().lower() or "view")[:16],
+                "granted_by": str(item.get("granted_by") or "").strip()[:128],
+                "granted_at": str(item.get("granted_at") or "").strip()[:64],
+            }
+        )
+    return members
+
+
+def _document_is_shared_with(document: Document, user_id: str | None) -> bool:
+    if not user_id:
+        return False
+    references = _safe_references(document)
+    for member in _shared_members_from_references(references):
+        if member.get("user_id") == user_id:
+            return True
+    return False
+
+
+def _can_manage_document_sharing(principal: Principal, document: Document) -> bool:
+    if principal.role in {"admin", "analyst"}:
+        return True
+    subject = str(principal.subject or "").strip()
+    if not subject:
+        return False
+    references = _safe_references(document)
+    owner_user_id = str(references.get("user_id") or "").strip()
+    owner_merchant_id = str(references.get("merchant_user_id") or "").strip()
+    return subject in {owner_user_id, owner_merchant_id}
+
+
+def _serialize_document_shares(document: Document) -> DocumentShareResponse:
+    references = _safe_references(document)
+    members = [
+        DocumentShareMemberView(
+            userId=member["user_id"],
+            permission=member.get("permission") or "view",
+            grantedBy=(member.get("granted_by") or None),
+            grantedAt=(member.get("granted_at") or None),
+        )
+        for member in _shared_members_from_references(references)
+    ]
+    return DocumentShareResponse(
+        docId=str(document.id),
+        ownerUserId=(str(references.get("user_id")) if references.get("user_id") else None),
+        sharedWith=members,
+    )
+
+
 def _serialize_extraction_review(review: ExtractionReview) -> ExtractionReviewView:
     return ExtractionReviewView(
         reviewId=str(review.id),
@@ -1447,39 +2518,55 @@ def _serialize_document(document: Document) -> DocumentView:
     warranty_start_iso = warranty_start.isoformat() if warranty_start else None
     warranty_end_iso = warranty_end.isoformat() if warranty_end else None
 
-    product_name = str(references.get("product_name") or references.get("title") or document.bill_id)
+    product_name_raw = str(references.get("product_name") or references.get("title") or document.bill_id).strip()
+    product_name = str(sanitize_merchandise_name(product_name_raw) or product_name_raw or document.bill_id).strip()
     items: list[WarrantyItemView] = []
     reference_items = references.get("line_items")
+    cleaned_reference_items: list[dict[str, object]] = []
     if isinstance(reference_items, list):
-        for index, entry in enumerate(reference_items[:50], start=1):
+        for entry in reference_items[:50]:
             if not isinstance(entry, dict):
                 continue
-            entry_name = str(entry.get("name") or entry.get("product_name") or "").strip()
-            entry_amount = _coerce_float(entry.get("amount"))
-            if not entry_name and entry_amount is None:
+            entry_name_raw = str(entry.get("name") or entry.get("product_name") or "").strip()
+            if _looks_like_non_merchandise_item_name(entry_name_raw):
                 continue
-            items.append(
-                WarrantyItemView(
-                    itemId=f"{document.id}:{index}",
-                    productName=(entry_name or product_name),
-                    model=str(references.get("brand") or document.vendor),
-                    invoiceNo=document.bill_id,
-                    purchaseDate=purchase_date_iso,
-                    purchasePrice=entry_amount,
-                    quantity=_coerce_float(entry.get("quantity")),
-                    unitPrice=_coerce_float(entry.get("unit_price")),
-                    gstAmount=_coerce_float(entry.get("gst_amount")),
-                    warrantyMonths=warranty_months,
-                    warrantyStart=warranty_start_iso,
-                    warrantyEnd=warranty_end_iso,
-                    serialNumber=(str(references["serial_number"]) if references.get("serial_number") else None),
-                    serviceCenters=(
-                        references.get("service_centers") if isinstance(references.get("service_centers"), list) else []
-                    ),
-                    extendedWarrantyPurchased=_coerce_bool(references.get("extended_warranty_purchased"), default=False),
-                    notes=(str(references["notes"]) if references.get("notes") else None),
-                )
+            entry_name = sanitize_merchandise_name(entry_name_raw)
+            if not entry_name:
+                continue
+            normalized_entry = dict(entry)
+            normalized_entry["name"] = entry_name
+            cleaned_reference_items.append(normalized_entry)
+
+    single_line_item = len(cleaned_reference_items) == 1
+    for index, entry in enumerate(cleaned_reference_items, start=1):
+        entry_amount = _coerce_float(entry.get("amount"))
+        display_amount = (
+            purchase_price
+            if single_line_item and purchase_price is not None and purchase_price > 0
+            else entry_amount
+        )
+        items.append(
+            WarrantyItemView(
+                itemId=f"{document.id}:{index}",
+                productName=str(entry.get("name") or product_name),
+                model=str(references.get("brand") or document.vendor),
+                invoiceNo=document.bill_id,
+                purchaseDate=purchase_date_iso,
+                purchasePrice=display_amount,
+                quantity=_coerce_float(entry.get("quantity")),
+                unitPrice=_coerce_float(entry.get("unit_price")),
+                gstAmount=_coerce_float(entry.get("gst_amount")),
+                warrantyMonths=warranty_months,
+                warrantyStart=warranty_start_iso,
+                warrantyEnd=warranty_end_iso,
+                serialNumber=(str(references["serial_number"]) if references.get("serial_number") else None),
+                serviceCenters=(
+                    references.get("service_centers") if isinstance(references.get("service_centers"), list) else []
+                ),
+                extendedWarrantyPurchased=_coerce_bool(references.get("extended_warranty_purchased"), default=False),
+                notes=(str(references["notes"]) if references.get("notes") else None),
             )
+        )
 
     if not items:
         items = [
@@ -1575,6 +2662,7 @@ def _serialize_document(document: Document) -> DocumentView:
             str(references["merchant_custom_id"]) if references.get("merchant_custom_id") else None
         ),
         consumerCustomId=(str(references["consumer_custom_id"]) if references.get("consumer_custom_id") else None),
+        totalAmount=purchase_price,
         taxableAmount=_coerce_float(references.get("taxable_amount")),
         gstAmount=_coerce_float(references.get("gst_amount")),
         gstRate=_coerce_float(references.get("gst_rate")),
@@ -1592,7 +2680,141 @@ def _serialize_document(document: Document) -> DocumentView:
         claimReadiness=claim_readiness_payload,
         deadlineBand=deadline_band,
         compliance=compliance_payload,
+        productImageAvailable=bool(
+            isinstance(references.get("product_image"), dict)
+            and str((references.get("product_image") or {}).get("storage_key") or "").strip()
+        ),
+        productImageGeneratedAt=(
+            str((references.get("product_image") or {}).get("generated_at"))
+            if isinstance(references.get("product_image"), dict)
+            and (references.get("product_image") or {}).get("generated_at")
+            else None
+        ),
     )
+
+
+def _document_view_in_scope(
+    view: DocumentView,
+    *,
+    user_id: str | None,
+    merchant_user_id: str | None,
+) -> bool:
+    if user_id and str(view.userId or "") != user_id:
+        return False
+    if merchant_user_id and str(view.assignedByMerchantId or "") != merchant_user_id:
+        return False
+    return True
+
+
+def _sync_document_mirror(services: ServiceRegistry, document: Document) -> None:
+    store = getattr(services, "dynamodb_store", None)
+    if store is None or not getattr(store, "enabled", False):
+        return
+    try:
+        payload = _response_model_payload(_serialize_document(document))
+        store.upsert_document_record(payload=payload)
+    except Exception:
+        logger.exception("Failed to mirror document_id=%s into DynamoDB.", str(document.id))
+
+
+def _sync_async_extraction_job_mirror(services: ServiceRegistry, job: ExtractionJob) -> None:
+    store = getattr(services, "dynamodb_store", None)
+    if store is None or not getattr(store, "enabled", False):
+        return
+    try:
+        payload = _response_model_payload(_serialize_async_extraction_job(job))
+        store.upsert_extraction_job_record(
+            payload=payload,
+            user_id=job.user_id,
+            merchant_user_id=job.merchant_user_id,
+        )
+    except Exception:
+        logger.exception("Failed to mirror extraction job_id=%s into DynamoDB.", str(job.id))
+
+
+def _list_document_views_from_mirror(
+    services: ServiceRegistry,
+    *,
+    user_id: str | None,
+    merchant_user_id: str | None,
+    limit: int,
+) -> list[DocumentView]:
+    store = getattr(services, "dynamodb_store", None)
+    if (
+        store is None
+        or not getattr(store, "enabled", False)
+        or not getattr(store, "read_fallback_enabled", False)
+    ):
+        return []
+    views: list[DocumentView] = []
+    for record in store.list_document_records(
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+        limit=limit,
+    ):
+        try:
+            view = DocumentView(**record.payload)
+        except Exception:
+            logger.exception("Failed to parse mirrored document payload for DynamoDB fallback.")
+            continue
+        if _document_view_in_scope(view, user_id=user_id, merchant_user_id=merchant_user_id):
+            views.append(view)
+    return views[: max(1, int(limit))]
+
+
+def _load_document_view_from_mirror(
+    services: ServiceRegistry,
+    *,
+    doc_id: UUID,
+    user_id: str | None,
+    merchant_user_id: str | None,
+) -> DocumentView | None:
+    store = getattr(services, "dynamodb_store", None)
+    if (
+        store is None
+        or not getattr(store, "enabled", False)
+        or not getattr(store, "read_fallback_enabled", False)
+    ):
+        return None
+    record = store.get_document_record(str(doc_id))
+    if record is None:
+        return None
+    try:
+        view = DocumentView(**record.payload)
+    except Exception:
+        logger.exception("Failed to parse mirrored document payload doc_id=%s", str(doc_id))
+        return None
+    if not _document_view_in_scope(view, user_id=user_id, merchant_user_id=merchant_user_id):
+        return None
+    return view
+
+
+def _load_async_job_status_from_mirror(
+    services: ServiceRegistry,
+    *,
+    job_id: UUID,
+    user_id: str | None,
+    merchant_user_id: str | None,
+) -> AsyncExtractionJobStatusResponse | None:
+    store = getattr(services, "dynamodb_store", None)
+    if (
+        store is None
+        or not getattr(store, "enabled", False)
+        or not getattr(store, "read_fallback_enabled", False)
+    ):
+        return None
+    record = store.get_extraction_job_record(str(job_id))
+    if record is None:
+        return None
+    if user_id and str(record.user_id or "") != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if merchant_user_id and str(record.merchant_user_id or "") != merchant_user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        return AsyncExtractionJobStatusResponse(**record.payload)
+    except Exception:
+        logger.exception("Failed to parse mirrored extraction job payload job_id=%s", str(job_id))
+        return None
 
 
 def _manual_bill_text_payload(request: MerchantManualBillRequest, resolved_bill_id: str, resolved_vendor: str) -> str:
@@ -1627,17 +2849,6 @@ def _merchant_activity_action(source: str, assignment_source: str) -> str:
 def _ics_timestamp(dt: datetime) -> str:
     utc = dt.astimezone(timezone.utc)
     return utc.strftime("%Y%m%dT%H%M%SZ")
-
-
-def _build_google_calendar_url(*, title: str, description: str, start_at: datetime, end_at: datetime) -> str:
-    payload = {
-        "action": "TEMPLATE",
-        "text": title,
-        "details": description,
-        "dates": f"{_ics_timestamp(start_at)}/{_ics_timestamp(end_at)}",
-    }
-    query = "&".join(f"{quote(key)}={quote(value)}" for key, value in payload.items())
-    return f"https://calendar.google.com/calendar/render?{query}"
 
 
 def _build_warranty_ics(*, uid: str, title: str, description: str, start_at: datetime, end_at: datetime) -> str:
@@ -1732,6 +2943,134 @@ def _build_claim_packet_payload(document: Document, view: DocumentView) -> Claim
         emailTemplate=email_template,
         attachmentChecklist=checklist,
     )
+
+
+def _claim_next_best_actions(view: DocumentView) -> list[str]:
+    readiness = view.claimReadiness
+    if readiness is None:
+        return ["Review extracted invoice fields before initiating claim."]
+    actions = list(readiness.recommendedActions or [])
+    if view.deadlineBand in {"expired", "critical", "watch"}:
+        actions.append("Use claim packet and contact support channel immediately.")
+    if not actions:
+        actions.append("Claim packet is ready. Submit via vendor support.")
+    return actions[:6]
+
+
+def _reminder_action_from_days(days_remaining: int | None) -> str:
+    if days_remaining is None:
+        return "Review warranty details."
+    if days_remaining <= 0:
+        return "Warranty expired. Check grace-period claim options."
+    if days_remaining <= 7:
+        return "Raise claim now and attach issue photos."
+    if days_remaining <= 30:
+        return "Prepare claim packet and book service center visit."
+    return "Set up follow-up reminder and keep documents ready."
+
+
+def _compute_fraud_signals(document: Document, view: DocumentView) -> list[FraudSignalView]:
+    references = _safe_references(document)
+    signals: list[FraudSignalView] = []
+
+    if bool(references.get("duplicate_suspected")):
+        count = int(_coerce_int(references.get("duplicate_match_count"), default=1) or 1)
+        signals.append(
+            FraudSignalView(
+                code="DUPLICATE_SUSPECTED",
+                severity=("high" if count > 1 else "medium"),
+                detail=f"Possible duplicate detected with {count} similar record(s).",
+            )
+        )
+
+    compliance = view.compliance.model_dump() if view.compliance is not None else {}
+    alerts = compliance.get("alerts") if isinstance(compliance, dict) else []
+    if isinstance(alerts, list):
+        for item in alerts[:6]:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("code") or "").strip()
+            severity = str(item.get("severity") or "low").strip().lower()
+            message = str(item.get("message") or "").strip()
+            if not code:
+                continue
+            signals.append(
+                FraudSignalView(
+                    code=f"COMPLIANCE_{code}",
+                    severity=("high" if severity == "high" else ("medium" if severity == "medium" else "low")),
+                    detail=message or "Compliance anomaly found.",
+                )
+            )
+
+    references_fingerprint = str(references.get("extraction_fingerprint") or "").strip()
+    if not references_fingerprint:
+        signals.append(
+            FraudSignalView(
+                code="TRACEABILITY_WEAK",
+                severity="low",
+                detail="Extraction fingerprint missing; source traceability should be reviewed.",
+            )
+        )
+
+    return signals
+
+
+def _fraud_status_from_score(score: float) -> str:
+    if score >= 0.66:
+        return "high_risk"
+    if score >= 0.33:
+        return "watch"
+    return "low_risk"
+
+
+def _renewal_options_for_document(view: DocumentView, *, currency: str = "INR") -> list[RenewalOptionView]:
+    item = view.items[0] if view.items else None
+    base_price = float(item.purchasePrice) if item and item.purchasePrice is not None else 0.0
+    category = str(view.category or "Others").strip().lower()
+    category_multiplier = 1.0
+    if category in {"gadgets", "electronics"}:
+        category_multiplier = 1.15
+    elif category in {"appliances"}:
+        category_multiplier = 1.0
+    elif category in {"vehicle"}:
+        category_multiplier = 1.35
+
+    if base_price <= 0:
+        base_price = 5000.0
+
+    plan_specs = [
+        ("basic", "SafeBill Protect Basic", 12, 0.045, "Repairs for manufacturing defects and parts replacement."),
+        ("plus", "SafeBill Protect Plus", 24, 0.075, "Includes accidental damage support and doorstep pickup."),
+        ("premium", "SafeBill Protect Premium", 36, 0.11, "Comprehensive coverage with priority turnaround."),
+    ]
+    options: list[RenewalOptionView] = []
+    for idx, (plan_id, name, months, rate, summary) in enumerate(plan_specs):
+        premium = round(base_price * rate * category_multiplier, 2)
+        partner_code = "sbx_guardian"
+        webhook_ref = f"renewal_{plan_id}_{int(time.time())}"
+        options.append(
+            RenewalOptionView(
+                planId=plan_id,
+                partnerCode=partner_code,
+                provider="SafeBill Marketplace",
+                planName=name,
+                extensionMonths=months,
+                estimatedPremium=max(premium, 299.0),
+                currency=currency,
+                coverageSummary=summary,
+                recommended=(idx == 1),
+                quoteUrl=f"/api/v1/marketplace/renewal/quote?plan_id={plan_id}",
+                purchaseUrl="/api/v1/marketplace/renewal/purchase-intent",
+                webhookRef=webhook_ref,
+            )
+        )
+    return options
+
+
+def _renewal_webhook_ref(*, doc_id: str, plan_id: str, partner_code: str) -> str:
+    raw = f"{doc_id}:{plan_id}:{partner_code}".encode("utf-8", errors="ignore")
+    digest = hashlib.sha256(raw).hexdigest()[:24]
+    return f"renewal_{digest}"
 
 
 def _clean_company_token(value: object) -> str | None:
@@ -1998,6 +3337,7 @@ async def ingest_pdf(
     vendor: str | None = Form(default=None),
     document_date: date | None = Form(default=None),
     total_amount: float | None = Form(default=None),
+    ocr_mode: str | None = Form(default=None),
     user_id: str | None = Form(default=None),
     consumer_custom_id: str | None = Form(default=None),
     consumer_name: str | None = Form(default=None),
@@ -2032,11 +3372,22 @@ async def ingest_pdf(
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Upload a PDF document.")
     payload = await file.read()
+    storage_references = _store_source_blob(
+        services=services,
+        payload=payload,
+        filename=file.filename,
+        source="ingest_pdf",
+        principal=principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
     references: dict[str, object] = {
         "filename": file.filename,
         "source": "pdf",
         "is_verified": True,
     }
+    if storage_references:
+        references.update(storage_references)
     if user_id:
         references["user_id"] = user_id
     if consumer_custom_id:
@@ -2063,6 +3414,7 @@ async def ingest_pdf(
         vendor=vendor,
         document_date=document_date,
         total_amount=total_amount,
+        ocr_mode=ocr_mode,
         version=version,
         references=references,
     )
@@ -2095,6 +3447,204 @@ async def ingest_pdf(
     )
 
 
+@router.post("/extraction-jobs/image", response_model=AsyncExtractionJobCreateResponse)
+async def create_image_extraction_job(
+    request: Request,
+    file: UploadFile = File(...),
+    bill_id: str | None = Form(default=None),
+    vendor: str | None = Form(default=None),
+    document_date: date | None = Form(default=None),
+    total_amount: float | None = Form(default=None),
+    user_id: str | None = Form(default=None),
+    consumer_email: str | None = Form(default=None),
+    consumer_name: str | None = Form(default=None),
+    merchant_user_id: str | None = Form(default=None),
+    merchant_name: str | None = Form(default=None),
+    merchant_custom_id: str | None = Form(default=None),
+    ocr_mode: str | None = Form(default=None),
+    principal: Principal = Depends(require_roles("admin", "analyst", "merchant", "consumer")),
+    db: Session = Depends(get_db),
+    services: ServiceRegistry = Depends(get_services),
+) -> AsyncExtractionJobCreateResponse:
+    _rate_limit_or_429(
+        request=request,
+        principal=principal,
+        bucket="ingest_image",
+        limit=get_settings().api_rate_limit_ingest_per_window,
+    )
+    if not _async_extraction_enabled():
+        raise HTTPException(status_code=503, detail="Async extraction pipeline is not enabled.")
+
+    user_id, merchant_user_id = _resolve_document_scope(
+        principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    if principal.role == "consumer":
+        user_id = principal.subject
+    if principal.role == "merchant":
+        merchant_user_id = principal.subject
+        if not user_id:
+            raise HTTPException(status_code=400, detail="consumer user_id is required for merchant ingestion.")
+
+    filename = file.filename or "uploaded-image"
+    lowered = filename.lower()
+    is_image = lowered.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"))
+    if file.content_type and file.content_type.lower().startswith("image/"):
+        is_image = True
+    if not is_image:
+        raise HTTPException(status_code=400, detail="Upload an image document.")
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+
+    settings = get_settings()
+    store = getattr(services, "object_store", None)
+    local_worker_enabled = _local_async_extraction_worker_enabled()
+    if (store is None or not getattr(store, "enabled", False)) and not local_worker_enabled:
+        raise HTTPException(status_code=503, detail="Async extraction requires S3 or the local async worker.")
+
+    job_id = uuid.uuid4()
+    source_prefix = str(settings.async_extraction_source_prefix or "async-extraction").strip() or "async-extraction"
+    key = store.build_object_key(filename=filename, source=source_prefix) if store is not None and getattr(store, "enabled", False) else ""
+    content_type = store.guess_content_type(filename) if store is not None and getattr(store, "enabled", False) else (file.content_type or "image/png")
+    request_metadata = {
+        "bill_id": str(bill_id or "").strip(),
+        "vendor": str(vendor or "").strip(),
+        "document_date": (document_date.isoformat() if document_date else None),
+        "total_amount": total_amount,
+        "consumer_email": str(consumer_email or "").strip(),
+        "consumer_name": str(consumer_name or "").strip(),
+        "merchant_name": str(merchant_name or "").strip(),
+        "merchant_custom_id": str(merchant_custom_id or "").strip(),
+        "ocr_mode": str(ocr_mode or "").strip() or str(settings.async_extraction_ocr_mode or "hybrid"),
+    }
+    if local_worker_enabled:
+        request_metadata["inline_image_base64"] = base64.b64encode(payload).decode("ascii")
+    storage_metadata = {
+        "job_id": str(job_id),
+        "filename": filename,
+        "user_id": str(user_id or ""),
+        "merchant_user_id": str(merchant_user_id or ""),
+    }
+    uploaded: dict[str, object] | None = None
+    if store is not None and getattr(store, "enabled", False):
+        try:
+            uploaded = store.put_bytes(
+                key=key,
+                payload=payload,
+                filename=filename,
+                content_type=content_type,
+                metadata=storage_metadata,
+            )
+        except Exception as exc:
+            logger.exception("Async extraction S3 upload failed filename=%s", filename)
+            if not local_worker_enabled:
+                raise HTTPException(status_code=500, detail=f"Async extraction upload failed: {exc}") from exc
+            uploaded = None
+        if not uploaded and not local_worker_enabled:
+            raise HTTPException(status_code=500, detail="Async extraction upload failed.")
+
+    job = ExtractionJob(
+        id=job_id,
+        status="queued",
+        filename=filename,
+        content_type=content_type,
+        source_object_key=str((uploaded or {}).get("storage_key") or key or ""),
+        source_bucket=str((uploaded or {}).get("storage_bucket") or getattr(store, "bucket", "")),
+        source_region=str((uploaded or {}).get("storage_region") or getattr(store, "region", "")),
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+        request_metadata=request_metadata,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    _sync_async_extraction_job_mirror(services, job)
+
+    return AsyncExtractionJobCreateResponse(
+        jobId=job.id,
+        status=str(job.status or "queued"),
+        createdAt=job.created_at,
+    )
+
+
+@router.get("/extraction-jobs/{job_id}", response_model=AsyncExtractionJobStatusResponse)
+def get_async_extraction_job(
+    job_id: UUID,
+    user_id: str | None = None,
+    merchant_user_id: str | None = None,
+    principal: Principal = Depends(require_roles("admin", "analyst", "merchant", "consumer")),
+    db: Session = Depends(get_db),
+    services: ServiceRegistry = Depends(get_services),
+) -> AsyncExtractionJobStatusResponse:
+    scoped_user_id, scoped_merchant_user_id = _resolve_document_scope(
+        principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    job = db.get(ExtractionJob, job_id)
+    if job is not None:
+        if not _async_job_in_scope(job, user_id=scoped_user_id, merchant_user_id=scoped_merchant_user_id):
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return _serialize_async_extraction_job(job)
+
+    mirrored = _load_async_job_status_from_mirror(
+        services,
+        job_id=job_id,
+        user_id=scoped_user_id,
+        merchant_user_id=scoped_merchant_user_id,
+    )
+    if mirrored is not None:
+        return mirrored
+    raise HTTPException(status_code=404, detail="Extraction job not found")
+
+
+@router.post("/extraction-jobs/{job_id}/callback")
+def complete_async_extraction_job(
+    job_id: UUID,
+    payload: AsyncExtractionCallbackRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    services: ServiceRegistry = Depends(get_services),
+):
+    _require_async_callback(request)
+    job = db.get(ExtractionJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Extraction job not found")
+
+    now = datetime.now(timezone.utc)
+    normalized_status = payload.status.strip().lower()
+    job.started_at = job.started_at or now
+    if normalized_status in {"failed", "error"}:
+        job.result_metadata = dict(payload.extracted_metadata or {})
+        job.result_text = (payload.extracted_text or None)
+        _mark_async_job_failed(
+            db,
+            job,
+            error_message=str(payload.error_message or "Async extraction failed"),
+            engines_used=[str(engine) for engine in payload.engines_used],
+            services=services,
+        )
+        return {"status": "acknowledged", "jobId": str(job.id)}
+
+    extracted_metadata = dict(payload.extracted_metadata or {})
+    extracted_text = str(payload.extracted_text or "").strip() or _metadata_to_canonical_text(extracted_metadata)
+    document = _finalize_async_extraction_job(
+        db=db,
+        services=services,
+        job=job,
+        extracted_text=extracted_text,
+        extracted_metadata=extracted_metadata,
+        field_confidences=dict(payload.field_confidences or {}),
+        field_sources={str(key): str(value) for key, value in dict(payload.field_sources or {}).items()},
+        low_confidence_fields=[str(field) for field in list(payload.low_confidence_fields or [])],
+        engines_used=[str(engine) for engine in payload.engines_used],
+    )
+    return {"status": "acknowledged", "jobId": str(job.id), "documentId": str(document.id)}
+
+
 @router.post("/ingest/image", response_model=IngestPDFResponse)
 async def ingest_image(
     request: Request,
@@ -2104,6 +3654,7 @@ async def ingest_image(
     document_date: date | None = Form(default=None),
     total_amount: float | None = Form(default=None),
     ocr_text: str | None = Form(default=None),
+    ocr_mode: str | None = Form(default=None),
     user_id: str | None = Form(default=None),
     consumer_custom_id: str | None = Form(default=None),
     consumer_name: str | None = Form(default=None),
@@ -2146,11 +3697,21 @@ async def ingest_image(
     payload = await file.read()
     if not payload:
         raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+    storage_references = _store_source_blob(
+        services=services,
+        payload=payload,
+        filename=filename,
+        source="ingest_image",
+        principal=principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
 
     routed = _run_image_extraction_router(
         image_bytes=payload,
         filename=filename,
         supplied_ocr_text=(ocr_text or ""),
+        ocr_mode_override=(ocr_mode or ""),
         bill_id=bill_id,
         vendor=vendor,
         document_date=document_date,
@@ -2159,16 +3720,20 @@ async def ingest_image(
     strict_metadata = routed.get("metadata")
     if not isinstance(strict_metadata, dict):
         strict_metadata = {}
+    engines_used = [str(name) for name in routed.get("engines_used") or []]
     resolved_ocr_text = str(routed.get("resolved_text") or "").strip()
     if not resolved_ocr_text:
         resolved_ocr_text = _metadata_to_canonical_text(strict_metadata)
     if not resolved_ocr_text:
+        diagnostics = _build_image_ocr_diagnostics(payload)
+        engine_hint = f"engines={','.join(engines_used)}" if engines_used else "engines=none"
         raise HTTPException(
             status_code=422,
             detail=(
                 "Unable to extract readable text from this image. "
                 "Retry with a clearer bill image. "
-                "If OCR still fails, add invoice fields manually."
+                "If OCR still fails, add invoice fields manually. "
+                f"Diagnostics: {engine_hint}; {diagnostics}"
             ),
         )
 
@@ -2176,9 +3741,8 @@ async def ingest_image(
         _is_meaningful_metadata_value(strict_metadata.get(key))
         for key in ("bill_id", "vendor", "total_amount", "date")
     )
-    engines_used = [str(name) for name in routed.get("engines_used") or []]
     has_strong_invoice_engine = any(
-        name in {"openai_vision", "aws_textract", "google_docai", "manual_override"}
+        name in {"google_vision", "aws_bedrock_vision", "aws_textract", "aws_textract_proxy", "manual_override"}
         for name in engines_used
     )
     if _looks_like_ui_screenshot(resolved_ocr_text) and not has_strong_invoice_engine:
@@ -2199,6 +3763,8 @@ async def ingest_image(
         )
 
     additional_references: dict[str, object] = {}
+    if storage_references:
+        additional_references.update(storage_references)
     if consumer_custom_id:
         additional_references["consumer_custom_id"] = consumer_custom_id
     if consumer_name:
@@ -2291,8 +3857,21 @@ async def ingest_vendor_table(
     if not file.filename or not file.filename.lower().endswith((".csv", ".xlsx", ".xls")):
         raise HTTPException(status_code=400, detail="Upload CSV/XLSX/XLS vendor table.")
     payload = await file.read()
+    storage_references = _store_source_blob(
+        services=services,
+        payload=payload,
+        filename=file.filename,
+        source="ingest_vendor_table",
+        principal=principal,
+        user_id=None,
+        merchant_user_id=None,
+    )
     documents, row_count = services.ingestion.ingest_vendor_table(
-        db=db, file_bytes=payload, filename=file.filename, version=version
+        db=db,
+        file_bytes=payload,
+        filename=file.filename,
+        version=version,
+        source_references=storage_references,
     )
     created_at = documents[0].created_at if documents else None
     return IngestVendorTableResponse(
@@ -2329,6 +3908,16 @@ def create_merchant_manual_bill(
         resolved_bill_id=resolved_bill_id,
         resolved_vendor=resolved_vendor,
     )
+    manual_payload = extracted_text.encode("utf-8", errors="ignore")
+    storage_references = _store_source_blob(
+        services=services,
+        payload=manual_payload,
+        filename=f"{resolved_bill_id}.txt",
+        source="merchant_manual_bill",
+        principal=principal,
+        user_id=request.consumer_user_id,
+        merchant_user_id=request.merchant_user_id,
+    )
 
     references: dict[str, object] = {
         "title": request.product_name,
@@ -2340,6 +3929,8 @@ def create_merchant_manual_bill(
         "merchant_name": request.merchant_name or resolved_vendor,
         "assignment_source": "merchant_manual",
     }
+    if storage_references:
+        references.update(storage_references)
     if principal.role == "merchant" and principal.email:
         references["merchant_email"] = principal.email
     if request.merchant_custom_id:
@@ -2700,9 +4291,9 @@ def ask(
                 field="retrieval",
                 value=f"{hit.bill_id}:{hit.chunk_type}",
                 confidence=max(0.0, min(hit.score, 1.0)),
-                source="hybrid_retrieval",
+                source="lexical_retrieval",
                 reason=(
-                    f"Selected because semantic score={hit.vector_score:.3f} and keyword score={hit.keyword_score:.3f}."
+                    f"Selected because keyword score={hit.keyword_score:.3f}."
                 ),
                 citations=[str(hit.chunk_id)],
             )
@@ -2803,6 +4394,7 @@ def list_documents(
     limit: int = 100,
     principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
     db: Session = Depends(get_db),
+    services: ServiceRegistry = Depends(get_services),
 ) -> DocumentsResponse:
     user_id, merchant_user_id = _resolve_document_scope(
         principal,
@@ -2817,7 +4409,15 @@ def list_documents(
         for document in list(db.execute(stmt).scalars())
         if _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id)
     ][:safe_limit]
-    return DocumentsResponse(documents=[_serialize_document(document) for document in documents])
+    if documents:
+        return DocumentsResponse(documents=[_serialize_document(document) for document in documents])
+    mirrored = _list_document_views_from_mirror(
+        services,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+        limit=safe_limit,
+    )
+    return DocumentsResponse(documents=mirrored)
 
 
 @router.get("/documents/{doc_id}", response_model=DocumentView)
@@ -2827,6 +4427,7 @@ def get_document(
     merchant_user_id: str | None = None,
     principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
     db: Session = Depends(get_db),
+    services: ServiceRegistry = Depends(get_services),
 ) -> DocumentView:
     user_id, merchant_user_id = _resolve_document_scope(
         principal,
@@ -2834,18 +4435,160 @@ def get_document(
         merchant_user_id=merchant_user_id,
     )
     document = db.get(Document, doc_id)
-    if not document or not _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id):
+    if document and _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id):
+        if principal.role == "consumer" and principal.subject:
+            try:
+                _mark_document_consumer_activated(db, document=document, consumer_user_id=principal.subject)
+            except Exception:
+                if hasattr(db, "rollback"):
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+        return _serialize_document(document)
+
+    mirrored = _load_document_view_from_mirror(
+        services,
+        doc_id=doc_id,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    if mirrored is not None:
+        return mirrored
+    raise HTTPException(status_code=404, detail="Document not found")
+
+
+@router.get("/documents/{doc_id}/source-url")
+def get_document_source_url(
+    doc_id: UUID,
+    expires_in: int | None = None,
+    user_id: str | None = None,
+    merchant_user_id: str | None = None,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+    services: ServiceRegistry = Depends(get_services),
+) -> dict[str, object]:
+    user_id, merchant_user_id = _resolve_document_scope(
+        principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    document = db.get(Document, doc_id)
+    if not document:
         raise HTTPException(status_code=404, detail="Document not found")
-    if principal.role == "consumer" and principal.subject:
-        try:
-            _mark_document_consumer_activated(db, document=document, consumer_user_id=principal.subject)
-        except Exception:
-            if hasattr(db, "rollback"):
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-    return _serialize_document(document)
+    in_scope = _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id)
+    shared_access = _document_is_shared_with(document, principal.subject)
+    if not in_scope and not shared_access:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    references = _safe_references(document)
+    object_key = str(references.get("storage_key") or "").strip()
+    if not object_key:
+        raise HTTPException(status_code=404, detail="Source object not available for this document")
+
+    store = getattr(services, "object_store", None)
+    if store is None or not getattr(store, "enabled", False):
+        raise HTTPException(status_code=503, detail="Object storage is not configured")
+
+    ttl = int(expires_in or get_settings().s3_presign_ttl_seconds)
+    ttl = max(60, min(ttl, 3600 * 24))
+    signed_url = store.generate_download_url(key=object_key, expires_in_seconds=ttl)
+    if not signed_url:
+        raise HTTPException(status_code=500, detail="Could not generate source download URL")
+    return {"docId": str(doc_id), "url": signed_url, "expiresInSeconds": ttl}
+
+
+@router.post("/documents/{doc_id}/product-image/generate", response_model=DocumentProductImageView)
+def generate_document_product_image(
+    doc_id: UUID,
+    payload: DocumentProductImageGenerateRequest = Body(default=DocumentProductImageGenerateRequest()),
+    user_id: str | None = None,
+    merchant_user_id: str | None = None,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+    services: ServiceRegistry = Depends(get_services),
+) -> DocumentProductImageView:
+    user_id, merchant_user_id = _resolve_document_scope(
+        principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    document = db.get(Document, doc_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    in_scope = _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id)
+    shared_access = _document_is_shared_with(document, principal.subject)
+    if not in_scope and not shared_access:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    current_state = _serialize_product_image_state(document)
+    if current_state.productImageAvailable and not payload.force:
+        return current_state
+
+    generator = getattr(services, "product_images", None)
+    if generator is None or not getattr(generator, "enabled", False):
+        raise HTTPException(status_code=503, detail="Product image generation is not configured")
+
+    try:
+        generated_payload = generator.generate_for_document(
+            document=document,
+            object_store=getattr(services, "object_store", None),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Product image generation failed for doc_id=%s", str(doc_id))
+        raise HTTPException(status_code=502, detail=str(exc) or "Product image generation failed")
+
+    references = _safe_references(document).copy()
+    references["product_image"] = generated_payload
+    document.references = references
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+    _sync_document_mirror(services, document)
+    return _serialize_product_image_state(document)
+
+
+@router.get("/documents/{doc_id}/product-image-url", response_model=DocumentProductImageUrlResponse)
+def get_document_product_image_url(
+    doc_id: UUID,
+    expires_in: int | None = None,
+    user_id: str | None = None,
+    merchant_user_id: str | None = None,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+    services: ServiceRegistry = Depends(get_services),
+) -> DocumentProductImageUrlResponse:
+    user_id, merchant_user_id = _resolve_document_scope(
+        principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    document = db.get(Document, doc_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    in_scope = _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id)
+    shared_access = _document_is_shared_with(document, principal.subject)
+    if not in_scope and not shared_access:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    references = _safe_references(document)
+    product_image = references.get("product_image") if isinstance(references.get("product_image"), dict) else {}
+    object_key = str(product_image.get("storage_key") or "").strip()
+    if not object_key:
+        raise HTTPException(status_code=404, detail="Product image not available for this document")
+
+    store = getattr(services, "object_store", None)
+    if store is None or not getattr(store, "enabled", False):
+        raise HTTPException(status_code=503, detail="Object storage is not configured")
+
+    ttl = int(expires_in or get_settings().s3_presign_ttl_seconds)
+    ttl = max(60, min(ttl, 3600 * 24))
+    signed_url = store.generate_download_url(key=object_key, expires_in_seconds=ttl)
+    if not signed_url:
+        raise HTTPException(status_code=500, detail="Could not generate product image URL")
+    return DocumentProductImageUrlResponse(docId=str(doc_id), url=signed_url, expiresInSeconds=ttl)
 
 
 @router.get("/documents/{doc_id}/calendar-links", response_model=CalendarLinkResponse)
@@ -2880,11 +4623,16 @@ def get_document_calendar_links(
         f"Warranty end: {warranty_end.isoformat()}"
     )
     ics_url = f"/api/documents/{view.docId}/calendar.ics"
-    google_url = _build_google_calendar_url(
-        title=title,
-        description=description,
-        start_at=start_at,
-        end_at=end_at,
+    google_url = (
+        "https://calendar.google.com/calendar/render?"
+        + urlencode(
+            {
+                "action": "TEMPLATE",
+                "text": title,
+                "details": description,
+                "dates": f"{start_at.strftime('%Y%m%dT%H%M%SZ')}/{end_at.strftime('%Y%m%dT%H%M%SZ')}",
+            }
+        )
     )
     return CalendarLinkResponse(
         docId=view.docId,
@@ -2961,6 +4709,566 @@ def generate_claim_packet(
     db.add(document)
     db.commit()
     return packet
+
+
+@router.get("/documents/{doc_id}/claim-assistant", response_model=ClaimAssistantResponse)
+def get_claim_assistant(
+    doc_id: UUID,
+    user_id: str | None = None,
+    merchant_user_id: str | None = None,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+) -> ClaimAssistantResponse:
+    user_id, merchant_user_id = _resolve_document_scope(
+        principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    document = db.get(Document, doc_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    in_scope = _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id)
+    shared_access = _document_is_shared_with(document, principal.subject)
+    if not in_scope and not shared_access:
+        raise HTTPException(status_code=404, detail="Document not found")
+    view = _serialize_document(document)
+    references = _safe_references(document)
+    channel_candidates = ["in_app", "email"]
+    if str(references.get("consumer_email") or "").strip():
+        channel_candidates.append("email")
+    if str(references.get("whatsapp_number") or "").strip():
+        channel_candidates.append("whatsapp")
+    if str(references.get("sms_number") or "").strip():
+        channel_candidates.append("sms")
+    recommended_channels = []
+    for item in channel_candidates:
+        if item not in recommended_channels:
+            recommended_channels.append(item)
+
+    return ClaimAssistantResponse(
+        docId=view.docId,
+        readiness=view.claimReadiness,
+        deadlineBand=view.deadlineBand,
+        nextBestActions=_claim_next_best_actions(view),
+        recommendedChannels=recommended_channels,
+        claimPacketUrl=f"/api/v1/documents/{view.docId}/claim-packet",
+        calendarIcsUrl=f"/api/v1/documents/{view.docId}/calendar.ics",
+        serviceCentersUrl=f"/api/v1/documents/{view.docId}/service-centers",
+    )
+
+
+@router.get("/documents/{doc_id}/service-centers", response_model=ServiceCentersRecommendationResponse)
+def get_document_service_centers(
+    doc_id: UUID,
+    user_id: str | None = None,
+    merchant_user_id: str | None = None,
+    user_latitude: float | None = None,
+    user_longitude: float | None = None,
+    user_location_text: str | None = None,
+    radius_km: float | None = None,
+    limit: int = 5,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+    services: ServiceRegistry = Depends(get_services),
+) -> ServiceCentersRecommendationResponse:
+    user_id, merchant_user_id = _resolve_document_scope(
+        principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    document = db.get(Document, doc_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    in_scope = _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id)
+    shared_access = _document_is_shared_with(document, principal.subject)
+    if not in_scope and not shared_access:
+        raise HTTPException(status_code=404, detail="Document not found")
+    view = _serialize_document(document)
+    references = _safe_references(document)
+    company_candidates = [
+        _clean_company_token(view.sellerName),
+        _clean_company_token(str(references.get("brand") or "")),
+        _clean_company_token(str(view.items[0].model if view.items else "")),
+        _clean_company_token(str(view.title or "")),
+    ]
+    company = None
+    normalize_company_name = getattr(services.service_center_locator, "normalize_company_name", None)
+    for candidate in company_candidates:
+        normalized = (
+            normalize_company_name(candidate)
+            if callable(normalize_company_name)
+            else _clean_company_token(candidate)
+        )
+        if normalized:
+            company = normalized
+            break
+    if not company:
+        return ServiceCentersRecommendationResponse(
+            docId=view.docId,
+            company=None,
+            locationHint=user_location_text,
+            radiusKm=float(radius_km or 30.0),
+            count=0,
+            guidance="Could not infer brand/vendor. Please update document brand or vendor details.",
+            centers=[],
+        )
+
+    safe_limit = max(1, min(limit, 10))
+    safe_radius = services.service_center_locator.parse_radius_km("", default_km=radius_km)
+    allow_live_lookup = bool(getattr(services.service_center_locator, "live_lookup_enabled", False))
+    candidates = services.service_center_locator.find_service_centers(
+        company_name=company,
+        user_latitude=user_latitude,
+        user_longitude=user_longitude,
+        location_hint=user_location_text,
+        radius_km=safe_radius,
+        limit=safe_limit,
+        allow_external_lookup=allow_live_lookup,
+    )
+    guidance = _format_service_centers_block(
+        "",
+        company_name=company,
+        centers=candidates,
+        has_user_location=bool(user_latitude is not None and user_longitude is not None) or bool(user_location_text),
+        radius_km=safe_radius,
+    )
+    response_centers = [
+        ServiceCenterView(
+            name=center.name,
+            address=center.address,
+            latitude=center.latitude,
+            longitude=center.longitude,
+            distance_km=center.distance_km,
+            source=center.source,
+            confidence=center.confidence,
+            map_url=center.map_url,
+            city=center.city,
+            phone=center.phone,
+            website=center.website,
+            pincode=center.pincode,
+            pickup_available=center.pickup_available,
+            estimated_tat_days=center.estimated_tat_days,
+        )
+        for center in candidates
+    ]
+    return ServiceCentersRecommendationResponse(
+        docId=view.docId,
+        company=company,
+        locationHint=user_location_text,
+        radiusKm=float(safe_radius),
+        count=len(response_centers),
+        guidance=guidance,
+        centers=response_centers,
+    )
+
+
+@router.post("/documents/{doc_id}/share", response_model=DocumentShareResponse)
+def share_document(
+    doc_id: UUID,
+    request: DocumentShareRequest,
+    principal: Principal = Depends(require_roles("admin", "analyst", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+) -> DocumentShareResponse:
+    document = db.get(Document, doc_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if not _can_manage_document_sharing(principal, document):
+        raise HTTPException(status_code=403, detail="You do not have permission to share this document.")
+
+    references = _safe_references(document).copy()
+    owner_user_id = str(references.get("user_id") or "").strip()
+    target_user_id = request.target_user_id.strip()
+    if owner_user_id and target_user_id == owner_user_id:
+        raise HTTPException(status_code=400, detail="Owner already has access.")
+
+    members = _shared_members_from_references(references)
+    now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    granted_by = str(principal.subject or principal.role or "system")
+    updated_members: list[dict[str, str]] = []
+    upserted = False
+    for member in members:
+        if member.get("user_id") == target_user_id:
+            member["permission"] = request.permission
+            member["granted_by"] = granted_by
+            member["granted_at"] = now_iso
+            upserted = True
+        updated_members.append(member)
+    if not upserted:
+        updated_members.append(
+            {
+                "user_id": target_user_id,
+                "permission": request.permission,
+                "granted_by": granted_by,
+                "granted_at": now_iso,
+            }
+        )
+    references["shared_with"] = updated_members
+    document.references = references
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+    return _serialize_document_shares(document)
+
+
+@router.delete("/documents/{doc_id}/share/{target_user_id}", response_model=DocumentShareResponse)
+def unshare_document(
+    doc_id: UUID,
+    target_user_id: str,
+    principal: Principal = Depends(require_roles("admin", "analyst", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+) -> DocumentShareResponse:
+    document = db.get(Document, doc_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if not _can_manage_document_sharing(principal, document):
+        raise HTTPException(status_code=403, detail="You do not have permission to unshare this document.")
+
+    references = _safe_references(document).copy()
+    members = _shared_members_from_references(references)
+    filtered = [member for member in members if member.get("user_id") != target_user_id.strip()]
+    references["shared_with"] = filtered
+    document.references = references
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+    return _serialize_document_shares(document)
+
+
+@router.get("/vault/shared-with-me", response_model=SharedVaultResponse)
+def list_shared_vault_documents(
+    user_id: str | None = None,
+    limit: int = 100,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+) -> SharedVaultResponse:
+    requested_user = _normalize_scope_value(user_id)
+    if principal.role in {"admin", "analyst"}:
+        target_user_id = requested_user
+    else:
+        target_user_id = str(principal.subject or "").strip()
+        if requested_user and requested_user != target_user_id:
+            raise HTTPException(status_code=403, detail="User scope mismatch.")
+    if not target_user_id:
+        raise HTTPException(status_code=400, detail="user_id is required.")
+
+    safe_limit = max(1, min(limit, 500))
+    stmt = select(Document).order_by(desc(Document.created_at)).limit(max(50, safe_limit * 5))
+    rows = list(db.execute(stmt).scalars())
+    shared_docs = [doc for doc in rows if _document_is_shared_with(doc, target_user_id)]
+    serialized = [_serialize_document(doc) for doc in shared_docs[:safe_limit]]
+    return SharedVaultResponse(documents=serialized)
+
+
+@router.get("/documents/{doc_id}/claim-whatsapp-draft", response_model=WhatsAppClaimDraftResponse)
+def get_claim_whatsapp_draft(
+    doc_id: UUID,
+    user_id: str | None = None,
+    merchant_user_id: str | None = None,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+) -> WhatsAppClaimDraftResponse:
+    user_id, merchant_user_id = _resolve_document_scope(
+        principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    document = db.get(Document, doc_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    in_scope = _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id)
+    shared_access = _document_is_shared_with(document, principal.subject)
+    if not in_scope and not shared_access:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    view = _serialize_document(document)
+    packet = _build_claim_packet_payload(document, view)
+    references = _safe_references(document)
+    consumer_user_id = str(references.get("user_id") or principal.subject or "").strip()
+    consumer_email = str(references.get("consumer_email") or "").strip() or None
+    consumer_name = str(references.get("consumer_name") or "").strip() or None
+    preference = _notification_service.get_preference(
+        db,
+        user_id=(consumer_user_id or "anonymous"),
+        email_hint=consumer_email,
+        full_name_hint=consumer_name,
+    )
+    whatsapp_enabled = bool(preference.whatsapp_enabled and preference.whatsapp_number)
+    destination = preference.whatsapp_number if whatsapp_enabled else None
+    issue_line = packet.issueSummaryTemplate.splitlines()[0] if packet.issueSummaryTemplate else "Issue Summary"
+    message = (
+        f"Hi {view.sellerName or 'Support Team'}, I want to raise a warranty claim.\n"
+        f"Invoice: {packet.facts.get('invoice_number') or 'N/A'}\n"
+        f"Product: {packet.facts.get('product_name') or view.title}\n"
+        f"Warranty End: {packet.facts.get('warranty_end') or 'N/A'}\n"
+        f"{issue_line}\n"
+        f"Please share next steps for authorized service."
+    )
+    next_steps = _claim_next_best_actions(view)
+    if not whatsapp_enabled:
+        next_steps = [
+            "Enable WhatsApp notifications in /api/v1/notifications/preferences.",
+            "Set whatsapp_enabled=true and add whatsapp_number.",
+        ] + next_steps
+
+    references["claim_whatsapp_draft_generated_at"] = datetime.now(timezone.utc).isoformat()
+    document.references = references
+    db.add(document)
+    db.commit()
+
+    return WhatsAppClaimDraftResponse(
+        docId=view.docId,
+        whatsappEnabled=whatsapp_enabled,
+        destination=destination,
+        message=message,
+        nextSteps=next_steps[:6],
+    )
+
+
+@router.get("/documents/{doc_id}/fraud-check", response_model=FraudCheckResponse)
+def get_document_fraud_check(
+    doc_id: UUID,
+    user_id: str | None = None,
+    merchant_user_id: str | None = None,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+) -> FraudCheckResponse:
+    user_id, merchant_user_id = _resolve_document_scope(
+        principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    document = db.get(Document, doc_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    in_scope = _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id)
+    shared_access = _document_is_shared_with(document, principal.subject)
+    if not in_scope and not shared_access:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    view = _serialize_document(document)
+    signals = _compute_fraud_signals(document, view)
+    weighted = 0.0
+    for signal in signals:
+        if signal.severity == "high":
+            weighted += 0.28
+        elif signal.severity == "medium":
+            weighted += 0.16
+        else:
+            weighted += 0.06
+    risk_score = round(max(0.0, min(weighted, 1.0)), 3)
+    status = _fraud_status_from_score(risk_score)
+    recommended_actions = [
+        "Re-verify invoice number, vendor, and date against original document.",
+        "Cross-check GST/tax fields and duplicate indicators before approving claim.",
+        "Request manual review if high-risk compliance alerts are present.",
+    ]
+    return FraudCheckResponse(
+        docId=view.docId,
+        riskScore=risk_score,
+        status=status,
+        signals=signals,
+        recommendedActions=recommended_actions,
+    )
+
+
+@router.get("/documents/{doc_id}/renewal-options", response_model=RenewalOptionsResponse)
+def get_document_renewal_options(
+    doc_id: UUID,
+    user_id: str | None = None,
+    merchant_user_id: str | None = None,
+    currency: str = "INR",
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+) -> RenewalOptionsResponse:
+    user_id, merchant_user_id = _resolve_document_scope(
+        principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    document = db.get(Document, doc_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    in_scope = _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id)
+    shared_access = _document_is_shared_with(document, principal.subject)
+    if not in_scope and not shared_access:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    safe_currency = (currency or "INR").strip().upper()[:8] or "INR"
+    view = _serialize_document(document)
+    options = _renewal_options_for_document(view, currency=safe_currency)
+    current_end = view.items[0].warrantyEnd if view.items else None
+    notes = [
+        "Premiums are estimates based on invoice value/category and may vary by provider.",
+        "Choose plans with pickup support when service-center coverage is limited.",
+    ]
+    for option in options:
+        option.quoteUrl = (
+            f"/api/v1/marketplace/renewal/quote?doc_id={view.docId}"
+            f"&plan_id={option.planId}&partner_code={option.partnerCode}&currency={safe_currency}"
+        )
+        option.purchaseUrl = "/api/v1/marketplace/renewal/purchase-intent"
+        option.webhookRef = _renewal_webhook_ref(
+            doc_id=view.docId,
+            plan_id=option.planId,
+            partner_code=option.partnerCode,
+        )
+    return RenewalOptionsResponse(
+        docId=view.docId,
+        productName=(view.items[0].productName if view.items else view.title),
+        currentWarrantyEnd=current_end,
+        options=options,
+        notes=notes,
+    )
+
+
+@router.get("/marketplace/renewal/quote", response_model=RenewalQuoteResponse)
+def get_marketplace_renewal_quote(
+    doc_id: str,
+    plan_id: str,
+    partner_code: str = "sbx_guardian",
+    currency: str = "INR",
+    user_id: str | None = None,
+    merchant_user_id: str | None = None,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+) -> RenewalQuoteResponse:
+    try:
+        document_uuid = UUID(doc_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid doc_id") from exc
+
+    user_id, merchant_user_id = _resolve_document_scope(
+        principal,
+        user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    document = db.get(Document, document_uuid)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    in_scope = _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id)
+    shared_access = _document_is_shared_with(document, principal.subject)
+    if not in_scope and not shared_access:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    view = _serialize_document(document)
+    options = _renewal_options_for_document(view, currency=(currency or "INR").upper()[:8] or "INR")
+    selected = next((option for option in options if option.planId == plan_id), None)
+    if selected is None:
+        raise HTTPException(status_code=404, detail="Renewal plan not found")
+
+    base_premium = round(float(selected.estimatedPremium), 2)
+    tax_amount = round(base_premium * 0.18, 2)
+    total = round(base_premium + tax_amount, 2)
+    valid_until = (datetime.now(timezone.utc) + timedelta(hours=24)).replace(microsecond=0).isoformat()
+    quote_ref = _renewal_webhook_ref(
+        doc_id=view.docId,
+        plan_id=plan_id,
+        partner_code=partner_code,
+    )
+    return RenewalQuoteResponse(
+        docId=view.docId,
+        planId=plan_id,
+        partnerCode=partner_code,
+        currency=selected.currency,
+        basePremium=base_premium,
+        taxAmount=tax_amount,
+        totalPremium=total,
+        validUntil=valid_until,
+        quoteRef=quote_ref,
+    )
+
+
+@router.post("/marketplace/renewal/purchase-intent", response_model=RenewalPurchaseIntentResponse)
+def create_marketplace_purchase_intent(
+    request: RenewalPurchaseRequest,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    db: Session = Depends(get_db),
+) -> RenewalPurchaseIntentResponse:
+    try:
+        document_uuid = UUID(request.doc_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid doc_id") from exc
+
+    user_id, merchant_user_id = _resolve_document_scope(
+        principal,
+        user_id=request.user_id,
+    )
+    document = db.get(Document, document_uuid)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    in_scope = _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id)
+    shared_access = _document_is_shared_with(document, principal.subject)
+    if not in_scope and not shared_access:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    webhook_ref = _renewal_webhook_ref(
+        doc_id=request.doc_id,
+        plan_id=request.plan_id,
+        partner_code=request.partner_code,
+    )
+    references = _safe_references(document).copy()
+    references["renewal_purchase_intent"] = {
+        "plan_id": request.plan_id,
+        "partner_code": request.partner_code,
+        "webhook_ref": webhook_ref,
+        "status": "initiated",
+        "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }
+    document.references = references
+    db.add(document)
+    db.commit()
+
+    checkout_url = (
+        f"/api/v1/marketplace/renewal/checkout"
+        f"?doc_id={request.doc_id}&plan_id={request.plan_id}&partner_code={request.partner_code}"
+    )
+    if request.return_url:
+        checkout_url = f"{checkout_url}&return_url={request.return_url}"
+    return RenewalPurchaseIntentResponse(
+        docId=request.doc_id,
+        planId=request.plan_id,
+        partnerCode=request.partner_code,
+        checkoutUrl=checkout_url,
+        webhookRef=webhook_ref,
+        status="initiated",
+    )
+
+
+@router.post("/marketplace/renewal/provider-events")
+def ingest_marketplace_provider_event(
+    request: RenewalProviderWebhookRequest,
+    principal: Principal = Depends(require_roles("admin", "analyst")),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    _ = principal
+    safe_ref = request.webhook_ref.strip()
+    rows = list(db.execute(select(Document)).scalars())
+    matched: Document | None = None
+    for document in rows:
+        references = _safe_references(document)
+        payload = references.get("renewal_purchase_intent")
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("webhook_ref") or "").strip() == safe_ref:
+            matched = document
+            break
+
+    if matched is None:
+        raise HTTPException(status_code=404, detail="webhook_ref not found")
+
+    references = _safe_references(matched).copy()
+    intent = references.get("renewal_purchase_intent")
+    if not isinstance(intent, dict):
+        intent = {}
+    intent["status"] = request.status.strip().lower()
+    intent["provider"] = request.provider
+    intent["updated_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    intent["provider_payload"] = request.payload
+    references["renewal_purchase_intent"] = intent
+    matched.references = references
+    db.add(matched)
+    db.commit()
+    return {"status": "acknowledged", "webhook_ref": safe_ref}
 
 
 @router.get("/extraction-reviews", response_model=ExtractionReviewQueueResponse)
@@ -3123,6 +5431,7 @@ def delete_document(
     merchant_user_id: str | None = None,
     principal: Principal = Depends(require_roles("admin", "analyst", "consumer", "merchant")),
     db: Session = Depends(get_db),
+    services: ServiceRegistry = Depends(get_services),
 ) -> dict[str, str]:
     user_id, merchant_user_id = _resolve_document_scope(
         principal,
@@ -3130,11 +5439,36 @@ def delete_document(
         merchant_user_id=merchant_user_id,
     )
     document = db.get(Document, doc_id)
-    if not document or not _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id):
+    if document is None:
+        mirrored = _load_document_view_from_mirror(
+            services,
+            doc_id=doc_id,
+            user_id=user_id,
+            merchant_user_id=merchant_user_id,
+        )
+        if mirrored is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+        store = getattr(services, "dynamodb_store", None)
+        if store is not None and getattr(store, "enabled", False):
+            store.delete_document_record(str(doc_id))
+        return {"status": "deleted", "docId": str(doc_id)}
+    if not _document_in_scope(document, user_id=user_id, merchant_user_id=merchant_user_id):
         raise HTTPException(status_code=404, detail="Document not found")
+    references = _safe_references(document)
+    storage_key = str(references.get("storage_key") or "").strip()
     _cancel_document_notifications(db, document_id=doc_id)
     db.delete(document)
     db.commit()
+    store = getattr(services, "dynamodb_store", None)
+    if store is not None and getattr(store, "enabled", False):
+        store.delete_document_record(str(doc_id))
+    if storage_key:
+        try:
+            store = getattr(services, "object_store", None)
+            if store is not None and getattr(store, "enabled", False):
+                store.delete_object(key=storage_key)
+        except Exception:
+            logger.exception("Failed to delete S3 source object for document_id=%s", str(doc_id))
     _log_security_event(
         db,
         event_type="document.deleted",
@@ -3195,6 +5529,7 @@ def list_reminders(
                 status=("expired" if warranty_end < now else "scheduled"),
                 daysRemaining=days_remaining,
                 urgencyTone=urgency_tone,
+                recommendedAction=_reminder_action_from_days(days_remaining),
             )
         )
 
@@ -3488,3 +5823,107 @@ def delete_notification(
     if not deleted:
         raise HTTPException(status_code=404, detail="Notification not found")
     return {"status": "deleted", "notificationId": str(notification_id)}
+
+
+@router.post("/ai/bharat/enrich", response_model=BharatAIEnrichResponse)
+def bharat_ai_enrich(
+    payload: BharatAIEnrichRequest,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    services: ServiceRegistry = Depends(get_services),
+) -> BharatAIEnrichResponse:
+    _ = principal
+    metadata = payload.metadata if isinstance(payload.metadata, dict) else {}
+    result = services.bharat_ai.enrich_invoice_for_bharat(
+        ocr_text=payload.ocr_text,
+        metadata=metadata,
+        target_language_code=payload.target_language_code,
+        include_speech=payload.include_speech,
+    )
+    return BharatAIEnrichResponse(
+        sourceLanguageCode=str(result.get("source_language_code") or "en"),
+        targetLanguageCode=str(result.get("target_language_code") or payload.target_language_code),
+        normalizedText=str(result.get("normalized_text") or ""),
+        consumerSummary=str(result.get("consumer_summary") or ""),
+        localizedSummary=str(result.get("localized_summary") or ""),
+        gstFindings=[str(item) for item in (result.get("gst_findings") or [])],
+        fraudSignals=[str(item) for item in (result.get("fraud_signals") or [])],
+        claimSteps=[str(item) for item in (result.get("claim_steps") or [])],
+        merchantNotes=[str(item) for item in (result.get("merchant_notes") or [])],
+        paymentReferences=[str(item) for item in (result.get("payment_references") or [])],
+        modelUsed=(str(result.get("model_used")) if result.get("model_used") else None),
+        speechAudioBase64=(str(result.get("speech_audio_base64")) if result.get("speech_audio_base64") else None),
+        speechContentType=(str(result.get("speech_content_type")) if result.get("speech_content_type") else None),
+    )
+
+
+@router.post("/ai/bharat/translate", response_model=BharatAITranslateResponse)
+def bharat_ai_translate(
+    payload: BharatAITranslateRequest,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    services: ServiceRegistry = Depends(get_services),
+) -> BharatAITranslateResponse:
+    _ = principal
+    translated = services.bharat_ai.translate_text(
+        payload.text,
+        target_language_code=payload.target_language_code,
+        source_language_code=payload.source_language_code,
+    )
+    source_language = payload.source_language_code
+    if source_language == "auto":
+        source_language = services.bharat_ai.detect_language(payload.text)
+    return BharatAITranslateResponse(
+        sourceLanguageCode=source_language,
+        targetLanguageCode=payload.target_language_code,
+        translatedText=translated,
+    )
+
+
+@router.post("/ai/bharat/translate-batch", response_model=BharatAITranslateBatchResponse)
+def bharat_ai_translate_batch(
+    payload: BharatAITranslateBatchRequest,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    services: ServiceRegistry = Depends(get_services),
+) -> BharatAITranslateBatchResponse:
+    _ = principal
+    texts = [str(item or "") for item in payload.texts]
+    translated = services.bharat_ai.translate_many(
+        texts,
+        target_language_code=payload.target_language_code,
+        source_language_code=payload.source_language_code,
+    )
+    source_language = payload.source_language_code
+    if source_language == "auto":
+        joined = next((item for item in texts if item.strip()), "")
+        source_language = services.bharat_ai.detect_language(joined) if joined else "en"
+    return BharatAITranslateBatchResponse(
+        sourceLanguageCode=source_language,
+        targetLanguageCode=payload.target_language_code,
+        translations=translated,
+    )
+
+
+@router.post("/ai/bharat/ask", response_model=BharatAIAskResponse)
+def bharat_ai_ask(
+    payload: BharatAIAskRequest,
+    principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
+    services: ServiceRegistry = Depends(get_services),
+) -> BharatAIAskResponse:
+    _ = principal
+    metadata = payload.metadata if isinstance(payload.metadata, dict) else {}
+    result = services.bharat_ai.answer_invoice_question(
+        question=payload.question,
+        ocr_text=payload.ocr_text,
+        metadata=metadata,
+        target_language_code=payload.target_language_code,
+    )
+    return BharatAIAskResponse(
+        sourceLanguageCode=str(result.get("source_language_code") or "en"),
+        targetLanguageCode=str(result.get("target_language_code") or payload.target_language_code),
+        normalizedQuestion=str(result.get("normalized_question") or payload.question),
+        localizedQuestion=str(result.get("localized_question") or payload.question),
+        answer=str(result.get("answer") or ""),
+        supportPoints=[str(item) for item in (result.get("support_points") or [])],
+        missingInformation=[str(item) for item in (result.get("missing_information") or [])],
+        confidenceNote=str(result.get("confidence_note") or ""),
+        modelUsed=(str(result.get("model_used")) if result.get("model_used") else None),
+    )

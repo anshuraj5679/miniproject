@@ -120,6 +120,8 @@ export interface Document {
   claimReadiness?: ClaimReadiness;
   deadlineBand?: string;
   compliance?: DocumentCompliance;
+  productImageAvailable?: boolean;
+  productImageGeneratedAt?: string | null;
 }
 
 export interface Reminder {

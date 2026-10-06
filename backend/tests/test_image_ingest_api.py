@@ -138,7 +138,7 @@ def test_ingest_image_allows_manual_field_fallback_when_ocr_missing(
     assert response.status_code == 200
 
 
-def test_ingest_image_uses_openai_metadata_fallback_when_ocr_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ingest_image_uses_bedrock_metadata_fallback_when_ocr_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
     fake_doc = SimpleNamespace(
         id=uuid.uuid4(),
@@ -160,7 +160,7 @@ def test_ingest_image_uses_openai_metadata_fallback_when_ocr_missing(monkeypatch
 
     monkeypatch.setattr("app.api.routes._persist_structured_document", fake_persist_structured_document)
     monkeypatch.setattr(
-        "app.api.routes._extract_image_metadata_with_openai",
+        "app.api.routes._extract_image_metadata_with_bedrock",
         lambda _payload, _filename: {
             "bill_id": "QEAC-7547",
             "vendor": "Lalani Info Tech Limited",
@@ -189,11 +189,11 @@ def test_ingest_image_uses_openai_metadata_fallback_when_ocr_missing(monkeypatch
     assert (captured["metadata"] or {}).get("vendor") == "Lalani Info Tech Limited"
 
 
-def test_ingest_image_ui_text_allowed_when_openai_detects_invoice(
+def test_ingest_image_ui_text_allowed_when_bedrock_detects_invoice(
     image_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        "app.api.routes._extract_image_metadata_with_openai",
+        "app.api.routes._extract_image_metadata_with_bedrock",
         lambda _payload, _filename: {"bill_id": "QEAC-7547", "total_amount": 6180.0},
     )
     response = image_client.post(
@@ -206,3 +206,59 @@ def test_ingest_image_ui_text_allowed_when_openai_detects_invoice(
         },
     )
     assert response.status_code == 200
+
+
+def test_ingest_image_hybrid_mode_uses_bedrock_without_textract(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    fake_doc = SimpleNamespace(
+        id=uuid.uuid4(),
+        bill_id="IMG-200",
+        vendor="Hybrid Store",
+        created_at=datetime.now(timezone.utc),
+    )
+
+    def fake_persist_structured_document(**kwargs):
+        captured["metadata"] = kwargs.get("extracted_metadata")
+        captured["text"] = kwargs.get("extracted_text")
+        return fake_doc, 2
+
+    def fake_db():
+        class _DB:
+            pass
+
+        yield _DB()
+
+    monkeypatch.setattr("app.api.routes._persist_structured_document", fake_persist_structured_document)
+    monkeypatch.setattr("app.api.routes._extract_image_metadata_with_google_vision", lambda _payload, _filename: ({}, ""))
+    monkeypatch.setattr(
+        "app.api.routes._extract_image_metadata_with_bedrock",
+        lambda _payload, _filename: {
+            "bill_id": "INV-HYBRID-1",
+            "vendor": "Hybrid Store",
+            "date": "2026-03-07",
+            "total_amount": 27881.36,
+        },
+    )
+
+    def fail_textract(_payload, _filename):
+        raise AssertionError("Textract path should not execute in hybrid mode")
+
+    monkeypatch.setattr("app.api.routes._extract_image_metadata_with_textract", fail_textract)
+    app.dependency_overrides[get_services] = lambda: object()
+    app.dependency_overrides[get_db] = fake_db
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/api/v1/ingest/image",
+            headers={"Authorization": "Bearer safebill-analyst-token"},
+            files={"file": ("bill.png", b"fake-image-bytes", "image/png")},
+            data={"user_id": "u-1", "ocr_mode": "hybrid"},
+        )
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    metadata = captured.get("metadata")
+    assert isinstance(metadata, dict)
+    assert metadata.get("bill_id") == "INV-HYBRID-1"
+    assert metadata.get("vendor") == "Hybrid Store"

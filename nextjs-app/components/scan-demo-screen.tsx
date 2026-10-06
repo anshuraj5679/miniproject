@@ -13,6 +13,12 @@ type DemoFields = {
   vendor: string | null
 }
 
+interface DemoOcrApiResponse {
+  ok?: boolean
+  fullText?: string
+  error?: string
+}
+
 function extractDemoFields(rawText: string): DemoFields {
   const text = rawText.replace(/\s+/g, ' ').trim()
 
@@ -79,16 +85,24 @@ export function ScanDemoScreen() {
     setOcrText('')
 
     try {
-      const Tesseract = await import('tesseract.js')
-      const result = await Tesseract.recognize(file, 'eng', {
-        logger(message) {
-          if (message.status === 'recognizing text') {
-            setProgress(Math.round((message.progress || 0) * 100))
-          }
-        },
+      setProgress(20)
+      const formData = new FormData()
+      formData.append('file', file, file.name)
+      const response = await fetch('/api/scan/demo-ocr', {
+        method: 'POST',
+        body: formData,
       })
+      setProgress(75)
 
-      const text = result.data?.text || ''
+      const payload = (await response.json().catch(() => null)) as DemoOcrApiResponse | null
+      if (!response.ok || !payload?.ok) {
+        throw new Error(payload?.error || 'OCR demo failed.')
+      }
+
+      const text = String(payload.fullText || '').trim()
+      if (!text) {
+        throw new Error('No text was detected in the uploaded document.')
+      }
       setOcrText(text)
       setProgress(100)
     } catch (err: unknown) {
@@ -140,13 +154,13 @@ export function ScanDemoScreen() {
         <div className="grid gap-5 lg:grid-cols-2">
           <section data-gsap="card" className="rounded-2xl border border-white/10 bg-white/5 p-4 backdrop-blur-xl">
             <p className="mb-2 text-sm font-semibold text-white">1) Upload invoice image</p>
-            <p className="mb-4 text-xs text-slate-400">Supported in demo: image files (`.png`, `.jpg`, `.jpeg`).</p>
+            <p className="mb-4 text-xs text-slate-400">Supported in demo: image files and PDF (`.png`, `.jpg`, `.jpeg`, `.pdf`).</p>
 
             <div className="space-y-3">
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="image/*"
+                accept="image/*,.pdf"
                 onChange={handleFileChange}
                 className="file-input file-input-bordered w-full border-white/15 bg-white/5"
               />

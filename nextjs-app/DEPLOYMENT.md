@@ -1,69 +1,75 @@
-# Deployment Guide
+# AWS Deployment Guide (Next.js Frontend)
 
-This guide deploys the Next.js app to Vercel and connects it to a backend running on Neon Postgres + Pinecone.
+This guide deploys the Next.js app on AWS Amplify Hosting and connects it to the AWS-hosted backend API.
 
-## Prerequisites
+## Target Architecture
 
-- GitHub account
-- Vercel account
-- A deployed backend URL (FastAPI)
-- Backend configured with Neon + Pinecone env vars
+- Frontend: AWS Amplify Hosting (Next.js SSR)
+- Auth: Amazon Cognito (Hosted UI + Google federated identity)
+- Backend: API Gateway + Lambda (or ECS Fargate)
+- Storage/AI/Comms: S3, Bedrock, Textract, SNS, SES
 
-## Step 1: Push to GitHub
+## 1) Prerequisites
 
-```bash
-cd nextjs-app
-git init
-git add .
-git commit -m "Initial commit: SafeBill Next.js app"
-git remote add origin https://github.com/YOUR_USERNAME/safebill-nextjs.git
-git branch -M main
-git push -u origin main
-```
+- AWS account with access to Amplify, Cognito, Route53 (optional), ACM (optional)
+- GitHub repository for this project
+- Backend deployed on AWS (see `../backend/infra/AWS_DEPLOY.md`)
 
-## Step 2: Deploy on Vercel
+## 2) Deploy Frontend on Amplify
 
-1. Go to `https://vercel.com/new`.
-2. Import your repository.
-3. Use default Next.js build settings.
+1. Open Amplify Console.
+2. Create a new app and connect your GitHub repository.
+3. Set app root to `nextjs-app`.
+4. Use the included `amplify.yml` build config in this folder.
 
-## Step 3: Set Vercel Environment Variables
+## 3) Amplify Environment Variables
 
-Add these:
+Set these in Amplify (App settings -> Environment variables):
 
 ```env
-NEXT_PUBLIC_SUPABASE_URL=your-supabase-url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-supabase-anon-key
-SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
+NEXT_PUBLIC_COGNITO_REGION=ap-south-1
+NEXT_PUBLIC_COGNITO_DOMAIN=your-cognito-domain-prefix.auth.ap-south-1.amazoncognito.com
+NEXT_PUBLIC_COGNITO_CLIENT_ID=your-cognito-app-client-id
+NEXT_PUBLIC_COGNITO_REDIRECT_URI=https://your-frontend-domain/auth/callback
+NEXT_PUBLIC_COGNITO_LOGOUT_URI=https://your-frontend-domain/login
+NEXT_PUBLIC_COGNITO_SCOPE=openid email profile
+
+COGNITO_REGION=ap-south-1
+COGNITO_DOMAIN=your-cognito-domain-prefix.auth.ap-south-1.amazoncognito.com
+COGNITO_CLIENT_ID=your-cognito-app-client-id
+COGNITO_CLIENT_SECRET=your-cognito-client-secret
+COGNITO_REDIRECT_URI=https://your-frontend-domain/auth/callback
+COGNITO_LOGOUT_URI=https://your-frontend-domain/login
+COGNITO_SCOPE=openid email profile
+
 NEXT_PUBLIC_APP_API_BASE_URL=/api
-BACKEND_API_BASE_URL=https://your-backend-domain
+BACKEND_API_BASE_URL=https://your-api-gateway-domain-or-alb-domain
 BACKEND_API_SERVICE_TOKEN=
 BACKEND_API_TIMEOUT_MS=45000
 ```
 
-Notes:
+## 4) Cognito App Client URLs
 
-- `BACKEND_API_BASE_URL` should be backend origin without `/api/v1`.
-- User JWTs are forwarded from Next.js API routes to backend per request.
-- `SUPABASE_SERVICE_ROLE_KEY` is required for secure custom ID lookup route.
-- Keep `NEXT_PUBLIC_APP_API_BASE_URL` as `/api` in most cases.
+In Cognito app client configuration, set:
 
-## Step 4: Verify E2E
+- Allowed callback URL: `https://your-frontend-domain/auth/callback`
+- Allowed sign-out URL: `https://your-frontend-domain/login`
 
-After deploy, test:
+These must exactly match frontend env values.
 
-- `/scan` (PDF/image upload and ingestion)
-- `/locker` (document list)
-- `/document/:id` (detail + delete)
-- `/chat` (RAG answers)
-- `/reminders` (warranty reminders)
+## 5) DNS (Optional Custom Domain)
 
-## Troubleshooting
+- If using Route53, attach domain directly in Amplify custom domain settings.
+- If using external DNS, map records as instructed by Amplify.
 
-- API failures:
-  - Check `BACKEND_API_BASE_URL` and token.
-  - Check backend CORS and availability.
-- Empty RAG responses:
-  - Confirm backend has `OPENAI_API_KEY`.
-  - Confirm Pinecone index exists and matches embedding dimensions.
-  - Confirm data was ingested successfully.
+## 6) Validation Checklist
+
+- Login works with Cognito Hosted UI.
+- Consumer goes to `/locker`, merchant goes to `/merchant-dashboard`.
+- `/scan` uploads and processes invoice via backend.
+- `/document/[id]`, `/reminders`, `/chat` call backend successfully.
+
+## Notes
+
+- This app is configured for AWS-only auth flow (Cognito).
+- Keep `NEXT_PUBLIC_APP_API_BASE_URL=/api` so browser never calls backend directly.

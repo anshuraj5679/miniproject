@@ -39,14 +39,25 @@ class Principal:
 
 
 @lru_cache(maxsize=2)
-def _jwks_client(supabase_url: str):
+def _jwks_client(jwks_url: str):
     if PyJWKClient is None:
         return None
-    base = supabase_url.rstrip("/")
-    return PyJWKClient(f"{base}/auth/v1/.well-known/jwks.json")
+    return PyJWKClient(jwks_url)
 
 
 def _extract_user_type(claims: dict[str, Any]) -> str | None:
+    cognito_custom = str(claims.get("custom:user_type") or "").strip().lower()
+    if cognito_custom in {"consumer", "merchant"}:
+        return cognito_custom
+
+    cognito_groups = claims.get("cognito:groups")
+    if isinstance(cognito_groups, list):
+        lowered_groups = {str(group).strip().lower() for group in cognito_groups}
+        if "merchant" in lowered_groups:
+            return "merchant"
+        if "consumer" in lowered_groups:
+            return "consumer"
+
     user_metadata = claims.get("user_metadata")
     if isinstance(user_metadata, dict):
         candidate = str(user_metadata.get("user_type") or "").strip().lower()
@@ -78,6 +89,10 @@ def _extract_email(claims: dict[str, Any]) -> str | None:
 
 
 def _extract_full_name(claims: dict[str, Any]) -> str | None:
+    direct_name = str(claims.get("name") or "").strip()
+    if direct_name:
+        return direct_name[:255]
+
     for key in ("user_metadata", "app_metadata"):
         section = claims.get(key)
         if not isinstance(section, dict):
@@ -89,27 +104,41 @@ def _extract_full_name(claims: dict[str, Any]) -> str | None:
     return None
 
 
-def _verify_supabase_jwt(token: str) -> dict[str, Any] | None:
+def _resolve_cognito_issuer() -> str:
     settings = get_settings()
-    if not token or not settings.supabase_url or jwt is None:
+    explicit_issuer = settings.cognito_jwt_issuer.strip() if settings.cognito_jwt_issuer else ""
+    if explicit_issuer:
+        return explicit_issuer
+
+    region = settings.aws_region.strip()
+    user_pool_id = settings.cognito_user_pool_id.strip()
+    if not region or not user_pool_id:
+        return ""
+    return f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}"
+
+
+def _verify_cognito_jwt(token: str) -> dict[str, Any] | None:
+    settings = get_settings()
+    if not token or jwt is None:
         return None
 
-    jwks_client = _jwks_client(settings.supabase_url)
+    issuer = _resolve_cognito_issuer()
+    if not issuer:
+        return None
+
+    jwks_client = _jwks_client(f"{issuer.rstrip('/')}/.well-known/jwks.json")
     if jwks_client is None:
         return None
 
-    issuer = settings.supabase_jwt_issuer.strip() if settings.supabase_jwt_issuer else ""
-    if not issuer:
-        issuer = f"{settings.supabase_url.rstrip('/')}/auth/v1"
+    audience = settings.cognito_jwt_audience.strip() if settings.cognito_jwt_audience else ""
+    if not audience:
+        audience = settings.cognito_app_client_id.strip()
 
-    audience = settings.supabase_jwt_audience.strip() if settings.supabase_jwt_audience else ""
     decode_kwargs: dict[str, Any] = {
         "algorithms": ["RS256"],
         "issuer": issuer,
-        "options": {"require": ["exp", "iat", "sub"], "verify_aud": bool(audience)},
+        "options": {"require": ["exp", "iat", "sub"], "verify_aud": False},
     }
-    if audience:
-        decode_kwargs["audience"] = audience
 
     try:
         signing_key = jwks_client.get_signing_key_from_jwt(token)
@@ -117,7 +146,18 @@ def _verify_supabase_jwt(token: str) -> dict[str, Any] | None:
     except Exception:
         return None
 
-    return claims if isinstance(claims, dict) else None
+    if not isinstance(claims, dict):
+        return None
+
+    if audience:
+        aud_claim = claims.get("aud")
+        client_id_claim = claims.get("client_id")
+        aud_match = isinstance(aud_claim, str) and aud_claim.strip() == audience
+        client_id_match = isinstance(client_id_claim, str) and client_id_claim.strip() == audience
+        if not (aud_match or client_id_match):
+            return None
+
+    return claims
 
 
 def sanitize_user_query(text: str) -> str:
@@ -164,7 +204,11 @@ def get_current_principal(
     if token in settings.auth_tokens:
         return Principal(token=token, role=settings.auth_tokens[token])
 
-    claims = _verify_supabase_jwt(token)
+    provider = settings.auth_provider.strip().lower()
+    if provider not in {"cognito", "aws_cognito"}:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unsupported auth provider")
+    claims = _verify_cognito_jwt(token)
+
     if not claims:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 

@@ -33,6 +33,35 @@ class IngestVendorTableResponse(BaseModel):
     created_at: DateTime | None
 
 
+class AsyncExtractionJobCreateResponse(BaseModel):
+    jobId: UUID
+    status: str
+    createdAt: DateTime
+
+
+class AsyncExtractionJobStatusResponse(BaseModel):
+    jobId: UUID
+    status: str
+    filename: str
+    documentId: UUID | None = None
+    error: str | None = None
+    enginesUsed: list[str] = Field(default_factory=list)
+    createdAt: DateTime
+    updatedAt: DateTime
+    completedAt: DateTime | None = None
+
+
+class AsyncExtractionCallbackRequest(BaseModel):
+    status: str = Field(min_length=3, max_length=24)
+    extracted_text: str | None = None
+    extracted_metadata: dict[str, Any] = Field(default_factory=dict)
+    field_confidences: dict[str, float] = Field(default_factory=dict)
+    field_sources: dict[str, str] = Field(default_factory=dict)
+    low_confidence_fields: list[str] = Field(default_factory=list)
+    engines_used: list[str] = Field(default_factory=list)
+    error_message: str | None = None
+
+
 class SearchRequest(BaseModel):
     query: str = Field(min_length=3, max_length=1000)
     filters: MetadataFilter = Field(default_factory=MetadataFilter)
@@ -93,8 +122,8 @@ class Citation(BaseModel):
 class ServiceCenterView(BaseModel):
     name: str
     address: str
-    latitude: float
-    longitude: float
+    latitude: float | None = None
+    longitude: float | None = None
     distance_km: float | None = None
     source: str = "brand_directory"
     confidence: str = "likely"
@@ -217,6 +246,9 @@ class ClaimReadinessView(BaseModel):
     summary: str
     factors: dict[str, float] = Field(default_factory=dict)
     missing: list[str] = Field(default_factory=list)
+    days_left: int | None = None
+    deadline_risk: str | None = None
+    recommendedActions: list[str] = Field(default_factory=list)
 
 
 class DocumentView(BaseModel):
@@ -237,6 +269,7 @@ class DocumentView(BaseModel):
     assignedByMerchantName: str | None = None
     assignedByMerchantCustomId: str | None = None
     consumerCustomId: str | None = None
+    totalAmount: float | None = None
     taxableAmount: float | None = None
     gstAmount: float | None = None
     gstRate: float | None = None
@@ -250,6 +283,26 @@ class DocumentView(BaseModel):
     claimReadiness: ClaimReadinessView | None = None
     deadlineBand: str | None = None
     compliance: DocumentComplianceView | None = None
+    productImageAvailable: bool = False
+    productImageGeneratedAt: str | None = None
+
+
+class DocumentProductImageGenerateRequest(BaseModel):
+    force: bool = False
+
+
+class DocumentProductImageView(BaseModel):
+    docId: str
+    productImageAvailable: bool = False
+    generatedAt: str | None = None
+    subject: str | None = None
+    modelUsed: str | None = None
+
+
+class DocumentProductImageUrlResponse(BaseModel):
+    docId: str
+    url: str
+    expiresInSeconds: int
 
 
 class DocumentsResponse(BaseModel):
@@ -266,6 +319,7 @@ class ReminderView(BaseModel):
     status: str
     daysRemaining: int | None = None
     urgencyTone: str | None = None
+    recommendedAction: str | None = None
 
 
 class RemindersResponse(BaseModel):
@@ -453,6 +507,130 @@ class ClaimPacketResponse(BaseModel):
     attachmentChecklist: list[str]
 
 
+class ClaimAssistantResponse(BaseModel):
+    docId: str
+    readiness: ClaimReadinessView | None = None
+    deadlineBand: str | None = None
+    nextBestActions: list[str] = Field(default_factory=list)
+    recommendedChannels: list[str] = Field(default_factory=list)
+    claimPacketUrl: str
+    calendarIcsUrl: str
+    serviceCentersUrl: str
+
+
+class ServiceCentersRecommendationResponse(BaseModel):
+    docId: str
+    company: str | None = None
+    locationHint: str | None = None
+    radiusKm: float
+    count: int
+    guidance: str
+    centers: list[ServiceCenterView] = Field(default_factory=list)
+
+
+class DocumentShareRequest(BaseModel):
+    target_user_id: str = Field(min_length=3, max_length=128)
+    permission: str = Field(default="view", pattern="^(view|edit)$")
+
+
+class DocumentShareMemberView(BaseModel):
+    userId: str
+    permission: str = "view"
+    grantedBy: str | None = None
+    grantedAt: str | None = None
+
+
+class DocumentShareResponse(BaseModel):
+    docId: str
+    ownerUserId: str | None = None
+    sharedWith: list[DocumentShareMemberView] = Field(default_factory=list)
+
+
+class SharedVaultResponse(BaseModel):
+    documents: list[DocumentView]
+
+
+class WhatsAppClaimDraftResponse(BaseModel):
+    docId: str
+    whatsappEnabled: bool
+    destination: str | None = None
+    message: str
+    nextSteps: list[str] = Field(default_factory=list)
+
+
+class FraudSignalView(BaseModel):
+    code: str
+    severity: str
+    detail: str
+
+
+class FraudCheckResponse(BaseModel):
+    docId: str
+    riskScore: float = Field(ge=0, le=1)
+    status: str
+    signals: list[FraudSignalView] = Field(default_factory=list)
+    recommendedActions: list[str] = Field(default_factory=list)
+
+
+class RenewalOptionView(BaseModel):
+    planId: str
+    partnerCode: str
+    provider: str
+    planName: str
+    extensionMonths: int
+    estimatedPremium: float
+    currency: str = "INR"
+    coverageSummary: str
+    recommended: bool = False
+    quoteUrl: str
+    purchaseUrl: str
+    webhookRef: str
+
+
+class RenewalOptionsResponse(BaseModel):
+    docId: str
+    productName: str | None = None
+    currentWarrantyEnd: str | None = None
+    options: list[RenewalOptionView] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class RenewalQuoteResponse(BaseModel):
+    docId: str
+    planId: str
+    partnerCode: str
+    currency: str
+    basePremium: float
+    taxAmount: float
+    totalPremium: float
+    validUntil: str
+    quoteRef: str
+
+
+class RenewalPurchaseRequest(BaseModel):
+    doc_id: str = Field(min_length=8, max_length=64)
+    plan_id: str = Field(min_length=2, max_length=64)
+    partner_code: str = Field(min_length=2, max_length=64)
+    user_id: str | None = Field(default=None, max_length=128)
+    return_url: str | None = Field(default=None, max_length=1024)
+
+
+class RenewalPurchaseIntentResponse(BaseModel):
+    docId: str
+    planId: str
+    partnerCode: str
+    checkoutUrl: str
+    webhookRef: str
+    status: str = "initiated"
+
+
+class RenewalProviderWebhookRequest(BaseModel):
+    webhook_ref: str = Field(min_length=8, max_length=128)
+    status: str = Field(min_length=2, max_length=32)
+    provider: str = Field(min_length=2, max_length=64)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 class MerchantAssignmentAcceptRequest(BaseModel):
     consumer_user_id: str = Field(min_length=3, max_length=128)
     status: str = Field(default="accepted", pattern="^(accepted|escalated|rejected)$")
@@ -493,3 +671,69 @@ class NotificationDeliverabilityDashboardResponse(BaseModel):
     windowDays: int
     totals: dict[str, int]
     channelStats: list[NotificationChannelStats] = Field(default_factory=list)
+
+
+class BharatAIEnrichRequest(BaseModel):
+    ocr_text: str = Field(min_length=1, max_length=100000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    target_language_code: str = Field(default="en", min_length=2, max_length=12)
+    include_speech: bool = False
+
+
+class BharatAIEnrichResponse(BaseModel):
+    sourceLanguageCode: str
+    targetLanguageCode: str
+    normalizedText: str
+    consumerSummary: str
+    localizedSummary: str
+    gstFindings: list[str] = Field(default_factory=list)
+    fraudSignals: list[str] = Field(default_factory=list)
+    claimSteps: list[str] = Field(default_factory=list)
+    merchantNotes: list[str] = Field(default_factory=list)
+    paymentReferences: list[str] = Field(default_factory=list)
+    modelUsed: str | None = None
+    speechAudioBase64: str | None = None
+    speechContentType: str | None = None
+
+
+class BharatAITranslateRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=10000)
+    target_language_code: str = Field(default="en", min_length=2, max_length=12)
+    source_language_code: str = Field(default="auto", min_length=2, max_length=12)
+
+
+class BharatAITranslateResponse(BaseModel):
+    sourceLanguageCode: str
+    targetLanguageCode: str
+    translatedText: str
+
+
+class BharatAITranslateBatchRequest(BaseModel):
+    texts: list[str] = Field(default_factory=list, min_length=1, max_length=250)
+    target_language_code: str = Field(default="en", min_length=2, max_length=12)
+    source_language_code: str = Field(default="auto", min_length=2, max_length=12)
+
+
+class BharatAITranslateBatchResponse(BaseModel):
+    sourceLanguageCode: str
+    targetLanguageCode: str
+    translations: list[str] = Field(default_factory=list)
+
+
+class BharatAIAskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=10000)
+    ocr_text: str = Field(min_length=1, max_length=100000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    target_language_code: str = Field(default="en", min_length=2, max_length=12)
+
+
+class BharatAIAskResponse(BaseModel):
+    sourceLanguageCode: str
+    targetLanguageCode: str
+    normalizedQuestion: str
+    localizedQuestion: str
+    answer: str
+    supportPoints: list[str] = Field(default_factory=list)
+    missingInformation: list[str] = Field(default_factory=list)
+    confidenceNote: str
+    modelUsed: str | None = None

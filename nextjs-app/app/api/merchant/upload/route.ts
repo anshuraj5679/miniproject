@@ -4,6 +4,7 @@ import { BackendApiError, backendApiFetch, resolveRequestAuthToken, withQuery } 
 export const runtime = 'nodejs'
 const INGEST_TIMEOUT_MS = 120000
 const DOCUMENT_FETCH_TIMEOUT_MS = 60000
+const DEFAULT_OCR_MODE = 'vision_only'
 
 interface IngestResponse {
   document_id: string
@@ -29,6 +30,7 @@ export async function POST(request: NextRequest) {
     const vendor = String(formData.get('vendor') || '').trim()
     const purchaseDate = String(formData.get('purchaseDate') || '').trim()
     const totalAmount = String(formData.get('totalAmount') || '').trim()
+    const requestedOcrMode = String(formData.get('ocrMode') || '').trim().toLowerCase()
 
     if (!(file instanceof File)) {
       return NextResponse.json({ error: 'No file provided' }, { status: 400 })
@@ -64,6 +66,7 @@ export async function POST(request: NextRequest) {
     if (vendor) backendFormData.append('vendor', vendor)
     if (purchaseDate) backendFormData.append('document_date', purchaseDate)
     if (totalAmount) backendFormData.append('total_amount', totalAmount)
+    backendFormData.append('ocr_mode', requestedOcrMode || DEFAULT_OCR_MODE)
 
     const ingestPath = isPdf ? '/ingest/pdf' : '/ingest/image'
     const ingest = await backendApiFetch<IngestResponse>(ingestPath, {

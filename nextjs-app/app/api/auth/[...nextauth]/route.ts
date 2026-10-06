@@ -9,10 +9,10 @@ const authOptions: NextAuthOptions = {
     },
     callbacks: {
         async redirect({ url, baseUrl }) {
-            // Redirect to locker after sign in
+            // Redirect to the in-app consumer experience after sign in
             if (url.startsWith(baseUrl)) return url
             else if (url.startsWith('/')) return `${baseUrl}${url}`
-            return baseUrl + '/locker'
+            return baseUrl + '/chat'
         },
     },
     session: {

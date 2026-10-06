@@ -11,7 +11,7 @@ def test_service_center_query_detection() -> None:
 
 
 def test_find_service_centers_sorts_by_distance(monkeypatch) -> None:
-    locator = ServiceCenterLocator(directory_entries=[])
+    locator = ServiceCenterLocator(directory_entries=[], live_lookup_enabled=True)
     mocked_results = [
         {
             "display_name": "Samsung Service Center A, MG Road, Bengaluru, Karnataka, India",
@@ -43,7 +43,7 @@ def test_find_service_centers_sorts_by_distance(monkeypatch) -> None:
 
 
 def test_find_service_centers_without_location_has_no_distance(monkeypatch) -> None:
-    locator = ServiceCenterLocator(directory_entries=[])
+    locator = ServiceCenterLocator(directory_entries=[], live_lookup_enabled=True)
     mocked_results = [
         {
             "display_name": "LG Service Center, Connaught Place, New Delhi, India",
@@ -78,6 +78,61 @@ def test_parse_pincode_extracts_valid_indian_pincode() -> None:
     assert locator.parse_pincode("zip 001234") is None
 
 
+def test_normalize_company_name_strips_corporate_suffixes() -> None:
+    locator = ServiceCenterLocator(directory_entries=[])
+    assert locator.normalize_company_name("Apple India Private Limited") == "Apple"
+    assert locator.normalize_company_name("Samsung Electronics India Pvt. Ltd.") == "Samsung"
+
+
+def test_find_service_centers_returns_official_fallback_when_fast_mode_requested(monkeypatch) -> None:
+    locator = ServiceCenterLocator(directory_entries=[])
+    monkeypatch.setattr(locator, "_search_nominatim", lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not call nominatim")))
+    monkeypatch.setattr(locator, "_search_overpass", lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not call overpass")))
+    monkeypatch.setattr(locator, "_search_google_places", lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not call google places")))
+
+    centers = locator.find_service_centers(
+        company_name="Apple India Private Limited",
+        location_hint="Bengaluru",
+        limit=3,
+        allow_external_lookup=False,
+    )
+
+    assert len(centers) == 1
+    assert centers[0].source == "official_support"
+    assert centers[0].website == "https://support.apple.com/en-in/repair"
+    assert centers[0].map_url is not None
+
+
+def test_find_service_centers_uses_live_lookup_when_enabled(monkeypatch) -> None:
+    locator = ServiceCenterLocator(directory_entries=[], live_lookup_enabled=True)
+    monkeypatch.setattr(locator, "_search_overpass", lambda **kwargs: [])
+    monkeypatch.setattr(
+        locator,
+        "_search_google_places",
+        lambda **kwargs: [
+            {
+                "name": "Apple Authorized Service Provider - Indiranagar",
+                "formatted_address": "100 Feet Road, Indiranagar, Bengaluru, Karnataka 560038, India",
+                "place_id": "apple-place-1",
+                "geometry": {"location": {"lat": 12.9719, "lng": 77.6408}},
+            }
+        ],
+    )
+    monkeypatch.setattr(locator, "_search_nominatim", lambda **kwargs: [])
+
+    centers = locator.find_service_centers(
+        company_name="Apple India Private Limited",
+        user_latitude=12.9716,
+        user_longitude=77.5946,
+        location_hint="Bengaluru",
+        limit=3,
+    )
+
+    assert len(centers) == 1
+    assert centers[0].source == "google_maps"
+    assert centers[0].distance_km is not None
+
+
 def test_directory_results_prioritized_and_verified(monkeypatch) -> None:
     directory_entries = [
         {
@@ -101,7 +156,7 @@ def test_directory_results_prioritized_and_verified(monkeypatch) -> None:
             "is_verified": True,
         },
     ]
-    locator = ServiceCenterLocator(directory_entries=directory_entries)
+    locator = ServiceCenterLocator(directory_entries=directory_entries, live_lookup_enabled=True)
     monkeypatch.setattr(
         locator,
         "_search_nominatim",
