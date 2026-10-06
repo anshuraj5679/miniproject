@@ -307,21 +307,6 @@ Channels:
 - **SMS/Push/WhatsApp** via configured webhook URLs + optional HMAC signature (`NOTIFICATION_WEBHOOK_SECRET`)
 - **In-app** is persisted as jobs with `channel=in_app` and served via `GET /api/v1/notifications`
 
-### Grounded Q&A (RAG) with citations + QA logging
-
-```mermaid
-flowchart TD
-  Q[User question] -->|/api/chat| ASK[/api/v1/ask]
-  ASK --> PLAN[QueryPlanner]
-  ASK --> RET[HybridRetriever\npgvector + FTS\n(optional Pinecone)]
-  RET --> CALC[CalculationAgent]
-  RET --> POL[PolicyAgent]
-  RET --> GEN[GroundedAnswerGenerator\n(OpenAI or fallback)]
-  GEN --> AUD[AuditorAgent]
-  AUD --> LOG[qa_logs]
-  AUD --> OUT[Answer + claims + citations + confidence]
-```
-
 Important: if `OPENAI_API_KEY` is not set, the backend will:
 
 - generate deterministic embeddings (so retrieval still works, but is weaker)
