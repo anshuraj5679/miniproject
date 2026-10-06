@@ -1214,6 +1214,12 @@ def _looks_like_ui_screenshot(text: str) -> bool:
         "digital locker",
         "all warranties",
         "scan invoice",
+        "warranty command center",
+        "open full ai report",
+        "extraction complete",
+        "personal outputs",
+        "settings",
+        "logout",
     ]
     hits = sum(1 for marker in ui_markers if marker in lowered)
     return hits >= 2
@@ -1806,6 +1812,102 @@ def _extract_image_metadata_with_bedrock(image_bytes: bytes, filename: str) -> d
         return {}
 
     return _normalize_invoice_metadata(parsed)
+
+
+def _classify_document_image_with_bedrock(image_bytes: bytes, filename: str) -> dict[str, object]:
+    settings = get_settings()
+    if not image_bytes:
+        return {}
+    if boto3 is None:
+        return {}
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return {}
+
+    model = (settings.bedrock_chat_model or "").strip()
+    if not model:
+        return {}
+
+    mime_type = mimetypes.guess_type(filename)[0] or "image/png"
+    image_format = "png"
+    if "jpeg" in mime_type or "jpg" in mime_type:
+        image_format = "jpeg"
+    elif "webp" in mime_type:
+        image_format = "webp"
+    elif "gif" in mime_type:
+        image_format = "gif"
+
+    system_prompt = (
+        "You are a document classifier for SafeBill. "
+        "Decide whether this image is a bill/invoice/receipt or a warranty/guarantee card. "
+        "If the image is a selfie, person, object photo, app screenshot, dashboard, or anything that is not a real document, "
+        "set is_invoice to false and document_type to other. "
+        "Return only JSON with keys: is_invoice (boolean), document_type (string), confidence (0-1), reason (short). "
+        "Acceptable document_type values: invoice, receipt, warranty_card, guarantee_card, other."
+    )
+    user_prompt = "Classify the document type for this image."
+
+    try:
+        configure_bedrock_api_key(settings)
+        client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+        response = client.converse(
+            modelId=model,
+            system=[{"text": system_prompt}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"text": user_prompt},
+                        {"image": {"format": image_format, "source": {"bytes": image_bytes}}},
+                    ],
+                }
+            ],
+            inferenceConfig={"temperature": 0.0, "maxTokens": 300},
+        )
+        content_blocks = (
+            response.get("output", {})
+            .get("message", {})
+            .get("content", [])
+        )
+        raw_content = "".join(
+            str(block.get("text", ""))
+            for block in content_blocks
+            if isinstance(block, dict)
+        ).strip()
+        if not raw_content:
+            return {}
+        if raw_content.startswith("```"):
+            raw_content = raw_content.strip("`")
+            raw_content = raw_content.replace("json\n", "", 1).strip()
+        parsed = json.loads(raw_content)
+    except Exception:
+        return {}
+
+    if not isinstance(parsed, dict):
+        return {}
+
+    raw_is_invoice = parsed.get("is_invoice")
+    is_invoice: bool | None = None
+    if isinstance(raw_is_invoice, bool):
+        is_invoice = raw_is_invoice
+    elif isinstance(raw_is_invoice, str):
+        lowered = raw_is_invoice.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            is_invoice = True
+        elif lowered in {"false", "0", "no", "n"}:
+            is_invoice = False
+
+    confidence = _coerce_float(parsed.get("confidence"), default=0.0) or 0.0
+    if confidence < 0:
+        confidence = 0.0
+    if confidence > 1:
+        confidence = 1.0
+
+    return {
+        "is_invoice": is_invoice,
+        "document_type": str(parsed.get("document_type") or "").strip() or None,
+        "confidence": confidence,
+        "reason": str(parsed.get("reason") or "").strip() or None,
+    }
 
 
 def _extract_text_metadata_with_bedrock(ocr_text: str, filename: str) -> dict[str, object]:
@@ -4457,6 +4559,16 @@ async def ingest_image(
         user_id=user_id,
         merchant_user_id=merchant_user_id,
     )
+    image_classification = _classify_document_image_with_bedrock(payload, filename)
+    image_doc_is_invoice = image_classification.get("is_invoice") if image_classification else None
+    image_doc_confidence = _coerce_float(image_classification.get("confidence"), default=0.0) if image_classification else 0.0
+    image_doc_type = str(image_classification.get("document_type") or "").strip().lower() if image_classification else ""
+    image_allowed_type = image_doc_type in {"warranty_card", "guarantee_card"}
+    if image_doc_is_invoice is False and not image_allowed_type and image_doc_confidence >= 0.7:
+        raise HTTPException(
+            status_code=422,
+            detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+        )
 
     routed = _run_image_extraction_router(
         image_bytes=payload,
@@ -4496,7 +4608,7 @@ async def ingest_image(
         name in {"google_vision", "aws_bedrock_text", "aws_bedrock_vision", "aws_textract", "aws_textract_proxy", "manual_override"}
         for name in engines_used
     )
-    if _looks_like_ui_screenshot(resolved_ocr_text) and not has_strong_invoice_engine:
+    if _looks_like_ui_screenshot(resolved_ocr_text):
         raise HTTPException(
             status_code=422,
             detail=(
