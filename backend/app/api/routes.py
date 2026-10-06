@@ -1206,6 +1206,18 @@ def _build_image_ocr_diagnostics(image_bytes: bytes) -> str:
 
 def _looks_like_ui_screenshot(text: str) -> bool:
     lowered = (text or "").lower()
+    strong_markers = [
+        "warranty command center",
+        "scan invoice",
+        "assets in locker",
+        "protected value",
+        "expiring soon",
+        "all assets",
+        "warranty locker",
+        "dashboard",
+    ]
+    if any(marker in lowered for marker in strong_markers):
+        return True
     ui_markers = [
         "merchant dashboard",
         "consumer sync",
@@ -1245,6 +1257,39 @@ def _looks_like_safebill_ui(text: str) -> bool:
         )
         return any(marker in lowered for marker in secondary_markers)
     return False
+
+
+def _metadata_looks_like_ui(metadata: dict[str, object]) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    text_parts: list[str] = []
+    for key in ("bill_id", "vendor", "product_name", "category"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            text_parts.append(value.strip())
+    line_items = metadata.get("line_items")
+    if isinstance(line_items, list):
+        for item in line_items:
+            if isinstance(item, dict):
+                name = item.get("name")
+                if isinstance(name, str) and name.strip():
+                    text_parts.append(name.strip())
+    combined = " ".join(text_parts).lower()
+    if not combined:
+        return False
+    ui_tokens = (
+        "dashboard",
+        "warranty command center",
+        "scan invoice",
+        "expiring soon",
+        "assets in locker",
+        "protected value",
+        "all assets",
+        "warranty locker",
+        "safebill",
+        "safe bill",
+    )
+    return any(token in combined for token in ui_tokens)
 
 
 def _heuristic_is_invoice_document(text: str) -> tuple[bool, float]:
@@ -4620,6 +4665,12 @@ async def ingest_image(
                 "If OCR still fails, add invoice fields manually. "
                 f"Diagnostics: {engine_hint}; {diagnostics}"
             ),
+        )
+
+    if _metadata_looks_like_ui(strict_metadata):
+        raise HTTPException(
+            status_code=422,
+            detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
         )
 
     has_invoice_signals = any(
