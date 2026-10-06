@@ -1225,6 +1225,28 @@ def _looks_like_ui_screenshot(text: str) -> bool:
     return hits >= 2
 
 
+def _looks_like_safebill_ui(text: str) -> bool:
+    lowered = (text or "").lower()
+    if not lowered:
+        return False
+    if "warranty command center" in lowered:
+        return True
+    if "safebill" in lowered:
+        secondary_markers = (
+            "dashboard",
+            "scan invoice",
+            "all assets",
+            "expiring soon",
+            "claims",
+            "vendors",
+            "analytics",
+            "assets in locker",
+            "warranty locker",
+        )
+        return any(marker in lowered for marker in secondary_markers)
+    return False
+
+
 def _heuristic_is_invoice_document(text: str) -> tuple[bool, float]:
     cleaned = re.sub(r"\s+", " ", (text or "").lower()).strip()
     if not cleaned:
@@ -4608,13 +4630,10 @@ async def ingest_image(
         name in {"google_vision", "aws_bedrock_text", "aws_bedrock_vision", "aws_textract", "aws_textract_proxy", "manual_override"}
         for name in engines_used
     )
-    if _looks_like_ui_screenshot(resolved_ocr_text):
+    if _looks_like_safebill_ui(resolved_ocr_text) or _looks_like_ui_screenshot(resolved_ocr_text):
         raise HTTPException(
             status_code=422,
-            detail=(
-                "Uploaded image appears to be an app screenshot, not a bill/invoice. "
-                "Upload the actual invoice photo/PDF."
-            ),
+            detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
         )
 
     classification = _classify_document_with_bedrock(resolved_ocr_text, filename)
