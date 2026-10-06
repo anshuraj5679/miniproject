@@ -31,24 +31,11 @@ import {
 } from 'lucide-react'
 import Image from 'next/image'
 import { ThemeToggle } from './theme-toggle'
+import { persistClientAuthCookies, signInWithCustomId } from '@/lib/auth-client'
 import { useAuthStore } from '@/lib/store/auth-store'
 import { useGsapReveal } from '@/lib/gsap-helpers'
-import { buildHostedUiAuthorizeUrl, type CognitoAuthResult } from '@/lib/cognito'
-
-type UserType = 'consumer' | 'merchant'
-
-interface LookupApiResponse {
-  userId?: string
-  email?: string
-  fullName?: string
-  userType?: UserType
-  customId?: string
-  error?: string
-}
-
-interface CognitoAuthError {
-  error?: string
-}
+import { AwsBeamSection } from './aws-beam-section'
+import type { UserType } from '@/lib/types'
 
 const appArticles = [
   {
@@ -427,85 +414,18 @@ export function LandingScreen() {
     setError(null)
 
     try {
-      const normalizedCustomId = customId.trim().toUpperCase()
-      let resolvedEmail = ''
-      let resolvedType: UserType = userType
-      let resolvedCustomId = normalizedCustomId
-      let resolvedName = ''
-
-      const lookupResponse = await fetch('/api/auth/lookup-id', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ customId: normalizedCustomId, userType }),
+      const result = await signInWithCustomId({
+        customId,
+        password,
+        userType,
       })
-      const lookupData = (await lookupResponse.json().catch(() => null)) as LookupApiResponse | null
 
-      if (!lookupResponse.ok || !lookupData?.email) {
-        throw new Error(`No account found for this ${userType} ID.`)
-      }
-      resolvedEmail = lookupData.email
-      resolvedType = (lookupData.userType || userType) as UserType
-      resolvedCustomId = lookupData.customId || normalizedCustomId
-      resolvedName = lookupData.fullName || ''
-
-      const authResponse = await fetch('/api/auth/cognito/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: resolvedEmail,
-          password,
-          userType: resolvedType,
-          customId: resolvedCustomId,
-          name: resolvedName,
-        }),
-      })
-      const authData = (await authResponse.json().catch(() => null)) as (CognitoAuthResult & CognitoAuthError) | null
-      if (!authResponse.ok || !authData?.accessToken || !authData.user?.userId) {
-        throw new Error(authData?.error || 'Login failed.')
-      }
-
-      const userId = authData.user.userId
-      if (!userId) throw new Error('Login failed.')
-      const sessionToken = authData.accessToken || ''
-      resolvedType = authData.user.userType || resolvedType
-      resolvedCustomId = authData.user.customId || resolvedCustomId
-      resolvedName = authData.user.name || resolvedName
-
-      await setAuth(
-        {
-          userId,
-          email: authData.user.email || resolvedEmail,
-          userType: resolvedType,
-          customId: resolvedCustomId || undefined,
-          name: resolvedName || '',
-          picture: authData.user.picture,
-          provider: authData.user.provider,
-        },
-        sessionToken
-      )
-
-      if (sessionToken) {
-        document.cookie = `sb_access_token=${sessionToken}; path=/; max-age=${60 * 60 * 24 * 7}`
-      }
-      document.cookie = `sb_user_type=${resolvedType}; path=/; max-age=${60 * 60 * 24 * 7}`
-
-      router.push(resolvedType === 'merchant' ? '/merchant-dashboard' : '/locker')
+      await setAuth(result.user, result.token)
+      persistClientAuthCookies(result.token, result.userType)
+      router.push(result.userType === 'merchant' ? '/merchant-dashboard' : '/locker')
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Login failed. Please try again.')
     } finally {
-      setLoading(false)
-    }
-  }
-
-  const handleGoogleSignIn = async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      localStorage.setItem('login_user_type', userType)
-      const authorizeUrl = buildHostedUiAuthorizeUrl(userType)
-      window.location.assign(authorizeUrl)
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Google sign-in failed.')
       setLoading(false)
     }
   }
@@ -659,26 +579,30 @@ export function LandingScreen() {
               families and businesses.
             </p>
 
-
-            <div
-              className={`grid gap-4 sm:grid-cols-4 transition-all duration-700 ${heroPhase >= 4 ? 'translate-y-0 opacity-100' : 'translate-y-6 opacity-0'
-                }`}
-            >
-              <div className="rounded-xl border border-slate-200 bg-white p-4 text-center shadow-soft">
-                <p className="text-3xl font-bold text-blue-600">{countDocs}Lakh+</p>
-                <p className="mt-1 text-sm text-slate-600">Documents Secured</p>
-              </div>
-              <div className="rounded-xl border border-slate-200 bg-white p-4 text-center shadow-soft">
-                <p className="text-3xl font-bold text-blue-600">{countAccuracy}%</p>
-                <p className="mt-1 text-sm text-slate-600">Scan Accuracy</p>
-              </div>
-              <div className="rounded-xl border border-slate-200 bg-white p-4 text-center shadow-soft">
-                <p className="text-3xl font-bold text-blue-600">{countFamilies}+</p>
-                <p className="mt-1 text-sm text-slate-600">Happy Families</p>
-              </div>
-              <div className="rounded-xl border border-slate-200 bg-white p-4 text-center shadow-soft">
-                <p className="text-3xl font-bold text-blue-600">{countStates}</p>
-                <p className="mt-1 text-sm text-slate-600">States Covered</p>
+            <div className={`transition-all duration-700 ${heroPhase >= 4 ? 'translate-y-0 opacity-100' : 'translate-y-6 opacity-0'}`}>
+              <p className="mb-2 text-sm font-semibold uppercase tracking-[0.15em] text-amber-400">Our Ambition</p>
+              <h3 className="mb-5 text-2xl font-bold text-white">Our Ambition to Achieve</h3>
+              <div className="grid gap-4 sm:grid-cols-4">
+                <div className="rounded-xl border border-slate-200 bg-white p-4 text-center shadow-soft">
+                  <p className="text-base font-semibold text-slate-700">To secure</p>
+                  <p className="text-3xl font-bold text-blue-600">10Lakh+</p>
+                  <p className="text-base font-semibold text-slate-700">Documents</p>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-white p-4 text-center shadow-soft">
+                  <p className="text-base font-semibold text-slate-700">To achieve</p>
+                  <p className="text-3xl font-bold text-blue-600">99%</p>
+                  <p className="text-base font-semibold text-slate-700">Accuracy</p>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-white p-4 text-center shadow-soft">
+                  <p className="text-base font-semibold text-slate-700">To make</p>
+                  <p className="text-3xl font-bold text-blue-600">50000+</p>
+                  <p className="text-base font-semibold text-slate-700">Happy Families</p>
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-white p-4 text-center shadow-soft">
+                  <p className="text-base font-semibold text-slate-700">To cover</p>
+                  <p className="text-3xl font-bold text-blue-600">28</p>
+                  <p className="text-base font-semibold text-slate-700">States</p>
+                </div>
               </div>
             </div>
 
@@ -1035,6 +959,8 @@ export function LandingScreen() {
         </div>
       </section>
 
+      <AwsBeamSection />
+
       <section id="articles" className="section-padding relative overflow-hidden bg-[#fafafa]">
         <div className="absolute left-0 top-1/4 h-64 w-64 rounded-full bg-blue-200/30 blur-3xl" />
         <div className="absolute bottom-1/4 right-0 h-48 w-48 rounded-full bg-amber-200/30 blur-3xl" />
@@ -1074,40 +1000,6 @@ export function LandingScreen() {
                 </div>
               </article>
             ))}
-          </div>
-
-          <div className="mt-20">
-            <div className="fade-up mb-12 text-center">
-              <span className="inline-block rounded-full bg-green-100 px-4 py-2 text-base font-medium text-green-700">
-                Happy Users
-              </span>
-              <p className="mt-4 text-sm font-semibold uppercase tracking-[0.15em] text-blue-600">WHAT PEOPLE SAY</p>
-              <h2 className="mt-2 text-3xl font-bold text-slate-900 lg:text-4xl">
-                Trusted by Families
-                <br />
-                Across India
-              </h2>
-            </div>
-
-            <div className="grid gap-8 md:grid-cols-3">
-              {appTestimonials.map((item, index) => (
-                <div
-                  key={item.name}
-                  className="scale-in testimonial-card relative"
-                  style={{ transitionDelay: `${0.1 + index * 0.1}s` }}
-                >
-                  <Quote className="absolute right-6 top-6 h-8 w-8 text-blue-200" />
-                  <div className="mb-4 flex gap-1">
-                    {Array.from({ length: 5 }).map((_, index) => (
-                      <Star key={index} className="h-5 w-5 fill-amber-500 text-amber-500" />
-                    ))}
-                  </div>
-                  <p className="mb-6 text-lg leading-relaxed text-slate-700">&quot;{item.text}&quot;</p>
-                  <p className="font-bold text-slate-900">{item.name}</p>
-                  <p className="text-sm text-slate-500">{item.role}</p>
-                </div>
-              ))}
-            </div>
           </div>
 
           <div id="story" className="fade-up mt-24 border-t border-slate-200 pt-20">
@@ -1186,26 +1078,8 @@ export function LandingScreen() {
             </p>
           </div>
 
-          <div className="grid gap-12 lg:grid-cols-5 lg:gap-16">
-            <div className="space-y-4 lg:col-span-2">
-              <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
-                <p className="mb-1 text-sm font-medium uppercase tracking-wider text-gray-500">Head Office</p>
-                <p className="text-lg font-bold text-gray-900">Bangalore, Karnataka</p>
-                <p className="text-base text-gray-500">Serving all of India</p>
-              </div>
-              <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
-                <p className="mb-1 text-sm font-medium uppercase tracking-wider text-gray-500">Support Helpline</p>
-                <p className="text-lg font-bold text-gray-900">1800-123-4567</p>
-                <p className="text-base text-gray-500">Toll-free across India</p>
-              </div>
-              <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
-                <p className="mb-1 text-sm font-medium uppercase tracking-wider text-gray-500">Email Us</p>
-                <p className="text-lg font-bold text-gray-900">help@safebill.in</p>
-                <p className="text-base text-gray-500">We reply within 24 hours</p>
-              </div>
-            </div>
-
-            <div className="lg:col-span-3">
+          <div className="flex justify-center">
+            <div className="w-full max-w-md">
               <div id="signin-form" className="rounded-2xl border border-gray-200 bg-white p-8 shadow-xl lg:p-10">
                 <div className="mb-6 text-center">
                   <div className="mx-auto mb-3 inline-flex h-14 w-14 items-center justify-center rounded-full bg-blue-100">
@@ -1275,20 +1149,13 @@ export function LandingScreen() {
                   </button>
                 </div>
 
-                <div className="my-4 text-center text-xs uppercase tracking-wider text-slate-400">or</div>
-
-                <button
-                  onClick={handleGoogleSignIn}
-                  disabled={loading}
-                  className="h-11 w-full rounded-xl border border-slate-300 bg-white px-4 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  Continue with Google
-                </button>
-
-                <p className="mt-5 text-center text-sm text-slate-600">
-                  Don&apos;t have an account?{' '}
-                  <button onClick={() => router.push('/signup')} className="font-semibold text-blue-600 hover:text-blue-700">
-                    Create one
+                <p className="mt-4 text-center text-sm text-slate-500">
+                  New here?{' '}
+                  <button
+                    onClick={() => router.push('/signup')}
+                    className="font-semibold text-blue-600 transition hover:text-blue-700"
+                  >
+                    Create a SafeBill account
                   </button>
                 </p>
               </div>
@@ -1298,121 +1165,17 @@ export function LandingScreen() {
       </section>
 
       <footer className="relative bg-gray-900 text-white" role="contentinfo">
-        <div className="container-custom py-16">
-          <div className="grid gap-10 md:grid-cols-2 lg:grid-cols-4 lg:gap-8">
-            <div className="lg:col-span-1">
-              <div className="mb-6 flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-600">
-                  <Shield className="h-6 w-6 text-white" />
-                </div>
-                <div>
-                  <span className="block text-xl font-bold text-white">SafeBill</span>
-                </div>
-              </div>
-              <p className="mb-6 text-base leading-relaxed text-gray-400">
-                India&apos;s most trusted digital warranty locker. Securely store and manage all your bills, invoices,
-                and warranties in one place.
-              </p>
-              <div className="flex gap-3">
-                {[Instagram, Facebook, Twitter, Youtube].map((Icon, index) => (
-                  <button
-                    key={index}
-                    className="flex h-10 w-10 items-center justify-center rounded-full bg-gray-800 text-gray-400 transition-all duration-300 hover:bg-blue-600 hover:text-white"
-                  >
-                    <Icon className="h-5 w-5" />
-                  </button>
-                ))}
-              </div>
+        <div className="px-8 py-16">
+          <div className="flex items-center gap-4 mb-6">
+            <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-blue-600">
+              <Shield className="h-7 w-7 text-white" />
             </div>
-
-            <nav aria-label="Product links">
-              <h3 className="mb-5 text-lg font-bold text-white">Product</h3>
-              <ul className="space-y-3 text-base text-gray-400">
-                <li><button onClick={() => scrollToSection('powerful-features')} className="hover:text-blue-400 transition-colors">Features</button></li>
-                <li><button onClick={() => scrollToSection('how-it-works')} className="hover:text-blue-400 transition-colors">How It Works</button></li>
-                <li><button onClick={() => scrollToSection('articles')} className="hover:text-blue-400 transition-colors">For Families</button></li>
-                <li><button onClick={() => scrollToSection('security')} className="hover:text-blue-400 transition-colors">For Business</button></li>
-                <li><button className="hover:text-blue-400 transition-colors">Pricing</button></li>
-              </ul>
-            </nav>
-
-            <nav aria-label="Company links">
-              <h3 className="mb-5 text-lg font-bold text-white">Company</h3>
-              <ul className="space-y-3 text-base text-gray-400">
-                <li><button className="hover:text-blue-400 transition-colors">About Us</button></li>
-                <li><button className="hover:text-blue-400 transition-colors">Careers</button></li>
-                <li><button className="hover:text-blue-400 transition-colors">Press</button></li>
-                <li><button onClick={() => scrollToSection('signin')} className="hover:text-blue-400 transition-colors">Contact</button></li>
-                <li><button className="hover:text-blue-400 transition-colors">Blog</button></li>
-              </ul>
-            </nav>
-
-            <div>
-              <h3 className="mb-5 text-lg font-bold text-white">Contact Us</h3>
-              <ul className="space-y-4">
-                <li className="flex items-start gap-3">
-                  <MapPin className="mt-0.5 h-5 w-5 flex-shrink-0 text-blue-500" />
-                  <span className="text-base text-gray-400">Bangalore, India</span>
-                </li>
-                <li className="flex items-start gap-3">
-                  <Phone className="mt-0.5 h-5 w-5 flex-shrink-0 text-blue-500" />
-                  <span className="text-base text-gray-400">1800-123-4567</span>
-                </li>
-                <li className="flex items-start gap-3">
-                  <Mail className="mt-0.5 h-5 w-5 flex-shrink-0 text-blue-500" />
-                  <span className="text-base text-gray-400">help@safebill.in</span>
-                </li>
-              </ul>
-
-              <div className="mt-6 border-t border-gray-800 pt-6">
-                <p className="mb-3 text-base text-gray-400">Subscribe for tips and updates</p>
-                {newsletterStatus === 'success' ? (
-                  <div className="flex items-center gap-2 text-base text-green-400">
-                    <CheckCircle className="h-5 w-5" />
-                    <span>Thanks for subscribing!</span>
-                  </div>
-                ) : (
-                  <form onSubmit={handleNewsletter} className="flex gap-2">
-                    <input
-                      type="email"
-                      value={newsletterEmail}
-                      onChange={(e) => setNewsletterEmail(e.target.value)}
-                      placeholder="Enter your email address"
-                      className="flex-1 rounded-lg border border-gray-700 bg-gray-800 px-4 py-3 text-base text-white placeholder-gray-500 focus:border-blue-500 focus:outline-none"
-                    />
-                    <button type="submit" className="rounded-lg bg-blue-600 px-5 py-3 text-base font-medium text-white hover:bg-blue-700">
-                      Subscribe
-                    </button>
-                  </form>
-                )}
-                {newsletterStatus === 'error' && <p className="mt-2 text-sm text-red-400">Subscription failed. Please try again.</p>}
-              </div>
-            </div>
+            <span className="text-3xl font-bold text-white">SafeBill</span>
           </div>
-        </div>
-
-        <div className="border-t border-gray-800">
-          <div className="container-custom flex flex-col items-center justify-between gap-4 py-6 md:flex-row">
-            <div className="flex flex-wrap items-center justify-center gap-4 text-sm text-gray-500">
-              <span>© 2025 SafeBill Technologies Pvt. Ltd. All rights reserved.</span>
-              <span className="hidden md:inline">|</span>
-              <button className="hover:text-blue-400 transition-colors">Privacy Policy</button>
-              <span className="hidden md:inline">|</span>
-              <button className="hover:text-blue-400 transition-colors">Terms of Service</button>
-              <span className="hidden md:inline">|</span>
-              <button className="hover:text-blue-400 transition-colors">Cookie Policy</button>
-            </div>
-
-            <button
-              onClick={scrollToTop}
-              className="group flex items-center gap-2 text-base text-gray-400 transition-colors hover:text-blue-400"
-            >
-              <span>Back to top</span>
-              <div className="flex h-10 w-10 items-center justify-center rounded-full border border-gray-700 transition-all duration-300 group-hover:border-blue-500 group-hover:bg-blue-500">
-                <ArrowUp className="h-5 w-5" />
-              </div>
-            </button>
-          </div>
+          <p className="text-xl leading-relaxed text-gray-300 max-w-xl">
+            India&apos;s most trusted digital warranty locker. Securely store and manage all your bills, invoices,
+            and warranties in one place.
+          </p>
         </div>
       </footer>
     </div>

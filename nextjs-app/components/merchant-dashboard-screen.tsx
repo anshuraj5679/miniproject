@@ -908,7 +908,7 @@ export function MerchantDashboardScreen() {
         <div className="mt-auto border-t border-white/10 p-4">
           <div className="rounded-3xl bg-white/8 p-4 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.06)]">
             <p className="text-sm font-semibold">{user.name || 'Merchant'}</p>
-            <p className="mt-1 truncate text-xs text-blue-100/55">{user.customId || user.email}</p>
+            <p className="mt-1 truncate text-xs text-blue-100/55">{user.customId || user.phone || user.email || user.loginId}</p>
           </div>
           <div className="mt-4 space-y-1.5">
             <SidebarNavItem icon={Settings} label="Settings" active={false} onClick={() => router.push('/settings')} />
@@ -967,7 +967,7 @@ export function MerchantDashboardScreen() {
               </div>
               <div>
                 <p className="text-sm font-semibold text-slate-900">{user.name || 'Merchant'}</p>
-                <p className="text-xs text-slate-500">{user.customId || user.email}</p>
+                <p className="text-xs text-slate-500">{user.customId || user.phone || user.email || user.loginId}</p>
               </div>
             </div>
           </div>

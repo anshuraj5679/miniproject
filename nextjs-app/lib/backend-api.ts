@@ -157,6 +157,49 @@ export async function backendApiFetch<T>(
   }
 }
 
+export async function backendPublicApiFetch<T>(
+  path: string,
+  init: RequestInit = {},
+  requestTimeoutMs: number = timeoutMs
+): Promise<T> {
+  const controller = new AbortController()
+  const timeoutHandle = setTimeout(() => controller.abort(), requestTimeoutMs)
+
+  try {
+    let response: Response
+    try {
+      response = await fetch(`${backendBaseUrl}${path}`, {
+        ...init,
+        headers: buildHeaders(init.body, init.headers, ''),
+        cache: 'no-store',
+        signal: controller.signal,
+      })
+    } catch (error) {
+      const isAbortError =
+        error instanceof Error &&
+        (error.name === 'AbortError' || controller.signal.aborted)
+      if (isAbortError) {
+        throw new BackendApiError(
+          `Backend request timed out after ${requestTimeoutMs}ms`,
+          504,
+          { detail: 'Gateway Timeout' }
+        )
+      }
+      throw error
+    }
+
+    const payload = await parseResponse(response)
+    if (!response.ok) {
+      const message = toErrorMessage(payload) || `Backend request failed with status ${response.status}`
+      throw new BackendApiError(message, response.status, payload)
+    }
+
+    return payload as T
+  } finally {
+    clearTimeout(timeoutHandle)
+  }
+}
+
 function parseBearerToken(value: string | null): string | null {
   if (!value) return null
   const trimmed = value.trim()

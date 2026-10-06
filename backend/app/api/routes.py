@@ -527,14 +527,30 @@ def _list_cognito_users_by_custom_id(
     custom_id: str,
 ) -> list[dict[str, object]]:
     escaped = custom_id.replace('"', '\\"')
-    filter_expression = f'custom:custom_id = "{escaped}"'
-    try:
-        response = client.list_users(UserPoolId=user_pool_id, Filter=filter_expression, Limit=20)
-        users = response.get("Users", [])
-        if isinstance(users, list):
-            return [user for user in users if isinstance(user, dict)]
-    except Exception:
-        pass
+    filter_expressions = [
+        f'custom:custom_id = "{escaped}"',
+        f'preferred_username = "{escaped}"',
+    ]
+    matched_by_filter: list[dict[str, object]] = []
+    seen_usernames: set[str] = set()
+    for filter_expression in filter_expressions:
+        try:
+            response = client.list_users(UserPoolId=user_pool_id, Filter=filter_expression, Limit=20)
+            users = response.get("Users", [])
+            if not isinstance(users, list):
+                continue
+            for user in users:
+                if not isinstance(user, dict):
+                    continue
+                username = str(user.get("Username") or "").strip()
+                if username and username not in seen_usernames:
+                    seen_usernames.add(username)
+                    matched_by_filter.append(user)
+        except Exception:
+            continue
+
+    if matched_by_filter:
+        return matched_by_filter
 
     # Fallback for pools where custom-attribute filtering is unavailable.
     matched: list[dict[str, object]] = []
@@ -550,13 +566,107 @@ def _list_cognito_users_by_custom_id(
                 if not isinstance(user, dict):
                     continue
                 attrs = _cognito_attr_map(user)
-                if attrs.get("custom:custom_id", "").strip().upper() == custom_id.upper():
+                stored_custom_id = str(
+                    attrs.get("custom:custom_id") or attrs.get("preferred_username") or ""
+                ).strip().upper()
+                if stored_custom_id == custom_id.upper():
                     matched.append(user)
         token_value = response.get("PaginationToken")
         pagination_token = str(token_value).strip() if token_value else None
         if not pagination_token:
             break
     return matched
+
+
+def _user_type_from_custom_id(custom_id: str) -> str | None:
+    normalized = str(custom_id or "").strip().upper()
+    if normalized.startswith("MER-"):
+        return "merchant"
+    if normalized.startswith("CON-"):
+        return "consumer"
+    return None
+
+
+def _should_try_next_cognito_password_flow(exc: Exception) -> bool:
+    message = str(exc).strip().lower()
+    if not message:
+        return False
+    retry_markers = (
+        "flow not enabled",
+        "not enabled for this client",
+        "invalid choice for authflow",
+        "unknown operation exception",
+        "accessdenied",
+        "access denied",
+        "admininitiateauth",
+    )
+    return any(marker in message for marker in retry_markers)
+
+
+def _cognito_password_login_response(
+    *,
+    client: object,
+    user_pool_id: str,
+    client_id: str,
+    username: str,
+    password: str,
+    secret_hash: str | None = None,
+) -> dict[str, object]:
+    auth_parameters = {
+        "USERNAME": username,
+        "PASSWORD": password,
+    }
+    if secret_hash:
+        auth_parameters["SECRET_HASH"] = secret_hash
+
+    flow_attempts: list[tuple[str, dict[str, object]]] = [
+        (
+            "admin_initiate_auth",
+            {
+                "UserPoolId": user_pool_id,
+                "ClientId": client_id,
+                "AuthFlow": "ADMIN_USER_PASSWORD_AUTH",
+                "AuthParameters": auth_parameters,
+            },
+        ),
+        (
+            "admin_initiate_auth",
+            {
+                "UserPoolId": user_pool_id,
+                "ClientId": client_id,
+                "AuthFlow": "ADMIN_NO_SRP_AUTH",
+                "AuthParameters": auth_parameters,
+            },
+        ),
+        (
+            "initiate_auth",
+            {
+                "ClientId": client_id,
+                "AuthFlow": "USER_PASSWORD_AUTH",
+                "AuthParameters": auth_parameters,
+            },
+        ),
+    ]
+
+    last_error: Exception | None = None
+    for index, (method_name, params) in enumerate(flow_attempts):
+        method = getattr(client, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            response = method(**params)
+        except Exception as exc:
+            last_error = exc
+            should_retry = index < len(flow_attempts) - 1 and _should_try_next_cognito_password_flow(exc)
+            if should_retry:
+                continue
+            raise
+        if isinstance(response, dict):
+            return response
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Cognito password login is unavailable")
 
 
 def _safe_session_commit(db: Session) -> None:
@@ -661,27 +771,91 @@ def lookup_user_by_custom_id(payload: dict[str, object]) -> dict[str, object]:
 
     for user in users:
         attrs = _cognito_attr_map(user)
+        resolved_custom_id = str(
+            attrs.get("custom:custom_id") or attrs.get("preferred_username") or custom_id
+        ).strip().upper()
         discovered_type = str(attrs.get("custom:user_type") or "").strip().lower()
+        if discovered_type not in {"consumer", "merchant"}:
+            discovered_type = _user_type_from_custom_id(resolved_custom_id) or ""
         if discovered_type and discovered_type != requested_type:
             continue
 
         email = str(attrs.get("email") or "").strip().lower()
-        if not email:
+        phone = str(attrs.get("phone_number") or "").strip()
+        username = str(user.get("Username") or "").strip()
+        if not username:
             continue
         full_name = str(attrs.get("name") or attrs.get("given_name") or "").strip()
         user_sub = str(attrs.get("sub") or "").strip()
-        resolved_custom_id = str(attrs.get("custom:custom_id") or custom_id).strip().upper()
         resolved_type = discovered_type if discovered_type in {"consumer", "merchant"} else requested_type
 
         return {
             "userId": user_sub,
+            "username": username,
             "email": email,
+            "phone": phone,
             "fullName": full_name,
             "userType": resolved_type,
             "customId": resolved_custom_id,
         }
 
     raise HTTPException(status_code=404, detail="Account not found")
+
+
+@router.post("/auth/cognito/login")
+def cognito_password_login(payload: dict[str, object]) -> dict[str, object]:
+    settings = get_settings()
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    secret_hash = str(payload.get("secretHash") or "").strip() or None
+
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password are required")
+    if not settings.cognito_user_pool_id:
+        raise HTTPException(status_code=500, detail="COGNITO_USER_POOL_ID is not configured")
+    if not settings.cognito_app_client_id:
+        raise HTTPException(status_code=500, detail="COGNITO_APP_CLIENT_ID is not configured")
+    if boto3 is None:
+        raise HTTPException(status_code=500, detail="boto3 dependency is unavailable")
+
+    try:
+        client = boto3.client("cognito-idp", region_name=settings.aws_region)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to initialize Cognito client: {exc}") from exc
+
+    try:
+        response = _cognito_password_login_response(
+            client=client,
+            user_pool_id=settings.cognito_user_pool_id,
+            client_id=settings.cognito_app_client_id,
+            username=username,
+            password=password,
+            secret_hash=secret_hash,
+        )
+    except Exception as exc:
+        detail = str(exc).strip() or "Cognito login failed"
+        lowered = detail.lower()
+        if "not authorized" in lowered or "incorrect username or password" in lowered:
+            raise HTTPException(status_code=401, detail=detail) from exc
+        if "user is not confirmed" in lowered or "usernotconfirmedexception" in lowered:
+            raise HTTPException(status_code=400, detail=detail) from exc
+        if "password reset required" in lowered:
+            raise HTTPException(status_code=400, detail=detail) from exc
+        raise HTTPException(status_code=500, detail=detail) from exc
+
+    auth_result = response.get("AuthenticationResult")
+    challenge_name = str(response.get("ChallengeName") or "").strip() or None
+    session = str(response.get("Session") or "").strip() or None
+    auth_result_map = auth_result if isinstance(auth_result, dict) else {}
+
+    return {
+        "accessToken": str(auth_result_map.get("AccessToken") or "").strip() or None,
+        "idToken": str(auth_result_map.get("IdToken") or "").strip() or None,
+        "refreshToken": str(auth_result_map.get("RefreshToken") or "").strip() or None,
+        "expiresIn": auth_result_map.get("ExpiresIn"),
+        "challengeName": challenge_name,
+        "session": session,
+    }
 
 
 def _coerce_date(value: object) -> date | None:

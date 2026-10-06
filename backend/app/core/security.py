@@ -50,6 +50,12 @@ def _extract_user_type(claims: dict[str, Any]) -> str | None:
     if cognito_custom in {"consumer", "merchant"}:
         return cognito_custom
 
+    preferred_username = str(claims.get("preferred_username") or "").strip().upper()
+    if preferred_username.startswith("MER-"):
+        return "merchant"
+    if preferred_username.startswith("CON-"):
+        return "consumer"
+
     cognito_groups = claims.get("cognito:groups")
     if isinstance(cognito_groups, list):
         lowered_groups = {str(group).strip().lower() for group in cognito_groups}

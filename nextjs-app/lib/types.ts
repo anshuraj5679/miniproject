@@ -202,7 +202,9 @@ export interface ChatSource {
 
 export interface User {
   userId: string;
-  email: string;
+  email?: string;
+  phone?: string;
+  loginId?: string;
   name?: string;
   userType?: UserType;
   customId?: string;

@@ -117,6 +117,8 @@ Resources:
                 - bedrock:InvokeModel
                 - textract:DetectDocumentText
                 - textract:AnalyzeExpense
+                - cognito-idp:AdminInitiateAuth
+                - cognito-idp:InitiateAuth
                 - cognito-idp:ListUsers
                 - ses:SendEmail
                 - ses:SendRawEmail

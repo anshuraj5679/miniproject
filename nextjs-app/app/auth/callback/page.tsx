@@ -163,7 +163,8 @@ function AuthCallbackContent() {
           throw fetchError
         })
         const exchangeData = (await exchangeResponse.json().catch(() => null)) as (CognitoAuthResult & { error?: string }) | null
-        if (!exchangeResponse.ok || !exchangeData?.accessToken || !exchangeData.user?.userId) {
+        const sessionToken = String(exchangeData?.idToken || exchangeData?.accessToken || '').trim()
+        if (!exchangeResponse.ok || !sessionToken || !exchangeData?.user?.userId) {
           const exchangeError = String(exchangeData?.error || 'Authentication failed').trim()
           if (hasSessionToken()) {
             sessionStorage.setItem(lockKey, 'done')
@@ -178,16 +179,18 @@ function AuthCallbackContent() {
           {
             userId: exchangeData.user.userId,
             email: exchangeData.user.email,
+            phone: exchangeData.user.phone,
+            loginId: exchangeData.user.loginId,
             name: exchangeData.user.name,
             userType: exchangeData.user.userType,
             customId: exchangeData.user.customId,
             picture: exchangeData.user.picture,
             provider: exchangeData.user.provider,
           },
-          exchangeData.accessToken
+          sessionToken
         )
 
-        document.cookie = `sb_access_token=${exchangeData.accessToken}; path=/; max-age=${60 * 60 * 24 * 7}`
+        document.cookie = `sb_access_token=${sessionToken}; path=/; max-age=${60 * 60 * 24 * 7}`
         document.cookie = `sb_user_type=${exchangeData.user.userType}; path=/; max-age=${60 * 60 * 24 * 7}`
         if (typeof window !== 'undefined') sessionStorage.setItem(lockKey, 'done')
 

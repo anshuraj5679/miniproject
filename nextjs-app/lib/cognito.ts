@@ -12,7 +12,9 @@ export interface CognitoConfig {
 
 export interface CognitoAuthUser {
   userId: string
-  email: string
+  email?: string
+  phone?: string
+  loginId?: string
   name: string
   userType: UserType
   customId?: string
@@ -26,6 +28,15 @@ export interface CognitoAuthResult {
   refreshToken?: string
   expiresIn?: number
   user: CognitoAuthUser
+}
+
+export type AuthContactType = 'email' | 'phone'
+
+export interface NormalizedAuthContact {
+  type: AuthContactType
+  value: string
+  email?: string
+  phone?: string
 }
 
 function requireValue(value: string | undefined, key: string): string {
@@ -121,15 +132,77 @@ function safeString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
+function inferUserTypeFromValue(value: string | undefined): UserType | undefined {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return undefined
+  if (normalized === 'merchant' || normalized.startsWith('mer-')) return 'merchant'
+  if (normalized === 'consumer' || normalized.startsWith('con-')) return 'consumer'
+  return undefined
+}
+
+export function normalizeEmailAddress(value: string): string {
+  return value.trim().toLowerCase()
+}
+
+export function normalizePhoneNumber(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) {
+    throw new Error('Phone number is required')
+  }
+
+  const hasPlusPrefix = trimmed.startsWith('+')
+  const digitsOnly = trimmed.replace(/\D/g, '')
+  if (!digitsOnly) {
+    throw new Error('Phone number is invalid')
+  }
+
+  let normalized = digitsOnly
+  if (hasPlusPrefix) {
+    normalized = `+${digitsOnly}`
+  } else if (digitsOnly.length === 10) {
+    normalized = `+91${digitsOnly}`
+  } else if (digitsOnly.length >= 11 && digitsOnly.length <= 15) {
+    normalized = `+${digitsOnly}`
+  } else {
+    throw new Error('Phone number must include a valid country code')
+  }
+
+  const normalizedDigits = normalized.replace(/\D/g, '')
+  if (normalizedDigits.length < 10 || normalizedDigits.length > 15) {
+    throw new Error('Phone number must be between 10 and 15 digits')
+  }
+
+  return normalized
+}
+
+export function normalizeAuthContact(value: string): NormalizedAuthContact {
+  const trimmed = value.trim()
+  if (!trimmed) {
+    throw new Error('Email or phone number is required')
+  }
+
+  if (trimmed.includes('@')) {
+    const email = normalizeEmailAddress(trimmed)
+    const isValidEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+    if (!isValidEmail) {
+      throw new Error('Enter a valid email address')
+    }
+    return { type: 'email', value: email, email }
+  }
+
+  const phone = normalizePhoneNumber(trimmed)
+  return { type: 'phone', value: phone, phone }
+}
+
 export function extractUserTypeFromClaims(claims: Record<string, unknown>): UserType {
   const claimCandidates = [
     safeString(claims['custom:user_type']),
     safeString(claims['user_type']),
+    safeString(claims.preferred_username),
   ]
   for (const candidate of claimCandidates) {
-    const normalized = candidate.toLowerCase()
-    if (normalized === 'merchant') return 'merchant'
-    if (normalized === 'consumer') return 'consumer'
+    const inferred = inferUserTypeFromValue(candidate)
+    if (inferred) return inferred
   }
 
   const groups = claims['cognito:groups']
@@ -144,30 +217,58 @@ export function extractUserTypeFromClaims(claims: Record<string, unknown>): User
 
 export function extractAuthUserFromClaims(
   claims: Record<string, unknown>,
-  fallback: { userType?: UserType; customId?: string; name?: string; email?: string } = {}
+  fallback: {
+    userType?: UserType
+    customId?: string
+    name?: string
+    email?: string
+    phone?: string
+    loginId?: string
+  } = {}
 ): CognitoAuthUser {
-  const email = safeString(claims.email) || safeString(fallback.email)
+  const email = safeString(claims.email) || safeString(fallback.email) || undefined
+  const phone = safeString(claims.phone_number) || safeString(fallback.phone) || undefined
   const userId = safeString(claims.sub)
+  const loginId =
+    safeString(fallback.loginId) ||
+    safeString(claims['cognito:username']) ||
+    email ||
+    phone ||
+    undefined
   const name =
     safeString(claims.name) ||
     safeString(claims.given_name) ||
     safeString(fallback.name) ||
-    (email.includes('@') ? email.split('@')[0] || 'User' : 'User')
-  const customId = safeString(claims['custom:custom_id']) || safeString(fallback.customId) || undefined
+    ((email || phone || '').includes('@') ? (email || '').split('@')[0] || 'User' : 'User')
+  const customId =
+    safeString(claims['custom:custom_id']) ||
+    safeString(claims.preferred_username) ||
+    safeString(fallback.customId) ||
+    undefined
   const picture = safeString(claims.picture) || undefined
   const provider = safeString(claims.identities) || safeString(claims['cognito:username']) || undefined
-  const userType = extractUserTypeFromClaims(claims)
+  const explicitUserType =
+    inferUserTypeFromValue(safeString(claims['custom:user_type'])) ||
+    inferUserTypeFromValue(safeString(claims['user_type'])) ||
+    inferUserTypeFromValue(safeString(claims.preferred_username))
+  const groups = claims['cognito:groups']
+  const groupUserType = Array.isArray(groups)
+    ? groups.map((group) => inferUserTypeFromValue(safeString(group))).find(Boolean)
+    : undefined
+  const userType = explicitUserType || groupUserType || inferUserTypeFromValue(customId) || fallback.userType || 'consumer'
 
   if (!userId) {
     throw new Error('Missing user id in Cognito token')
   }
-  if (!email) {
-    throw new Error('Missing email in Cognito token')
+  if (!email && !phone && !loginId) {
+    throw new Error('Missing login identifier in Cognito token')
   }
 
   return {
     userId,
     email,
+    phone,
+    loginId,
     name,
     userType,
     customId,
