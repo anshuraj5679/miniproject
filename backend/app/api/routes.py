@@ -4112,7 +4112,7 @@ async def ingest_pdf(
         _is_meaningful_metadata_value(parsed_metadata.get(key))
         for key in ("bill_id", "vendor", "total_amount", "date")
     )
-    if resolved_pdf_text and not has_invoice_signals:
+    if resolved_pdf_text:
         classification = _classify_document_with_bedrock(resolved_pdf_text, file.filename)
         doc_is_invoice = classification.get("is_invoice") if classification else None
         doc_confidence = _coerce_float(classification.get("confidence"), default=0.0) if classification else 0.0
@@ -4126,7 +4126,7 @@ async def ingest_pdf(
         if doc_is_invoice is None or doc_is_invoice is False:
             if not is_allowed_doc_type:
                 heuristic_is_invoice, heuristic_confidence = _heuristic_is_invoice_document(resolved_pdf_text)
-                if not heuristic_is_invoice and heuristic_confidence >= 0.75:
+                if not heuristic_is_invoice and heuristic_confidence >= 0.8:
                     raise HTTPException(
                         status_code=422,
                         detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
@@ -4505,27 +4505,24 @@ async def ingest_image(
             ),
         )
 
-    if not has_invoice_signals:
-        classification = _classify_document_with_bedrock(resolved_ocr_text, filename)
-        doc_is_invoice = classification.get("is_invoice") if classification else None
-        doc_confidence = _coerce_float(classification.get("confidence"), default=0.0) if classification else 0.0
-        doc_type = str(classification.get("document_type") or "").strip().lower() if classification else ""
-        is_allowed_doc_type = doc_type in {"warranty_card", "guarantee_card"}
-        if doc_is_invoice is False and not is_allowed_doc_type and doc_confidence >= 0.75:
-            raise HTTPException(
-                status_code=422,
-                detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
-            )
-        if doc_is_invoice is None or doc_is_invoice is False:
-            if is_allowed_doc_type:
-                pass
-            else:
-                heuristic_is_invoice, heuristic_confidence = _heuristic_is_invoice_document(resolved_ocr_text)
-                if not heuristic_is_invoice and heuristic_confidence >= 0.75:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
-                    )
+    classification = _classify_document_with_bedrock(resolved_ocr_text, filename)
+    doc_is_invoice = classification.get("is_invoice") if classification else None
+    doc_confidence = _coerce_float(classification.get("confidence"), default=0.0) if classification else 0.0
+    doc_type = str(classification.get("document_type") or "").strip().lower() if classification else ""
+    is_allowed_doc_type = doc_type in {"warranty_card", "guarantee_card"}
+    if doc_is_invoice is False and not is_allowed_doc_type and doc_confidence >= 0.75:
+        raise HTTPException(
+            status_code=422,
+            detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+        )
+    if doc_is_invoice is None or doc_is_invoice is False:
+        if not is_allowed_doc_type:
+            heuristic_is_invoice, heuristic_confidence = _heuristic_is_invoice_document(resolved_ocr_text)
+            if not heuristic_is_invoice and heuristic_confidence >= 0.8:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+                )
     if not has_invoice_signals:
         raise HTTPException(
             status_code=422,
