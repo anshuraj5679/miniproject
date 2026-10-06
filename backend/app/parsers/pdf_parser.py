@@ -26,10 +26,10 @@ try:
 except Exception:  # pragma: no cover - optional runtime dependency
     pytesseract = None
 
-try:
-    from unstructured.partition.pdf import partition_pdf
-except Exception:  # pragma: no cover - optional runtime dependency
-    partition_pdf = None
+# NOTE: `unstructured` (and its inference stack) is heavy and can add minutes
+# of import time on cold starts. Keep it lazily imported inside
+# `_partition_sections()` so the API can bind its port quickly when
+# `USE_UNSTRUCTURED_PARTITION=false` (the default).
 
 from app.core.config import get_settings
 
@@ -621,13 +621,16 @@ def _ocr_page_text(page: pdfplumber.page.Page) -> str:
 
 
 def _partition_sections(file_bytes: bytes) -> list[PageSection]:
-    if partition_pdf is None:
+    try:
+        # Lazily import to avoid heavy startup costs unless enabled via config.
+        from unstructured.partition.pdf import partition_pdf as _partition_pdf
+    except Exception:
         return []
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
     try:
-        elements = partition_pdf(filename=tmp_path, strategy="hi_res", infer_table_structure=True)
+        elements = _partition_pdf(filename=tmp_path, strategy="hi_res", infer_table_structure=True)
     except Exception:
         return []
     finally:
