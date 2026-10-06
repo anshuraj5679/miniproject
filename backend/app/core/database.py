@@ -19,6 +19,12 @@ def _build_engine_url(raw_url: str) -> str:
     if driver not in {"postgresql", "postgres"}:
         return raw_url
 
+    # Render and other providers often supply DATABASE_URL as `postgres://...` or
+    # `postgresql://...` without a specific DBAPI driver. We ship `psycopg`
+    # (not psycopg2), so normalize to the psycopg driver to avoid runtime errors.
+    if "+" not in url.drivername:
+        url = url.set(drivername="postgresql+psycopg")
+
     query = dict(url.query)
     if "connect_timeout" not in query:
         # Keep request latency predictable when DB host is unreachable.
