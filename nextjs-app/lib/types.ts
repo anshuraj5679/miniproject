@@ -107,6 +107,7 @@ export interface Document {
   assignedByMerchantName?: string;
   assignedByMerchantCustomId?: string;
   consumerCustomId?: string;
+  totalAmount?: number;
   taxableAmount?: number;
   gstAmount?: number;
   gstRate?: number;

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { backendApiFetch } from '@/lib/backend-api'
+import { backendApiFetch, resolveRequestAuthToken } from '@/lib/backend-api'
 
 export const runtime = 'nodejs'
 
@@ -10,6 +10,7 @@ interface LookupRequestBody {
 
 export async function POST(request: NextRequest) {
   try {
+    const authToken = resolveRequestAuthToken(request)
     const body = (await request.json()) as LookupRequestBody
     const customId = String(body.customId || '').trim().toUpperCase()
     const userType = String(body.userType || '').trim().toLowerCase()
@@ -29,7 +30,7 @@ export async function POST(request: NextRequest) {
     }>('/auth/lookup-id', {
       method: 'POST',
       body: JSON.stringify({ customId, userType }),
-    })
+    }, undefined, authToken)
 
     return NextResponse.json({
       userId: payload.userId,
