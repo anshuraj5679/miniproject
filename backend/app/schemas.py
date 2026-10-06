@@ -269,6 +269,9 @@ class DocumentView(BaseModel):
     assignedByMerchantName: str | None = None
     assignedByMerchantCustomId: str | None = None
     consumerCustomId: str | None = None
+    assignmentStatus: str | None = None
+    assignmentAcceptedAt: str | None = None
+    assignmentEscalatedAt: str | None = None
     totalAmount: float | None = None
     taxableAmount: float | None = None
     gstAmount: float | None = None

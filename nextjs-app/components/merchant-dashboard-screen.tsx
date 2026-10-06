@@ -33,7 +33,7 @@ import {
 } from 'lucide-react'
 import { apiClient } from '@/lib/api-client'
 import { useAuthStore } from '@/lib/store/auth-store'
-import type { Document, InAppNotification, MerchantActivity, MerchantAssignmentAudit } from '@/lib/types'
+import type { Document, ExtractionReview, InAppNotification, MerchantActivity, MerchantAssignmentAudit } from '@/lib/types'
 
 type WorkspaceTab = 'upload' | 'manual' | 'reassign'
 type NavigationMode = 'workspace' | 'activity'
@@ -78,6 +78,16 @@ interface MerchantUploadResponse {
 
 interface MerchantManualResponse {
   document?: Document
+}
+
+interface ReviewDraft {
+  bill_id: string
+  vendor: string
+  date: string
+  total_amount: string
+  product_name: string
+  serial_number: string
+  notes: string
 }
 
 function normalizeConsumerId(value: string): string {
@@ -169,6 +179,34 @@ function formatAssignmentSource(source?: string | null): string {
   const normalized = String(source || '').trim().replace(/[_-]+/g, ' ')
   if (!normalized) return 'manual action'
   return normalized.charAt(0).toUpperCase() + normalized.slice(1)
+}
+
+function normalizeReviewDraft(review: ExtractionReview | null): ReviewDraft {
+  const extracted = review?.extractedFields || {}
+  const confirmed = review?.confirmedFields || {}
+  const preferred = (key: string): unknown => confirmed[key] ?? extracted[key]
+  return {
+    bill_id: String(preferred('bill_id') || ''),
+    vendor: String(preferred('vendor') || ''),
+    date: String(preferred('date') || ''),
+    total_amount: preferred('total_amount') == null ? '' : String(preferred('total_amount')),
+    product_name: String(preferred('product_name') || ''),
+    serial_number: String(preferred('serial_number') || ''),
+    notes: String(review?.reviewNotes || ''),
+  }
+}
+
+function formatReviewFieldLabel(key: keyof ReviewDraft): string {
+  const labels: Record<keyof ReviewDraft, string> = {
+    bill_id: 'Invoice No',
+    vendor: 'Vendor',
+    date: 'Purchase Date',
+    total_amount: 'Total Amount',
+    product_name: 'Product Name',
+    serial_number: 'Serial Number',
+    notes: 'Review Notes',
+  }
+  return labels[key]
 }
 
 function buildClientAuthHeaders(): HeadersInit | undefined {
@@ -323,6 +361,8 @@ export function MerchantDashboardScreen() {
   const [documents, setDocuments] = useState<Document[]>([])
   const [recentActivity, setRecentActivity] = useState<MerchantActivity[]>([])
   const [assignmentAudits, setAssignmentAudits] = useState<MerchantAssignmentAudit[]>([])
+  const [unreadNotifications, setUnreadNotifications] = useState<InAppNotification[]>([])
+  const [extractionReviews, setExtractionReviews] = useState<ExtractionReview[]>([])
   const [notificationCount, setNotificationCount] = useState(0)
   const [workspaceLoading, setWorkspaceLoading] = useState(false)
   const [workspaceError, setWorkspaceError] = useState<string | null>(null)
@@ -335,8 +375,20 @@ export function MerchantDashboardScreen() {
 
   const [inventoryQuery, setInventoryQuery] = useState('')
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null)
+  const [selectedReviewId, setSelectedReviewId] = useState<string | null>(null)
   const [assignBusyDocId, setAssignBusyDocId] = useState<string | null>(null)
   const [assignNotice, setAssignNotice] = useState<ActionNotice | null>(null)
+  const [reviewDraft, setReviewDraft] = useState<ReviewDraft>({
+    bill_id: '',
+    vendor: '',
+    date: '',
+    total_amount: '',
+    product_name: '',
+    serial_number: '',
+    notes: '',
+  })
+  const [reviewSaveLoading, setReviewSaveLoading] = useState(false)
+  const [reviewNotice, setReviewNotice] = useState<ActionNotice | null>(null)
 
   const [uploadFile, setUploadFile] = useState<File | null>(null)
   const [uploadForm, setUploadForm] = useState<UploadFormState>({
@@ -411,7 +463,7 @@ export function MerchantDashboardScreen() {
     setWorkspaceLoading(true)
     setWorkspaceError(null)
 
-    const [documentsResult, activityResult, notificationsResult, auditsResult] = await Promise.allSettled([
+    const [documentsResult, activityResult, notificationsResult, auditsResult, reviewsResult] = await Promise.allSettled([
       apiClient.get<{ documents: Document[] }>('/documents', {
         params: { merchantUserId: user.userId, limit: 200 },
       }),
@@ -424,6 +476,9 @@ export function MerchantDashboardScreen() {
       apiClient.get<{ assignments: MerchantAssignmentAudit[] }>('/merchant/assignment-audits', {
         params: { merchantUserId: user.userId, limit: 50 },
       }),
+      apiClient.get<{ reviews: ExtractionReview[] }>('/extraction-reviews', {
+        params: { merchantUserId: user.userId, status: 'pending', limit: 50 },
+      }),
     ])
 
     if (documentsResult.status === 'fulfilled') {
@@ -433,17 +488,23 @@ export function MerchantDashboardScreen() {
       setRecentActivity(activityResult.value.activities || [])
     }
     if (notificationsResult.status === 'fulfilled') {
-      setNotificationCount((notificationsResult.value.notifications || []).length)
+      const notifications = notificationsResult.value.notifications || []
+      setUnreadNotifications(notifications)
+      setNotificationCount(notifications.length)
     }
     if (auditsResult.status === 'fulfilled') {
       setAssignmentAudits(auditsResult.value.assignments || [])
+    }
+    if (reviewsResult.status === 'fulfilled') {
+      setExtractionReviews(reviewsResult.value.reviews || [])
     }
 
     if (
       documentsResult.status === 'rejected' &&
       activityResult.status === 'rejected' &&
       notificationsResult.status === 'rejected' &&
-      auditsResult.status === 'rejected'
+      auditsResult.status === 'rejected' &&
+      reviewsResult.status === 'rejected'
     ) {
       setWorkspaceError('Merchant workspace failed to load. Refresh and retry.')
     }
@@ -463,6 +524,21 @@ export function MerchantDashboardScreen() {
     }))
     loadWorkspace()
   }, [loadWorkspace, router, user])
+
+  useEffect(() => {
+    const activeReview = extractionReviews.find((review) => review.reviewId === selectedReviewId) || null
+    setReviewDraft(normalizeReviewDraft(activeReview))
+  }, [extractionReviews, selectedReviewId])
+
+  useEffect(() => {
+    if (!extractionReviews.length) {
+      setSelectedReviewId(null)
+      return
+    }
+    if (!selectedReviewId || !extractionReviews.some((review) => review.reviewId === selectedReviewId)) {
+      setSelectedReviewId(extractionReviews[0].reviewId)
+    }
+  }, [extractionReviews, selectedReviewId])
 
   const activityByDocumentId = useMemo(() => {
     const map = new Map<string, MerchantActivity>()
@@ -526,13 +602,19 @@ export function MerchantDashboardScreen() {
     [documents, selectedDocumentId]
   )
 
+  const selectedReview = useMemo(
+    () => extractionReviews.find((review) => review.reviewId === selectedReviewId) || null,
+    [extractionReviews, selectedReviewId]
+  )
+  const selectedReviewDocument = selectedReview ? documentById.get(selectedReview.documentId) || null : null
+
   const reviewQueue = useMemo(
     () =>
-      documents
-        .filter((document) => document.reviewRequired || (document.lowConfidenceFields || []).length > 0)
+      extractionReviews
+        .slice()
         .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime())
         .slice(0, 6),
-    [documents]
+    [extractionReviews]
   )
 
   const auditTrail = useMemo(() => assignmentAudits.slice(0, 8), [assignmentAudits])
@@ -724,6 +806,48 @@ export function MerchantDashboardScreen() {
       setAssignBusyDocId(null)
     }
   }, [applyConsumerToWorkspace, loadWorkspace, resolveConsumerByCustomId, selectedConsumer?.customId, user?.customId, user?.name, user?.userId])
+
+  const saveExtractionReview = useCallback(async (status: 'confirmed' | 'rejected') => {
+    if (!selectedReview) return
+    setReviewSaveLoading(true)
+    setReviewNotice(null)
+    try {
+      const confirmedFields: Record<string, unknown> = {
+        bill_id: reviewDraft.bill_id.trim() || undefined,
+        vendor: reviewDraft.vendor.trim() || undefined,
+        date: reviewDraft.date.trim() || undefined,
+        total_amount: reviewDraft.total_amount.trim() ? Number(reviewDraft.total_amount) : undefined,
+        product_name: reviewDraft.product_name.trim() || undefined,
+        serial_number: reviewDraft.serial_number.trim() || undefined,
+      }
+      Object.keys(confirmedFields).forEach((key) => {
+        if (confirmedFields[key] === undefined || Number.isNaN(confirmedFields[key])) {
+          delete confirmedFields[key]
+        }
+      })
+
+      await apiClient.put<ExtractionReview>(`/extraction-reviews/${selectedReview.reviewId}`, {
+        confirmed_fields: confirmedFields,
+        review_notes: reviewDraft.notes.trim() || undefined,
+        status,
+      })
+      setReviewNotice({
+        tone: 'success',
+        message: status === 'confirmed'
+          ? 'OCR review saved and document fields were confirmed.'
+          : 'OCR review was rejected and flagged for further correction.',
+        documentId: selectedReview.documentId,
+      })
+      await loadWorkspace()
+    } catch (error) {
+      setReviewNotice({
+        tone: 'error',
+        message: error instanceof Error ? error.message : 'Failed to save OCR review.',
+      })
+    } finally {
+      setReviewSaveLoading(false)
+    }
+  }, [loadWorkspace, reviewDraft, selectedReview])
 
   const handleLogout = useCallback(async () => {
     await clearAuth()
@@ -1364,6 +1488,157 @@ export function MerchantDashboardScreen() {
                 <div className="dashboard-card p-6">
                   <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                     <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">OCR review workspace</p>
+                      <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-950">Review and correct extraction</h2>
+                      <p className="mt-2 text-sm leading-6 text-slate-500">
+                        Merchant operators can verify OCR output, correct mapped fields, and push the confirmed values back into the document record.
+                      </p>
+                    </div>
+                    <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">
+                      {reviewQueue.length} pending review
+                    </span>
+                  </div>
+
+                  <div className="mt-6 grid gap-5 xl:grid-cols-[0.95fr_1.15fr]">
+                    <div className="space-y-3">
+                      {reviewQueue.length === 0 ? (
+                        <EmptyPanel
+                          title="No OCR reviews pending"
+                          description="When extraction confidence is low, the invoice will appear here for merchant correction."
+                        />
+                      ) : (
+                        reviewQueue.map((review) => {
+                          const relatedDocument = documentById.get(review.documentId)
+                          const isSelected = review.reviewId === selectedReviewId
+                          return (
+                            <button
+                              key={review.reviewId}
+                              onClick={() => setSelectedReviewId(review.reviewId)}
+                              className={`w-full rounded-[24px] border p-4 text-left transition ${
+                                isSelected
+                                  ? 'border-blue-300 bg-blue-50 ring-4 ring-blue-100'
+                                  : 'border-slate-200 bg-slate-50/70 hover:border-slate-300'
+                              }`}
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <div>
+                                  <p className="text-sm font-semibold text-slate-950">
+                                    {relatedDocument?.title || review.extractedFields?.product_name?.toString() || 'Untitled invoice'}
+                                  </p>
+                                  <p className="mt-1 text-xs text-slate-500">
+                                    {relatedDocument?.sellerName || String(review.extractedFields?.vendor || 'Vendor missing')}
+                                  </p>
+                                </div>
+                                <span className="rounded-full border border-amber-200 bg-white px-2 py-1 text-[11px] font-semibold text-amber-700">
+                                  {review.status}
+                                </span>
+                              </div>
+                              <div className="mt-3 flex flex-wrap gap-2">
+                                {(review.lowConfidenceFields || []).slice(0, 4).map((field) => (
+                                  <span key={field} className="rounded-full bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 shadow-sm">
+                                    {field}
+                                  </span>
+                                ))}
+                              </div>
+                              <p className="mt-3 text-xs text-slate-400">
+                                Updated {formatDate(review.updatedAt)} | {formatRelativeTime(review.updatedAt)}
+                              </p>
+                            </button>
+                          )
+                        })
+                      )}
+                    </div>
+
+                    <div className="rounded-[28px] border border-slate-200 bg-slate-50/70 p-5">
+                      {selectedReview ? (
+                        <>
+                          {reviewNotice ? (
+                            <div className="mb-4">
+                              <NoticeBanner
+                                notice={reviewNotice}
+                                onDismiss={() => setReviewNotice(null)}
+                                onOpenDocument={reviewNotice.documentId ? () => router.push(`/document/${reviewNotice.documentId}`) : undefined}
+                              />
+                            </div>
+                          ) : null}
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Selected review</p>
+                              <h3 className="mt-2 text-lg font-semibold text-slate-950">
+                                {selectedReviewDocument?.title || String(selectedReview.extractedFields?.product_name || 'Invoice review')}
+                              </h3>
+                              <p className="mt-1 text-sm text-slate-500">
+                                {selectedReviewDocument?.consumerCustomId || selectedReview.userId} | {selectedReviewDocument?.sellerName || String(selectedReview.extractedFields?.vendor || 'Vendor missing')}
+                              </p>
+                            </div>
+                            <button
+                              onClick={() => router.push(`/document/${selectedReview.documentId}`)}
+                              className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+                            >
+                              <Eye className="h-4 w-4" />
+                              Open document
+                            </button>
+                          </div>
+
+                          <div className="mt-5 grid gap-4 md:grid-cols-2">
+                            {(['bill_id', 'vendor', 'date', 'total_amount', 'product_name', 'serial_number'] as const).map((fieldKey) => (
+                              <label key={fieldKey} className="space-y-2">
+                                <span className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                                  {formatReviewFieldLabel(fieldKey)}
+                                </span>
+                                <input
+                                  type={fieldKey === 'total_amount' ? 'number' : fieldKey === 'date' ? 'date' : 'text'}
+                                  value={reviewDraft[fieldKey]}
+                                  onChange={(event) =>
+                                    setReviewDraft((current) => ({ ...current, [fieldKey]: event.target.value }))
+                                  }
+                                  className="dashboard-input"
+                                />
+                              </label>
+                            ))}
+                            <label className="space-y-2 md:col-span-2">
+                              <span className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Review notes</span>
+                              <textarea
+                                value={reviewDraft.notes}
+                                onChange={(event) => setReviewDraft((current) => ({ ...current, notes: event.target.value }))}
+                                placeholder="Explain what was corrected or why this review is rejected."
+                                className="min-h-[112px] w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100"
+                              />
+                            </label>
+                          </div>
+
+                          <div className="mt-5 flex flex-wrap gap-2">
+                            <button
+                              onClick={() => void saveExtractionReview('confirmed')}
+                              disabled={reviewSaveLoading}
+                              className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+                            >
+                              {reviewSaveLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                              Confirm OCR correction
+                            </button>
+                            <button
+                              onClick={() => void saveExtractionReview('rejected')}
+                              disabled={reviewSaveLoading}
+                              className="inline-flex items-center gap-2 rounded-xl border border-red-200 bg-white px-4 py-3 text-sm font-semibold text-red-700 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              <AlertCircle className="h-4 w-4" />
+                              Reject and escalate
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <EmptyPanel
+                          title="No OCR review selected"
+                          description="Pick a pending extraction review from the left to inspect mapped fields and push corrections back into the document."
+                        />
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="dashboard-card p-6">
+                  <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                    <div>
                       <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Bill inventory</p>
                       <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-950">Merchant-assigned invoices</h2>
                       <p className="mt-2 text-sm leading-6 text-slate-500">Search, review, open, or reassign any bill already linked to this merchant workspace.</p>
@@ -1538,70 +1813,47 @@ export function MerchantDashboardScreen() {
                 <div className="dashboard-card overflow-hidden">
                   <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
                     <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Review queue</p>
-                      <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Invoices needing review</h2>
+                      <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Consumer sync</p>
+                      <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Assignment and notification state</h2>
                     </div>
-                    <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">
-                      {reviewQueue.length} flagged
+                    <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
+                      {unreadNotifications.length} unread
                     </span>
                   </div>
                   <div className="p-5">
-                    {reviewQueue.length === 0 ? (
+                    {unreadNotifications.length === 0 && assignmentAudits.length === 0 ? (
                       <EmptyPanel
-                        title="No flagged invoices"
-                        description="When OCR confidence drops or mapped fields need verification, those invoices will appear here for merchant follow-up."
+                        title="No sync events yet"
+                        description="Unread notifications, consumer acknowledgments, and escalations will appear here as the assignment workflow progresses."
                       />
                     ) : (
-                      <div className="space-y-3">
-                        {reviewQueue.map((document) => {
-                          const latestActivity = activityByDocumentId.get(document.docId)
-                          const lowConfidence = (document.lowConfidenceFields || []).slice(0, 3)
-                          return (
-                            <article key={document.docId} className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
-                              <div className="flex items-start justify-between gap-3">
-                                <div>
-                                  <p className="text-sm font-semibold text-slate-950">{document.title || 'Untitled invoice'}</p>
-                                  <p className="mt-1 text-xs text-slate-500">
-                                    {latestActivity?.consumerCustomId || document.consumerCustomId || document.userId || 'Consumer missing'} | {formatCurrency(getDocumentAmount(document))}
-                                  </p>
-                                </div>
-                                <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-700">
-                                  Review
-                                </span>
-                              </div>
-                              <div className="mt-3 flex flex-wrap gap-2">
-                                {lowConfidence.length > 0 ? lowConfidence.map((field) => (
-                                  <span key={field} className="rounded-full bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 shadow-sm">
-                                    {field}
-                                  </span>
-                                )) : (
-                                  <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 shadow-sm">
-                                    Low-confidence mapping
-                                  </span>
-                                )}
-                              </div>
-                              <div className="mt-4 flex flex-wrap gap-2">
-                                <button
-                                  onClick={() => router.push(`/document/${document.docId}`)}
-                                  className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-3 py-2 text-xs font-semibold text-white transition hover:bg-slate-800"
-                                >
-                                  <Eye className="h-3.5 w-3.5" />
-                                  Review document
-                                </button>
-                                <button
-                                  onClick={() => {
-                                    setSelectedDocumentId(document.docId)
-                                    setActiveTab('reassign')
-                                  }}
-                                  className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50"
-                                >
-                                  <Link2 className="h-3.5 w-3.5" />
-                                  Reassign
-                                </button>
-                              </div>
-                            </article>
-                          )
-                        })}
+                      <div className="space-y-4">
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3">
+                            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Assignments awaiting response</p>
+                            <p className="mt-2 text-2xl font-semibold text-slate-950">{pendingAuditCount}</p>
+                            <p className="mt-1 text-xs text-slate-500">Accepted or escalated status from consumers updates the audit trail automatically.</p>
+                          </div>
+                          <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3">
+                            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Unread merchant notifications</p>
+                            <p className="mt-2 text-2xl font-semibold text-slate-950">{unreadNotifications.length}</p>
+                            <p className="mt-1 text-xs text-slate-500">Notifications are scheduled from the same assignment and document workflow.</p>
+                          </div>
+                        </div>
+
+                        {unreadNotifications.length ? (
+                          <div className="space-y-3">
+                            {unreadNotifications.slice(0, 4).map((notification) => (
+                              <article key={notification.notificationId} className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+                                <p className="text-sm font-semibold text-slate-950">{notification.title}</p>
+                                <p className="mt-1 text-xs leading-5 text-slate-500">{notification.message}</p>
+                                <p className="mt-2 text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400">
+                                  {notification.eventType || notification.type} | {formatRelativeTime(notification.triggerAt)}
+                                </p>
+                              </article>
+                            ))}
+                          </div>
+                        ) : null}
                       </div>
                     )}
                   </div>

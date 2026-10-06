@@ -10,10 +10,12 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
     const userId = request.nextUrl.searchParams.get('userId') || undefined
+    const merchantUserId = request.nextUrl.searchParams.get('merchantUserId') || undefined
     const status = request.nextUrl.searchParams.get('status') || undefined
     const limit = request.nextUrl.searchParams.get('limit') || undefined
     const path = withQuery('/extraction-reviews', {
       user_id: userId,
+      merchant_user_id: merchantUserId,
       status,
       limit,
     })

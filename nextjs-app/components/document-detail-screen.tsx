@@ -138,6 +138,17 @@ interface BharatAITranslateBatchResponse {
   detail?: string
 }
 
+interface AssignmentAckResponse {
+  assignmentId: string
+  documentId: string
+  merchantUserId: string
+  consumerUserId: string
+  status: string
+  acceptedAt?: string | null
+  escalatedAt?: string | null
+  notes?: string | null
+}
+
 interface TranslationEntry {
   key: string
   text: string
@@ -444,6 +455,8 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
   const [bharatSpeechLoading, setBharatSpeechLoading] = useState(false)
   const [pageTranslations, setPageTranslations] = useState<Record<string, string>>({})
   const [pageTranslationLoading, setPageTranslationLoading] = useState(false)
+  const [assignmentActionLoading, setAssignmentActionLoading] = useState<'accepted' | 'escalated' | null>(null)
+  const [assignmentActionError, setAssignmentActionError] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const translateUi = useCallback(
@@ -540,6 +553,34 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
     }
   }, [docId, user?.userId])
 
+  const handleAssignmentAction = useCallback(
+    async (status: 'accepted' | 'escalated') => {
+      if (!document || !user?.userId) return
+      setAssignmentActionLoading(status)
+      setAssignmentActionError(null)
+      try {
+        await apiClient.post<AssignmentAckResponse>(`/documents/${docId}/assignment/ack`, {
+          consumer_user_id: user.userId,
+          status,
+          notes:
+            status === 'accepted'
+              ? 'Consumer confirmed the merchant assignment from the document page.'
+              : 'Consumer escalated the merchant assignment from the document page.',
+        })
+        await loadDocument()
+      } catch (error) {
+        setAssignmentActionError(
+          error instanceof Error && error.message.trim()
+            ? error.message
+            : 'Unable to update assignment status.'
+        )
+      } finally {
+        setAssignmentActionLoading(null)
+      }
+    },
+    [docId, document, loadDocument, user?.userId]
+  )
+
   useEffect(() => { loadDocument() }, [loadDocument])
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
   useEffect(() => {
@@ -611,6 +652,22 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
         { key: 'compliance.validated', text: '(validated)' },
         { key: 'compliance.verify', text: '(verify manually)' },
         { key: 'compliance.label', text: complianceTone(document.compliance?.status).label },
+        { key: 'assignment.label', text: 'Merchant Assignment' },
+        { key: 'assignment.title', text: 'Assigned by merchant' },
+        { key: 'assignment.description', text: 'Confirm that this invoice belongs in your locker or escalate it back to the merchant for correction.' },
+        { key: 'assignment.assignedBy', text: 'Assigned by' },
+        { key: 'assignment.status', text: 'Status' },
+        { key: 'assignment.accept', text: 'Accept Assignment' },
+        { key: 'assignment.escalate', text: 'Escalate to Merchant' },
+        { key: 'assignment.accepting', text: 'Accepting...' },
+        { key: 'assignment.escalating', text: 'Escalating...' },
+        { key: 'assignment.accepted', text: 'Accepted' },
+        { key: 'assignment.escalated', text: 'Escalated' },
+        { key: 'assignment.pending', text: 'Awaiting your confirmation' },
+        { key: 'assignment.synced', text: 'Merchant and consumer tracking stay synchronized after you respond here.' },
+        { key: 'assignment.acceptedNote', text: 'You already confirmed this invoice. The merchant audit trail now shows it as accepted.' },
+        { key: 'assignment.escalatedNote', text: 'You escalated this assignment. The merchant workspace will see the escalation status.' },
+        { key: 'assignment.error', text: assignmentActionError || '' },
         { key: 'bharat.heading', text: 'What this invoice means' },
         { key: 'bharat.loading', text: 'Reviewing OCR text and building claim guidance.' },
         { key: 'bharat.personalize', text: 'Personalize output' },
@@ -790,6 +847,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
       cancelled = true
     }
   }, [
+    assignmentActionError,
     bharatError,
     bharatInsight,
     bharatLanguage,
@@ -1166,6 +1224,39 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
   ]).slice(0, 3)
   const supportPreviewCenters = (serviceCenters?.centers || []).slice(0, 3)
   const isOutputUpdating = bharatLoading || pageTranslationLoading
+  const isConsumerAssignment = Boolean(
+    user?.userType === 'consumer' &&
+    user?.userId &&
+    document.assignedByMerchantId &&
+    document.userId === user.userId
+  )
+  const assignmentStatus = document.assignmentStatus || 'assigned'
+  const assignmentStatusClass =
+    assignmentStatus === 'accepted'
+      ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+      : assignmentStatus === 'escalated'
+        ? 'border-amber-200 bg-amber-50 text-amber-700'
+        : 'border-blue-200 bg-blue-50 text-blue-700'
+  const assignmentStatusLabel =
+    assignmentStatus === 'accepted'
+      ? translateUi('assignment.accepted', 'Accepted')
+      : assignmentStatus === 'escalated'
+        ? translateUi('assignment.escalated', 'Escalated')
+        : translateUi('assignment.pending', 'Awaiting your confirmation')
+  const assignmentStatusNote =
+    assignmentStatus === 'accepted'
+      ? translateUi('assignment.acceptedNote', 'You already confirmed this invoice. The merchant audit trail now shows it as accepted.')
+      : assignmentStatus === 'escalated'
+        ? translateUi('assignment.escalatedNote', 'You escalated this assignment. The merchant workspace will see the escalation status.')
+        : translateUi('assignment.synced', 'Merchant and consumer tracking stay synchronized after you respond here.')
+  const assignmentActorLabel =
+    document.assignedByMerchantName ||
+    document.assignedByMerchantCustomId ||
+    document.assignedByMerchantId ||
+    translateUi('value.unknown', 'Unknown')
+  const localizedAssignmentError = assignmentActionError
+    ? translateUi('assignment.error', assignmentActionError)
+    : null
 
   return (
     <div ref={rootRef} className="dashboard-shell">
@@ -1298,6 +1389,61 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
                     {localizedComplianceAlerts ? (
                       <p className="mt-1 text-xs leading-5">{translateUi('compliance.alerts', 'Alerts')}: {localizedComplianceAlerts}</p>
                     ) : null}
+                  </div>
+                </div>
+              ) : null}
+
+              {isConsumerAssignment ? (
+                <div className="rounded-2xl border border-blue-200 bg-blue-50/70 px-4 py-4">
+                  <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="inline-flex items-center rounded-full border border-blue-200 bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-blue-700">
+                          {translateUi('assignment.label', 'Merchant Assignment')}
+                        </span>
+                        <span className={`inline-flex rounded-full border px-3 py-1 text-xs font-semibold ${assignmentStatusClass}`}>
+                          {assignmentStatusLabel}
+                        </span>
+                      </div>
+                      <p className="mt-3 text-sm font-semibold text-slate-900">
+                        {translateUi('assignment.title', 'Assigned by merchant')}
+                      </p>
+                      <p className="mt-1 text-sm leading-6 text-slate-600">
+                        {translateUi('assignment.assignedBy', 'Assigned by')}: {assignmentActorLabel}
+                      </p>
+                      <p className="mt-2 text-sm leading-6 text-slate-600">
+                        {translateUi('assignment.description', 'Confirm that this invoice belongs in your locker or escalate it back to the merchant for correction.')}
+                      </p>
+                      <p className="mt-2 text-xs leading-5 text-slate-500">{assignmentStatusNote}</p>
+                      {localizedAssignmentError ? (
+                        <p className="mt-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-700">
+                          {localizedAssignmentError}
+                        </p>
+                      ) : null}
+                    </div>
+
+                    <div className="flex w-full shrink-0 flex-col gap-2 sm:w-auto">
+                      <button
+                        onClick={() => void handleAssignmentAction('accepted')}
+                        disabled={assignmentActionLoading !== null || assignmentStatus === 'accepted'}
+                        className="inline-flex items-center justify-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+                      >
+                        {assignmentActionLoading === 'accepted' ? <span className="loading loading-spinner loading-xs"></span> : <BadgeCheck className="h-4 w-4" />}
+                        {assignmentActionLoading === 'accepted'
+                          ? translateUi('assignment.accepting', 'Accepting...')
+                          : translateUi('assignment.accept', 'Accept Assignment')}
+                      </button>
+                      <button
+                        onClick={() => void handleAssignmentAction('escalated')}
+                        disabled={assignmentActionLoading !== null}
+                        className="inline-flex items-center justify-center gap-2 rounded-xl border border-amber-200 bg-white px-4 py-2.5 text-sm font-semibold text-amber-700 transition hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {assignmentActionLoading === 'escalated' ? <span className="loading loading-spinner loading-xs"></span> : <AlertTriangle className="h-4 w-4" />}
+                        {assignmentActionLoading === 'escalated'
+                          ? translateUi('assignment.escalating', 'Escalating...')
+                          : translateUi('assignment.escalate', 'Escalate to Merchant')}
+                      </button>
+                    </div>
                   </div>
                 </div>
               ) : null}

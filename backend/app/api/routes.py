@@ -2490,6 +2490,27 @@ def _serialize_assignment_audit(audit: MerchantAssignmentAudit) -> MerchantAssig
     )
 
 
+def _review_in_scope(
+    review: ExtractionReview,
+    *,
+    principal: Principal,
+    db: Session,
+) -> bool:
+    if principal.role in {"admin", "analyst", "auditor", "viewer"}:
+        return True
+    if principal.role == "consumer":
+        return bool(principal.subject and review.user_id == principal.subject)
+    if principal.role == "merchant":
+        if not principal.subject:
+            return False
+        document = db.get(Document, review.document_id)
+        if document is None:
+            return False
+        references = _safe_references(document)
+        return str(references.get("merchant_user_id") or "").strip() == principal.subject
+    return False
+
+
 def _deadline_band(*, warranty_end: date | None, today: date) -> str | None:
     if warranty_end is None:
         return None
@@ -2662,6 +2683,13 @@ def _serialize_document(document: Document) -> DocumentView:
             str(references["merchant_custom_id"]) if references.get("merchant_custom_id") else None
         ),
         consumerCustomId=(str(references["consumer_custom_id"]) if references.get("consumer_custom_id") else None),
+        assignmentStatus=(str(references["assignment_status"]) if references.get("assignment_status") else None),
+        assignmentAcceptedAt=(
+            str(references["consumer_activated_at"]) if references.get("consumer_activated_at") else None
+        ),
+        assignmentEscalatedAt=(
+            str(references["consumer_escalated_at"]) if references.get("consumer_escalated_at") else None
+        ),
         totalAmount=purchase_price,
         taxableAmount=_coerce_float(references.get("taxable_amount")),
         gstAmount=_coerce_float(references.get("gst_amount")),
@@ -5274,19 +5302,34 @@ def ingest_marketplace_provider_event(
 @router.get("/extraction-reviews", response_model=ExtractionReviewQueueResponse)
 def list_extraction_reviews(
     user_id: str | None = None,
+    merchant_user_id: str | None = None,
     status: str | None = None,
     limit: int = 100,
     principal: Principal = Depends(require_roles("admin", "analyst", "auditor", "viewer", "consumer", "merchant")),
     db: Session = Depends(get_db),
 ) -> ExtractionReviewQueueResponse:
     safe_limit = max(1, min(limit, 500))
-    if principal.role in {"consumer", "merchant"}:
-        scoped_user = principal.subject
+    stmt = select(ExtractionReview).order_by(desc(ExtractionReview.created_at)).limit(safe_limit)
+    if principal.role == "consumer":
+        if principal.subject:
+            stmt = stmt.where(ExtractionReview.user_id == principal.subject)
+    elif principal.role == "merchant":
+        merchant_scope = principal.subject
+        if merchant_scope:
+            stmt = (
+                stmt.join(Document, ExtractionReview.document_id == Document.id)
+                .where(Document.references["merchant_user_id"].as_string() == merchant_scope)
+            )
     else:
         scoped_user = _normalize_scope_value(user_id)
-    stmt = select(ExtractionReview).order_by(desc(ExtractionReview.created_at)).limit(safe_limit)
-    if scoped_user:
-        stmt = stmt.where(ExtractionReview.user_id == scoped_user)
+        scoped_merchant = _normalize_scope_value(merchant_user_id)
+        if scoped_user:
+            stmt = stmt.where(ExtractionReview.user_id == scoped_user)
+        if scoped_merchant:
+            stmt = (
+                stmt.join(Document, ExtractionReview.document_id == Document.id)
+                .where(Document.references["merchant_user_id"].as_string() == scoped_merchant)
+            )
     if status:
         stmt = stmt.where(ExtractionReview.status == status.strip().lower())
     rows = list(db.execute(stmt).scalars())
@@ -5302,7 +5345,7 @@ def get_extraction_review(
     review = db.get(ExtractionReview, review_id)
     if not review:
         raise HTTPException(status_code=404, detail="Extraction review not found")
-    if principal.role in {"consumer", "merchant"} and principal.subject and review.user_id != principal.subject:
+    if not _review_in_scope(review, principal=principal, db=db):
         raise HTTPException(status_code=403, detail="Forbidden")
     return _serialize_extraction_review(review)
 
@@ -5317,7 +5360,7 @@ def confirm_extraction_review(
     review = db.get(ExtractionReview, review_id)
     if not review:
         raise HTTPException(status_code=404, detail="Extraction review not found")
-    if principal.role in {"consumer", "merchant"} and principal.subject and review.user_id != principal.subject:
+    if not _review_in_scope(review, principal=principal, db=db):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     confirmed_fields = payload.confirmed_fields if isinstance(payload.confirmed_fields, dict) else {}
