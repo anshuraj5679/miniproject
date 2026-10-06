@@ -1402,6 +1402,21 @@ def _heuristic_is_invoice_document(text: str) -> tuple[bool, float]:
     if len(cleaned) < 30:
         return False, 0.4
 
+    ui_tokens = (
+        "warranty command center",
+        "scan invoice",
+        "assets in locker",
+        "protected value",
+        "expiring soon",
+        "all assets",
+        "warranty locker",
+        "dashboard",
+        "safebill",
+        "safe bill",
+    )
+    if any(token in cleaned for token in ui_tokens):
+        return False, 0.95
+
     strong_tokens = (
         "invoice",
         "tax invoice",
