@@ -1024,6 +1024,8 @@ def _looks_like_non_merchandise_item_name(value: object) -> bool:
     if not text:
         return False
     compact = re.sub(r"\s+", " ", text)
+    if re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,62}\.[a-z]{2,6}", compact):
+        return True
     blocked_tokens = (
         "customer number",
         "customer no",
@@ -1748,6 +1750,61 @@ def _extract_text_metadata_with_bedrock(ocr_text: str, filename: str) -> dict[st
     return _normalize_invoice_metadata(parsed)
 
 
+def _extract_product_name_with_bedrock(ocr_text: str, filename: str) -> dict[str, object]:
+    settings = get_settings()
+    if not ocr_text:
+        return {}
+    if boto3 is None:
+        return {}
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return {}
+    if not bool(getattr(settings, "bedrock_text_mapping_enabled", False)):
+        return {}
+
+    model = (settings.bedrock_chat_model or "").strip()
+    if not model:
+        return {}
+
+    system_prompt = (
+        "You extract product line items from OCR text. "
+        "Return only JSON with keys: product_name, line_items. "
+        "product_name must be the primary purchased item, not the store name. "
+        "If multiple items exist, choose the most expensive or primary one. "
+        "line_items must be an array of objects with keys: name, quantity, unit_price, amount. "
+        "Do not include totals, taxes, discounts, shipping, or 'amount in words' as line items."
+    )
+    user_payload = f"filename={filename}\nocr_text:\n{ocr_text[:18000]}"
+    try:
+        client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+        response = client.converse(
+            modelId=model,
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": [{"text": user_payload}]}],
+            inferenceConfig={"temperature": 0.0, "maxTokens": 800},
+        )
+        content_blocks = (
+            response.get("output", {})
+            .get("message", {})
+            .get("content", [])
+        )
+        raw_content = "".join(
+            str(block.get("text", ""))
+            for block in content_blocks
+            if isinstance(block, dict)
+        ).strip()
+        if not raw_content:
+            return {}
+        if raw_content.startswith("```"):
+            raw_content = raw_content.strip("`")
+            raw_content = raw_content.replace("json\n", "", 1).strip()
+        parsed = json.loads(raw_content)
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
 def _extract_text_with_textract(image_bytes: bytes) -> str:
     settings = get_settings()
     if not image_bytes or boto3 is None:
@@ -2318,34 +2375,54 @@ def _persist_structured_document(
     if extracted_product_name and _looks_like_non_merchandise_item_name(extracted_product_name):
         extracted_product_name = ""
     metadata_line_items = metadata.get("line_items")
-    sanitized_line_items: list[dict[str, object]] = []
-    if isinstance(metadata_line_items, list):
-        for item in metadata_line_items[:50]:
-            if not isinstance(item, dict):
-                continue
-            entry_name = sanitize_merchandise_name(item.get("name") or item.get("product_name"))
-            if not entry_name:
-                continue
-            normalized_item: dict[str, object] = {"name": entry_name}
-            amount = _coerce_float(item.get("amount"))
-            quantity = _coerce_float(item.get("quantity"))
-            unit_price = _coerce_float(item.get("unit_price"))
-            gst_component = _coerce_float(item.get("gst_amount"))
-            if amount is not None:
-                normalized_item["amount"] = amount
-            if quantity is not None:
-                normalized_item["quantity"] = quantity
-            if unit_price is not None:
-                normalized_item["unit_price"] = unit_price
-            if gst_component is not None:
-                normalized_item["gst_amount"] = gst_component
-            sanitized_line_items.append(normalized_item)
+    def _sanitize_line_items(raw_items: object) -> list[dict[str, object]]:
+        sanitized: list[dict[str, object]] = []
+        if isinstance(raw_items, list):
+            for item in raw_items[:50]:
+                if not isinstance(item, dict):
+                    continue
+                entry_name = sanitize_merchandise_name(item.get("name") or item.get("product_name"))
+                if not entry_name:
+                    continue
+                normalized_item: dict[str, object] = {"name": entry_name}
+                amount = _coerce_float(item.get("amount"))
+                quantity = _coerce_float(item.get("quantity"))
+                unit_price = _coerce_float(item.get("unit_price"))
+                gst_component = _coerce_float(item.get("gst_amount"))
+                if amount is not None:
+                    normalized_item["amount"] = amount
+                if quantity is not None:
+                    normalized_item["quantity"] = quantity
+                if unit_price is not None:
+                    normalized_item["unit_price"] = unit_price
+                if gst_component is not None:
+                    normalized_item["gst_amount"] = gst_component
+                sanitized.append(normalized_item)
+        return sanitized
+
+    sanitized_line_items = _sanitize_line_items(metadata_line_items)
     if not extracted_product_name:
         for item in sanitized_line_items:
             candidate = str(item.get("name") or "").strip()
             if candidate:
                 extracted_product_name = candidate
                 break
+    if not extracted_product_name and extracted_text:
+        bedrock_payload = _extract_product_name_with_bedrock(extracted_text, filename)
+        bedrock_name = str(sanitize_merchandise_name(bedrock_payload.get("product_name")) or "").strip()
+        if bedrock_name and not _looks_like_non_merchandise_item_name(bedrock_name):
+            extracted_product_name = bedrock_name
+            metadata["product_name"] = bedrock_name
+        bedrock_items = bedrock_payload.get("line_items")
+        if not sanitized_line_items and isinstance(bedrock_items, list):
+            metadata["line_items"] = bedrock_items
+            sanitized_line_items = _sanitize_line_items(bedrock_items)
+            if not extracted_product_name:
+                for item in sanitized_line_items:
+                    candidate = str(item.get("name") or "").strip()
+                    if candidate:
+                        extracted_product_name = candidate
+                        break
     if extracted_product_name:
         metadata["product_name"] = extracted_product_name
     title = extracted_product_name or _first_meaningful_line(extracted_text, fallback=title_fallback)

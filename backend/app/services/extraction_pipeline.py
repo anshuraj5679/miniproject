@@ -190,6 +190,8 @@ def _looks_like_non_merchandise_line_item(name: str | None) -> bool:
     if not text:
         return False
     compact = re.sub(r"\s+", " ", text)
+    if _looks_like_domain_text(compact):
+        return True
 
     blocked_tokens = (
         "customer number",
@@ -234,6 +236,17 @@ def _looks_like_non_merchandise_line_item(name: str | None) -> bool:
         return True
 
     if re.fullmatch(r"(?:customer|invoice|document|order|po|gst|pan|hsn|item)\s*(?:no|number|id|code)", compact):
+        return True
+    return False
+
+
+def _looks_like_domain_text(value: str | None) -> bool:
+    text = (value or "").strip().lower()
+    if not text or " " in text:
+        return False
+    if len(text) > 64:
+        return False
+    if re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,62}\.[a-z]{2,6}", text):
         return True
     return False
 
@@ -334,6 +347,8 @@ def sanitize_merchandise_name(value: object) -> str | None:
 
     normalized = " ".join(tokens).strip(":- ")
     if not normalized:
+        return None
+    if _looks_like_domain_text(normalized):
         return None
     if re.fullmatch(r"\d+\s*(?:NOS|PCS|PC|UNIT|UNITS)", normalized.upper()):
         return None
