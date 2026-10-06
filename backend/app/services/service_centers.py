@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -46,9 +47,11 @@ class ServiceCenterLocator:
         "https://overpass-api.de/api/interpreter",
     )
     USER_AGENT = "SafeBill-ServiceCenterLocator/1.0"
-    DEFAULT_TIMEOUT_SECONDS = 8.0
-    OVERPASS_CLIENT_TIMEOUT_SECONDS = 10.0
-    OVERPASS_QUERY_TIMEOUT_SECONDS = 16
+    GEOCODE_TIMEOUT_SECONDS = 2.5
+    DEFAULT_TIMEOUT_SECONDS = 4.0
+    OVERPASS_CLIENT_TIMEOUT_SECONDS = 4.0
+    OVERPASS_QUERY_TIMEOUT_SECONDS = 6
+    EXTERNAL_LOOKUP_BUDGET_SECONDS = 9.0
     DEFAULT_LIMIT = 5
     DEFAULT_RADIUS_KM = 30.0
     MAX_RADIUS_KM = 100.0
@@ -501,7 +504,7 @@ class ServiceCenterLocator:
         headers = {"User-Agent": self.USER_AGENT}
         for query in (f"{location_hint.strip()}, India", location_hint.strip()):
             try:
-                with httpx.Client(timeout=self.DEFAULT_TIMEOUT_SECONDS, headers=headers) as client:
+                with httpx.Client(timeout=self.GEOCODE_TIMEOUT_SECONDS, headers=headers) as client:
                     response = client.get(
                         self.NOMINATIM_SEARCH_URL,
                         params={"q": query, "format": "jsonv2", "limit": 1},
@@ -532,6 +535,34 @@ class ServiceCenterLocator:
             if key in normalized_hint or normalized_hint in key:
                 return value
         return None
+
+    def _resolve_anchor_for_location_hint(self, location_hint: str | None) -> tuple[float, float] | None:
+        fallback = self._fallback_anchor_for_location_hint(location_hint)
+        if fallback:
+            return fallback
+        return self._geocode_location(location_hint)
+
+    @classmethod
+    def _remaining_lookup_budget_seconds(cls, *, started_at: float) -> float:
+        return cls.EXTERNAL_LOOKUP_BUDGET_SECONDS - (time.monotonic() - started_at)
+
+    def _sort_candidates(
+        self,
+        candidates: list[ServiceCenterCandidate],
+        *,
+        anchor_latitude: float | None,
+        anchor_longitude: float | None,
+    ) -> None:
+        if anchor_latitude is not None and anchor_longitude is not None:
+            candidates.sort(
+                key=lambda item: (
+                    self.SOURCE_PRIORITY.get(item.source, 99),
+                    item.distance_km if item.distance_km is not None else float("inf"),
+                    item.name.lower(),
+                )
+            )
+        else:
+            candidates.sort(key=lambda item: (self.SOURCE_PRIORITY.get(item.source, 99), item.name.lower()))
 
     @classmethod
     def _extract_pincode_from_address(cls, value: str | None) -> str | None:
@@ -1011,21 +1042,17 @@ out tags center 120;
         safe_limit = max(1, min(limit, 10))
         safe_radius = self.parse_radius_km("", default_km=radius_km)
         target_count = min(3, safe_limit)
+        external_lookup_started_at = time.monotonic()
+
+        def has_lookup_budget(required_seconds: float = 0.0) -> bool:
+            return self._remaining_lookup_budget_seconds(started_at=external_lookup_started_at) >= required_seconds
 
         anchor_lat = user_latitude
         anchor_lon = user_longitude
         if anchor_lat is None or anchor_lon is None:
-            location_pincode = self.parse_pincode(location_hint)
-            if location_pincode and location_pincode in self.PINCODE_HINTS:
-                anchor_lat, anchor_lon, _, _ = self.PINCODE_HINTS[location_pincode]
-            else:
-                geocoded = self._geocode_location(location_hint)
-                if geocoded:
-                    anchor_lat, anchor_lon = geocoded
-                else:
-                    fallback = self._fallback_anchor_for_location_hint(location_hint)
-                    if fallback:
-                        anchor_lat, anchor_lon = fallback
+            resolved_anchor = self._resolve_anchor_for_location_hint(location_hint)
+            if resolved_anchor:
+                anchor_lat, anchor_lon = resolved_anchor
 
         bbox = (
             self._bbox_from_radius(anchor_lat, anchor_lon, min(max(safe_radius, 20.0), 30.0))
@@ -1058,16 +1085,7 @@ out tags center 120;
             append(center)
 
         if candidates and not use_live_lookup:
-            if anchor_lat is not None and anchor_lon is not None:
-                candidates.sort(
-                    key=lambda item: (
-                        self.SOURCE_PRIORITY.get(item.source, 99),
-                        item.distance_km if item.distance_km is not None else float("inf"),
-                        item.name.lower(),
-                    )
-                )
-            else:
-                candidates.sort(key=lambda item: (self.SOURCE_PRIORITY.get(item.source, 99), item.name.lower()))
+            self._sort_candidates(candidates, anchor_latitude=anchor_lat, anchor_longitude=anchor_lon)
             return candidates[:safe_limit]
 
         if not candidates and not use_live_lookup:
@@ -1082,9 +1100,14 @@ out tags center 120;
                 append(center)
             return candidates[:safe_limit]
 
-        if use_live_lookup and len(candidates) < safe_limit:
+        if use_live_lookup and len(candidates) < safe_limit and has_lookup_budget(self.OVERPASS_CLIENT_TIMEOUT_SECONDS):
             overpass_raw = self._search_overpass(company_name=normalized_company, bbox=bbox)
-            if not overpass_raw and anchor_lat is not None and anchor_lon is not None:
+            if (
+                not overpass_raw
+                and anchor_lat is not None
+                and anchor_lon is not None
+                and has_lookup_budget(self.OVERPASS_CLIENT_TIMEOUT_SECONDS)
+            ):
                 expanded_bbox = self._bbox_from_radius(anchor_lat, anchor_lon, min(max(safe_radius * 1.35, 30.0), 35.0))
                 overpass_raw = self._search_overpass(company_name=normalized_company, bbox=expanded_bbox)
             for raw in overpass_raw:
@@ -1102,8 +1125,10 @@ out tags center 120;
             f"{normalized_company} service center",
             f"{normalized_company} repair center",
         ]
-        if use_live_lookup and len(candidates) < target_count:
+        if use_live_lookup and len(candidates) < target_count and has_lookup_budget(self.DEFAULT_TIMEOUT_SECONDS):
             for query in query_variants:
+                if not has_lookup_budget(self.DEFAULT_TIMEOUT_SECONDS):
+                    break
                 for raw in self._search_google_places(
                     query=query,
                     limit=max(10, safe_limit * 2),
@@ -1124,8 +1149,10 @@ out tags center 120;
                 if len(candidates) >= target_count:
                     break
 
-        if use_live_lookup and len(candidates) < target_count:
+        if use_live_lookup and len(candidates) < target_count and has_lookup_budget(self.DEFAULT_TIMEOUT_SECONDS):
             for query in query_variants:
+                if not has_lookup_budget(self.DEFAULT_TIMEOUT_SECONDS):
+                    break
                 for raw in self._search_nominatim(query=query, limit=max(8, safe_limit * 2), location_hint=location_hint):
                     append(
                         self._candidate_from_nominatim(
@@ -1149,14 +1176,5 @@ out tags center 120;
             ):
                 append(center)
 
-        if anchor_lat is not None and anchor_lon is not None:
-            candidates.sort(
-                key=lambda item: (
-                    self.SOURCE_PRIORITY.get(item.source, 99),
-                    item.distance_km if item.distance_km is not None else float("inf"),
-                    item.name.lower(),
-                )
-            )
-        else:
-            candidates.sort(key=lambda item: (self.SOURCE_PRIORITY.get(item.source, 99), item.name.lower()))
+        self._sort_candidates(candidates, anchor_latitude=anchor_lat, anchor_longitude=anchor_lon)
         return candidates[:safe_limit]

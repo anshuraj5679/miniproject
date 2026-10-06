@@ -251,3 +251,57 @@ def test_directory_lookup_accepts_same_prefix_pincode_cluster(monkeypatch) -> No
     centers = locator.find_service_centers(company_name="Samsung", location_hint="560001", radius_km=25, limit=3)
     assert len(centers) == 1
     assert centers[0].pincode == "560038"
+
+
+def test_find_service_centers_prefers_local_anchor_before_geocode(monkeypatch) -> None:
+    locator = ServiceCenterLocator(directory_entries=[])
+
+    def fail_geocode(_location_hint: str | None):
+        raise AssertionError("should not geocode when a local location hint is available")
+
+    monkeypatch.setattr(locator, "_geocode_location", fail_geocode)
+
+    centers = locator.find_service_centers(
+        company_name="Samsung",
+        location_hint="New Delhi",
+        limit=2,
+        allow_external_lookup=False,
+    )
+
+    assert len(centers) == 1
+    assert centers[0].source == "official_support"
+    assert centers[0].latitude == 28.6139
+    assert centers[0].longitude == 77.209
+
+
+def test_find_service_centers_skips_external_lookup_when_budget_is_exhausted(monkeypatch) -> None:
+    locator = ServiceCenterLocator(directory_entries=[], live_lookup_enabled=True)
+    monotonic_values = iter([0.0, 5.1, 5.1, 5.1, 5.1, 5.1])
+
+    monkeypatch.setattr("app.services.service_centers.time.monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(
+        locator,
+        "_search_overpass",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not call overpass without budget")),
+    )
+    monkeypatch.setattr(
+        locator,
+        "_search_google_places",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not call google places without budget")),
+    )
+    monkeypatch.setattr(
+        locator,
+        "_search_nominatim",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not call nominatim without budget")),
+    )
+
+    centers = locator.find_service_centers(
+        company_name="Samsung",
+        user_latitude=12.9716,
+        user_longitude=77.5946,
+        location_hint="Bengaluru",
+        limit=3,
+    )
+
+    assert len(centers) == 1
+    assert centers[0].source == "official_support"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import date
 from types import SimpleNamespace
 
 from app.services.ingestion import IngestionService
@@ -74,4 +75,53 @@ def test_ingest_pdf_auto_increments_version_on_bill_id_collision(monkeypatch) ->
 
     assert document.bill_id == "sample_warranty_card"
     assert document.version == 2
+    assert chunk_count == 1
+
+
+def test_ingest_pdf_prefers_extracted_metadata_over_upload_hints(monkeypatch) -> None:
+    parsed = SimpleNamespace(
+        metadata={
+            "bill_id": "9222000002664974",
+            "vendor": "Apple India Private Limited",
+            "date": date(2025, 6, 10),
+            "total_amount": 32900.0,
+            "product_name": "IPAD WIFI 128GB BLU-HIN",
+        },
+        is_scanned=False,
+        raw_text="Tax Invoice Number: 9222000002664974",
+        tables=[],
+    )
+    chunk_draft = SimpleNamespace(chunk_type="body_section", content="Invoice details", metadata={})
+
+    monkeypatch.setattr("app.services.ingestion.parse_pdf_document", lambda **kwargs: parsed)
+    monkeypatch.setattr("app.services.ingestion.structure_aware_chunking", lambda _parsed: [chunk_draft])
+
+    service = IngestionService(
+        metadata_generator=SimpleNamespace(
+            generate=lambda **kwargs: {
+                "summary": "summary",
+                "keywords": ["invoice"],
+                "hypothetical_questions": ["what is invoice number?"],
+            }
+        ),
+        embedding_service=SimpleNamespace(embed_batch=lambda texts: [[0.1, 0.2] for _ in texts]),
+        vector_store=SimpleNamespace(enabled=False),
+    )
+
+    db = _FakeDB(latest_version=None)
+    document, chunk_count = service.ingest_pdf(
+        db=db,
+        file_bytes=b"%PDF-1.4",
+        filename="apple-tax-invoice.pdf",
+        bill_id="TEST23",
+        vendor="Override Merchant",
+        document_date=date(2026, 3, 9),
+        total_amount=128.0,
+        version=1,
+    )
+
+    assert document.bill_id == "9222000002664974"
+    assert document.vendor == "Apple India Private Limited"
+    assert document.date == date(2025, 6, 10)
+    assert float(document.total_amount) == 32900.0
     assert chunk_count == 1

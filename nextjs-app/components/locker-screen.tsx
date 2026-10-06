@@ -85,6 +85,14 @@ function getDaysLeft(value?: string) {
   return Math.ceil((parsed - Date.now()) / DAY_MS)
 }
 
+function getDocumentAmount(document: Document): number {
+  if (document.totalAmount != null && Number.isFinite(document.totalAmount)) {
+    return document.totalAmount
+  }
+  const fallback = document.items?.[0]?.purchasePrice
+  return fallback != null && Number.isFinite(fallback) ? fallback : 0
+}
+
 function getStatusMeta(daysLeft: number | null) {
   if (daysLeft === null) {
     return {
@@ -143,7 +151,7 @@ function buildTimelineSeries(documents: Document[]) {
     return {
       label: monthStart.toLocaleString('en-IN', { month: 'short' }),
       value: matchingDocs.length,
-      totalValue: matchingDocs.reduce((sum, doc) => sum + (doc.items?.[0]?.purchasePrice || 0), 0),
+      totalValue: matchingDocs.reduce((sum, doc) => sum + getDocumentAmount(doc), 0),
       rangeLabel: `${monthStart.toLocaleString('en-IN', { month: 'short' })} ${monthStart.getFullYear()}`,
       assets: matchingDocs
         .map((doc) => doc.items?.[0]?.productName || doc.title)
@@ -373,7 +381,7 @@ export function LockerScreen() {
 
   const stats = useMemo(() => {
     const total = documents.length
-    const totalValue = documents.reduce((sum, doc) => sum + (doc.items?.[0]?.purchasePrice || 0), 0)
+    const totalValue = documents.reduce((sum, doc) => sum + getDocumentAmount(doc), 0)
     const expiring = documents.filter((doc) => {
       const daysLeft = getDaysLeft(doc.items?.[0]?.warrantyEnd)
       return daysLeft !== null && daysLeft >= 0 && daysLeft <= 30
@@ -963,7 +971,7 @@ export function LockerScreen() {
                                   <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
                                     <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Asset Value</p>
                                     <p className="mt-1 text-lg font-bold text-slate-950">
-                                      {item?.purchasePrice ? formatCurrency(item.purchasePrice) : 'Not available'}
+                                      {getDocumentAmount(doc) > 0 ? formatCurrency(getDocumentAmount(doc)) : 'Not available'}
                                     </p>
                                   </div>
                                   <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">

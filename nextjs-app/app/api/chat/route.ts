@@ -60,6 +60,7 @@ interface AskResponsePayload {
 
 interface FallbackDocument {
   sellerName?: string
+  totalAmount?: number | null
   items?: Array<{
     invoiceNo?: string
     purchaseDate?: string
@@ -142,13 +143,17 @@ export async function POST(request: NextRequest) {
           authToken
         )
         const item = doc.items?.[0]
+        const amount =
+          doc.totalAmount !== null && doc.totalAmount !== undefined
+            ? doc.totalAmount
+            : item?.purchasePrice
         const parts = [
           item?.productName ? `Product: ${item.productName}` : '',
           item?.invoiceNo ? `Invoice: ${item.invoiceNo}` : '',
           doc.sellerName ? `Vendor: ${doc.sellerName}` : '',
           item?.purchaseDate ? `Purchase date: ${item.purchaseDate}` : '',
-          item?.purchasePrice !== null && item?.purchasePrice !== undefined
-            ? `Amount: INR ${item.purchasePrice}`
+          amount !== null && amount !== undefined
+            ? `Amount: INR ${amount}`
             : '',
           item?.warrantyEnd ? `Warranty end: ${item.warrantyEnd}` : '',
         ].filter(Boolean)

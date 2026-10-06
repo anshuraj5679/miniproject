@@ -2,9 +2,10 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 
 // Routes that require authentication
-const consumerRoutes = ['/locker', '/scan', '/chat', '/claims', '/reminders', '/document', '/settings']
+const consumerRoutes = ['/locker', '/scan', '/chat', '/claims', '/reminders']
 const merchantRoutes = ['/merchant-dashboard']
-const protectedRoutes = [...consumerRoutes, ...merchantRoutes]
+const sharedRoutes = ['/document', '/settings']
+const protectedRoutes = [...consumerRoutes, ...merchantRoutes, ...sharedRoutes]
 const ACCESS_TOKEN_COOKIE = 'sb_access_token'
 const USER_TYPE_COOKIE = 'sb_user_type'
 

@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   ArrowLeft,
@@ -32,7 +32,7 @@ import { apiClient } from '@/lib/api-client'
 import { useGsapReveal } from '@/lib/gsap-helpers'
 import { getCurrentLocation } from '@/lib/location'
 import { useAuthStore } from '@/lib/store/auth-store'
-import type { Document } from '@/lib/types'
+import type { Document, User as AuthUser } from '@/lib/types'
 import { ProductVisual } from '@/components/product-visual'
 
 interface ChatMessage {
@@ -245,6 +245,23 @@ function formatDisplayDate(value: string | undefined): string | null {
   }).format(parsed)
 }
 
+function getDocumentInvoiceAmount(document: Document | null | undefined): number | null {
+  if (!document) return null
+  if (document.totalAmount != null && Number.isFinite(document.totalAmount)) {
+    return document.totalAmount
+  }
+  const fallback = document.items?.[0]?.purchasePrice
+  return fallback != null && Number.isFinite(fallback) ? fallback : null
+}
+
+function getDocumentInvoiceNumber(document: Document | null | undefined): string {
+  return String(document?.items?.[0]?.invoiceNo || '').trim()
+}
+
+function getDocumentPurchaseDate(document: Document | null | undefined): string {
+  return String(document?.items?.[0]?.purchaseDate || '').trim()
+}
+
 function formatInsightSummary(
   summary: string | undefined,
   fallback: {
@@ -321,17 +338,20 @@ function buildInvoiceAiMetadata(
   serviceCenters: ServiceCentersResponse | null = null
 ): Record<string, unknown> {
   const item = document?.items?.[0]
+  const invoiceNumber = getDocumentInvoiceNumber(document)
+  const invoiceAmount = getDocumentInvoiceAmount(document)
+  const purchaseDate = getDocumentPurchaseDate(document)
   const complianceAlerts =
     document?.compliance?.alerts?.map((alert) => String(alert.message || '').trim()).filter(Boolean) || []
 
   return {
-    bill_id: item?.invoiceNo || '',
+    bill_id: invoiceNumber,
     vendor: document?.sellerName || '',
     product_name: item?.productName || document?.title || '',
-    total_amount: item?.purchasePrice ?? null,
+    total_amount: invoiceAmount,
     gst_amount: item?.gstAmount ?? document?.gstAmount ?? null,
     taxable_amount: document?.taxableAmount ?? null,
-    date: item?.purchaseDate || '',
+    date: purchaseDate,
     category: document?.category || '',
     title: document?.title || '',
     model: item?.model || '',
@@ -424,6 +444,14 @@ function uniqueItems(values: Array<string | null | undefined>): string[] {
   return result
 }
 
+function buildDocumentScopeParams(user: AuthUser | null | undefined): Record<string, string> | undefined {
+  if (!user?.userId) return undefined
+  if (user.userType === 'merchant') {
+    return { merchantUserId: user.userId }
+  }
+  return { userId: user.userId }
+}
+
 export function DocumentDetailScreen({ docId }: { docId: string }) {
   const router = useRouter()
   const { user, token } = useAuthStore()
@@ -458,6 +486,8 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
   const [assignmentActionLoading, setAssignmentActionLoading] = useState<'accepted' | 'escalated' | null>(null)
   const [assignmentActionError, setAssignmentActionError] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const documentScopeParams = useMemo(() => buildDocumentScopeParams(user), [user])
+  const defaultHomeRoute = user?.userType === 'merchant' ? '/merchant-dashboard' : '/locker'
 
   const translateUi = useCallback(
     (key: string, fallback: string) => {
@@ -542,7 +572,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
     try {
       setIsLoading(true)
       const payload = await apiClient.get<Document>(`/documents/${docId}`, {
-        params: { userId: user?.userId || undefined },
+        params: documentScopeParams,
       })
       setDocument(payload)
     } catch (error) {
@@ -551,7 +581,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
     } finally {
       setIsLoading(false)
     }
-  }, [docId, user?.userId])
+  }, [docId, documentScopeParams])
 
   const handleAssignmentAction = useCallback(
     async (status: 'accepted' | 'escalated') => {
@@ -607,6 +637,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
       }
 
       const currentItem = document.items?.[0]
+      const currentInvoiceAmount = getDocumentInvoiceAmount(document)
       const currentDeadline = getDeadlineMeta(currentItem?.warrantyEnd, nowMs)
       const currentClaimReadinessSummary = document.claimReadiness?.summary || ''
       const currentComplianceAlerts = (document.compliance?.alerts || [])
@@ -782,7 +813,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
           productName: currentItem?.productName || document.title,
           sellerName: document.sellerName,
           purchaseDate: formatDisplayDate(currentItem?.purchaseDate) || currentItem?.purchaseDate,
-          amount: currentItem?.purchasePrice,
+          amount: currentInvoiceAmount,
         }) },
         { key: 'bharat.error', text: bharatError || '' },
         { key: 'serviceCenters.status', text: serviceCentersStatus || '' },
@@ -867,8 +898,8 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
     if (!document || !window.confirm('Are you sure you want to delete this warranty?')) return
     setIsDeleting(true)
     try {
-      await apiClient.delete(`/documents/${docId}`, { params: { userId: user?.userId || undefined } })
-      router.push('/locker')
+      await apiClient.delete(`/documents/${docId}`, { params: documentScopeParams })
+      router.push(defaultHomeRoute)
     } catch (error) {
       console.error('Delete failed:', error)
       alert('Failed to delete. Please try again.')
@@ -882,7 +913,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
     try {
       setCalendarLoading(true)
       const payload = await apiClient.get<CalendarLinksResponse>(`/documents/${docId}/calendar-links`, {
-        params: { userId: user?.userId || undefined },
+        params: documentScopeParams,
       })
       setCalendarLinks(payload)
       return payload
@@ -892,14 +923,14 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
     } finally {
       setCalendarLoading(false)
     }
-  }, [docId, document, user?.userId])
+  }, [docId, document, documentScopeParams])
 
   const loadClaimAssistant = useCallback(async () => {
     if (!document) return null
     try {
       setClaimAssistantLoading(true)
       const payload = await apiClient.get<ClaimAssistantResponse>(`/documents/${docId}/claim-assistant`, {
-        params: { userId: user?.userId || undefined },
+        params: documentScopeParams,
       })
       setClaimAssistant(payload)
       return payload
@@ -910,7 +941,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
     } finally {
       setClaimAssistantLoading(false)
     }
-  }, [docId, document, user?.userId])
+  }, [docId, document, documentScopeParams])
 
   useEffect(() => {
     if (!document?.docId) {
@@ -929,9 +960,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
   const handleDownloadIcs = async () => {
     const payload = calendarLinks || (await loadCalendarLinks())
     if (!payload?.icsDownloadUrl) { alert('Warranty date is not available for calendar sync yet.'); return }
-    const query = new URLSearchParams(
-      user?.userId ? { userId: user.userId } : {}
-    ).toString()
+    const query = new URLSearchParams(documentScopeParams || {}).toString()
     const target = `${payload.icsDownloadUrl}${payload.icsDownloadUrl.includes('?') ? '&' : '?'}${query}`
     window.open(target, '_blank', 'noopener,noreferrer')
   }
@@ -940,7 +969,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
     try {
       setClaimPacketLoading(true)
       const payload = await apiClient.get<ClaimPacketResponse>(`/documents/${docId}/claim-packet`, {
-        params: { userId: user?.userId || undefined },
+        params: documentScopeParams,
       })
       setClaimPacket(payload)
     } catch (error) {
@@ -955,7 +984,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
     try {
       setSourceUrlLoading(true)
       const payload = await apiClient.get<SourceUrlResponse>(`/documents/${docId}/source-url`, {
-        params: { userId: user?.userId || undefined, expiresIn: 900 },
+        params: { ...documentScopeParams, expiresIn: 900 },
       })
       if (!payload?.url) {
         alert('Source invoice is not available for this document.')
@@ -977,7 +1006,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
       setServiceCentersStatus('Checking your device location...')
       const location = await getCurrentLocation()
       const requestParams = {
-        userId: user?.userId || undefined,
+        ...(documentScopeParams || {}),
         radiusKm: 25,
         limit: 4,
       }
@@ -1110,18 +1139,23 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
       <div className="dashboard-shell flex items-center justify-center">
         <div className="text-center">
           <p className="text-slate-500 mb-4">Document not found</p>
-          <button onClick={() => router.push('/locker')} className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-blue-200/60 transition-all">Back to Locker</button>
+          <button onClick={() => router.push(defaultHomeRoute)} className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-blue-200/60 transition-all">
+            {user?.userType === 'merchant' ? 'Back to Merchant Dashboard' : 'Back to Locker'}
+          </button>
         </div>
       </div>
     )
   }
 
   const item = document.items[0]
+  const invoiceNumber = getDocumentInvoiceNumber(document)
+  const purchaseDate = getDocumentPurchaseDate(document)
+  const invoiceAmount = getDocumentInvoiceAmount(document)
   const deadline = getDeadlineMeta(item?.warrantyEnd, nowMs)
   const compliance = document.compliance
   const complianceUi = complianceTone(compliance?.status)
-  const displayAmount = formatCurrencyValue(item?.purchasePrice)
-  const displayPurchaseDate = formatDisplayDate(item?.purchaseDate)
+  const displayAmount = formatCurrencyValue(invoiceAmount)
+  const displayPurchaseDate = formatDisplayDate(purchaseDate)
   const displayWarrantyStart = formatDisplayDate(item?.warrantyStart)
   const displayWarrantyEnd = formatDisplayDate(item?.warrantyEnd)
   const insightSummary = formatInsightSummary(
@@ -1129,8 +1163,8 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
     {
       productName: item?.productName || document.title,
       sellerName: document.sellerName,
-      purchaseDate: displayPurchaseDate || item?.purchaseDate,
-      amount: item?.purchasePrice,
+      purchaseDate: displayPurchaseDate || purchaseDate,
+      amount: invoiceAmount,
     }
   )
   const insightState = getInsightState({
@@ -1155,7 +1189,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
   const quickQuestions = uniqueItems([
     'Summarize what this invoice covers and how much warranty time is left.',
     'What proof should I keep ready before I contact support?',
-    item?.invoiceNo ? `Check whether invoice ${item.invoiceNo} has any claim or compliance risk.` : '',
+    invoiceNumber ? `Check whether invoice ${invoiceNumber} has any claim or compliance risk.` : '',
     'What details are still missing or unclear in this invoice?',
   ]).slice(0, 4)
   const localizedDeadlineLabel = deadline
@@ -1336,7 +1370,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
                     />
                     <MetricPanel
                       label={translateUi('label.invoiceNo', 'Invoice No')}
-                      value={item?.invoiceNo || translateUi('value.notFound', 'Not found')}
+                      value={invoiceNumber || translateUi('value.notFound', 'Not found')}
                       tone="slate"
                     />
                     <MetricPanel
@@ -1478,7 +1512,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
                 <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
                   <SummaryChip label={translateUi('label.invoiceDate', 'Invoice Date')} value={displayPurchaseDate || translateUi('value.notFound', 'Not found')} />
                   <SummaryChip label={translateUi('label.invoiceAmount', 'Invoice Amount')} value={displayAmount || translateUi('value.notFound', 'Not found')} />
-                  <SummaryChip label={translateUi('label.invoiceNo', 'Invoice No')} value={item?.invoiceNo || translateUi('value.notFound', 'Not found')} />
+                  <SummaryChip label={translateUi('label.invoiceNo', 'Invoice No')} value={invoiceNumber || translateUi('value.notFound', 'Not found')} />
                   <SummaryChip label={translateUi('label.storeSeller', 'Supplier')} value={document.sellerName || translateUi('value.unknown', 'Unknown')} />
                 </div>
               </div>
@@ -1797,7 +1831,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
                 <InfoItem icon={Package} label={translateUi('label.brandModel', 'Brand/Model')} value={item?.model || translateUi('value.na', 'N/A')} />
                 <InfoItem icon={Hash} label={translateUi('label.category', 'Category')} value={document.category || translateUi('value.others', 'Others')} />
                 <InfoItem icon={Hash} label={translateUi('label.serialNumber', 'Serial Number')} value={item?.serialNumber || translateUi('value.na', 'N/A')} />
-                <InfoItem icon={Hash} label={translateUi('label.invoiceNo', 'Invoice No')} value={item?.invoiceNo || translateUi('value.na', 'N/A')} />
+                <InfoItem icon={Hash} label={translateUi('label.invoiceNo', 'Invoice No')} value={invoiceNumber || translateUi('value.na', 'N/A')} />
                 <InfoItem icon={Store} label={translateUi('label.storeSeller', 'Invoice Vendor')} value={document.sellerName || translateUi('value.na', 'N/A')} />
               </div>
             </section>
@@ -1807,7 +1841,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
                 <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-400">{translateUi('sections.purchaseLabel', 'Purchase Information')}</p>
                 <h2 className="mt-1 text-xl font-semibold text-slate-900">{translateUi('sections.purchase', 'Purchase Information')}</h2>
                 <div className="mt-5 grid grid-cols-1 gap-5">
-                  <InfoItem icon={Calendar} label={translateUi('label.purchaseDate', 'Purchase Date')} value={displayPurchaseDate || item?.purchaseDate || translateUi('value.na', 'N/A')} />
+                  <InfoItem icon={Calendar} label={translateUi('label.purchaseDate', 'Purchase Date')} value={displayPurchaseDate || purchaseDate || translateUi('value.na', 'N/A')} />
                   <InfoItem icon={DollarSign} label={translateUi('label.amount', 'Amount')} value={displayAmount || translateUi('value.na', 'N/A')} />
                 </div>
               </section>

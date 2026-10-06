@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import Counter
 from typing import Any
@@ -11,6 +12,8 @@ except Exception:  # pragma: no cover - optional runtime dependency
     boto3 = None  # type: ignore[assignment]
 
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 STOPWORDS = {
     "the",
@@ -66,10 +69,15 @@ class MetadataGenerator:
         }
 
     def generate(self, content: str, chunk_type: str, document_id: str, chunk_id: str) -> dict[str, Any]:
+        fallback = self._fallback_metadata(content, chunk_type)
         if not self.bedrock:
             if self.aws_only_mode:
-                raise RuntimeError("AWS-only mode: Bedrock runtime client is unavailable.")
-            return self._fallback_metadata(content, chunk_type)
+                logger.warning(
+                    "Bedrock runtime client unavailable for document_id=%s chunk_id=%s; using deterministic metadata fallback.",
+                    document_id,
+                    chunk_id,
+                )
+            return fallback
 
         prompt = (
             "You generate metadata for retrieval. Return strict JSON with keys: "
@@ -106,10 +114,9 @@ class MetadataGenerator:
             keywords = [str(keyword).lower().strip() for keyword in parsed.get("keywords", []) if str(keyword).strip()]
             questions = [str(item).strip() for item in parsed.get("hypothetical_questions", []) if str(item).strip()]
             if len(questions) < 3:
-                fallback = self._fallback_metadata(content, chunk_type)["hypothetical_questions"]
-                questions += fallback[: 3 - len(questions)]
+                fallback_questions = fallback["hypothetical_questions"]
+                questions += fallback_questions[: 3 - len(questions)]
             if not summary or not keywords:
-                fallback = self._fallback_metadata(content, chunk_type)
                 summary = summary or fallback["summary"]
                 keywords = keywords or fallback["keywords"]
             return {
@@ -118,6 +125,9 @@ class MetadataGenerator:
                 "hypothetical_questions": questions[:3],
             }
         except Exception:
-            if self.aws_only_mode:
-                raise
-            return self._fallback_metadata(content, chunk_type)
+            logger.exception(
+                "Bedrock metadata generation failed for document_id=%s chunk_id=%s; using deterministic metadata fallback.",
+                document_id,
+                chunk_id,
+            )
+            return fallback

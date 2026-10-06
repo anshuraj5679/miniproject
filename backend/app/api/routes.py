@@ -1208,6 +1208,69 @@ def _is_meaningful_metadata_value(value: object) -> bool:
     return True
 
 
+def _filename_stem(filename: str) -> str:
+    cleaned = str(filename or "").strip()
+    if not cleaned:
+        return ""
+    stem, _, _suffix = cleaned.rpartition(".")
+    return (stem or cleaned).strip()
+
+
+def _should_apply_bill_id_hint(current_value: object, *, filename: str) -> bool:
+    current = str(current_value or "").strip()
+    if not current:
+        return True
+    stem = _filename_stem(filename)
+    if stem and current.lower() == stem.lower():
+        return True
+    if current.upper().startswith(("IMAGE_OCR_", "IMAGE_OCR-", "INGEST_PDF-", "INGEST_IMAGE-")):
+        return True
+    return False
+
+
+def _should_apply_vendor_hint(current_value: object) -> bool:
+    current = str(current_value or "").strip()
+    return not current or current.upper() == "UNKNOWN_VENDOR"
+
+
+def _should_apply_date_hint(current_value: object) -> bool:
+    return _coerce_date(current_value) is None
+
+
+def _should_apply_total_hint(current_value: object) -> bool:
+    current = _coerce_float(current_value)
+    return current is None or current <= 0
+
+
+def _apply_invoice_request_hints(
+    metadata: dict[str, object],
+    *,
+    filename: str,
+    authoritative: bool,
+    bill_id: str | None,
+    vendor: str | None,
+    document_date: date | None,
+    total_amount: float | None,
+) -> dict[str, object]:
+    resolved = dict(metadata)
+
+    bill_id_hint = str(bill_id or "").strip()[:128]
+    if bill_id_hint and (authoritative or _should_apply_bill_id_hint(resolved.get("bill_id"), filename=filename)):
+        resolved["bill_id"] = bill_id_hint
+
+    vendor_hint = str(vendor or "").strip()[:255]
+    if vendor_hint and (authoritative or _should_apply_vendor_hint(resolved.get("vendor"))):
+        resolved["vendor"] = vendor_hint
+
+    if document_date and (authoritative or _should_apply_date_hint(resolved.get("date"))):
+        resolved["date"] = document_date.isoformat()
+
+    if total_amount is not None and (authoritative or _should_apply_total_hint(resolved.get("total_amount"))):
+        resolved["total_amount"] = total_amount
+
+    return resolved
+
+
 def _merge_invoice_metadata(
     preferred: dict[str, object] | None,
     fallback: dict[str, object],
@@ -2114,21 +2177,23 @@ def _persist_structured_document(
     fallback_metadata = ensure_strict_extraction(extract_invoice_metadata(extracted_text, filename))
     preferred_metadata = ensure_strict_extraction(extracted_metadata or {})
     metadata = ensure_strict_extraction(_merge_invoice_metadata(preferred_metadata, fallback_metadata))
-
-    if bill_id:
-        metadata["bill_id"] = bill_id.strip()[:128]
-    if vendor:
-        metadata["vendor"] = vendor.strip()[:255]
-    if document_date:
-        metadata["date"] = document_date.isoformat()
-    if total_amount is not None:
-        metadata["total_amount"] = total_amount
+    metadata = ensure_strict_extraction(
+        _apply_invoice_request_hints(
+            metadata,
+            filename=filename,
+            authoritative=(source == "merchant_manual"),
+            bill_id=bill_id,
+            vendor=vendor,
+            document_date=document_date,
+            total_amount=total_amount,
+        )
+    )
 
     fallback_bill = f"{source.upper()}-{int(time.time() * 1000)}"
-    resolved_bill_id = str(bill_id or metadata.get("bill_id") or fallback_bill)[:128]
-    resolved_vendor = str(vendor or metadata.get("vendor") or "UNKNOWN_VENDOR")[:256]
-    resolved_date = document_date if document_date is not None else _coerce_date(metadata.get("date"))
-    resolved_total = total_amount if total_amount is not None else _coerce_float(metadata.get("total_amount"))
+    resolved_bill_id = str(metadata.get("bill_id") or fallback_bill)[:128]
+    resolved_vendor = str(metadata.get("vendor") or "UNKNOWN_VENDOR")[:256]
+    resolved_date = _coerce_date(metadata.get("date"))
+    resolved_total = _coerce_float(metadata.get("total_amount"))
     if resolved_total is None:
         taxable_amount = _coerce_float(metadata.get("taxable_amount"))
         gst_amount = _coerce_float(metadata.get("gst_amount"))
@@ -2348,20 +2413,34 @@ def _persist_structured_document(
         if line_items_content and line_items_content != "[]":
             chunk_inputs.append(("line_items", line_items_content[:12000], {"section": "line_items", "source": source}))
 
-    # For image OCR flows, keep ingestion fast by avoiding per-chunk Bedrock calls.
-    fast_chunk_metadata = source in {"image_ocr", "image_ocr_router"}
+    # Keep OCR- and manual-entry ingestion fast by avoiding per-chunk model calls.
+    fast_chunk_metadata = source in {
+        "image_ocr",
+        "image_ocr_async",
+        "image_ocr_router",
+        "merchant_manual",
+    }
     chunk_records: list[Chunk] = []
     for chunk_type, content, metadata_json in chunk_inputs:
         chunk_id = uuid.uuid4()
         if fast_chunk_metadata:
             generated = services.ingestion.metadata_generator._fallback_metadata(content, chunk_type)  # type: ignore[attr-defined]
         else:
-            generated = services.ingestion.metadata_generator.generate(
-                content=content,
-                chunk_type=chunk_type,
-                document_id=str(document.id),
-                chunk_id=str(chunk_id),
-            )
+            try:
+                generated = services.ingestion.metadata_generator.generate(
+                    content=content,
+                    chunk_type=chunk_type,
+                    document_id=str(document.id),
+                    chunk_id=str(chunk_id),
+                )
+            except Exception:
+                logger.exception(
+                    "Chunk metadata generation failed for document_id=%s source=%s chunk_type=%s; using fallback metadata.",
+                    str(document.id),
+                    source,
+                    chunk_type,
+                )
+                generated = services.ingestion.metadata_generator._fallback_metadata(content, chunk_type)  # type: ignore[attr-defined]
         chunk_records.append(
             Chunk(
                 id=chunk_id,

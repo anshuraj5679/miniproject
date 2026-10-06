@@ -45,6 +45,19 @@ def _collapse_text(value: str, limit: int) -> str:
     return f"{trimmed}..."
 
 
+def _is_content_filter_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return any(
+        token in message
+        for token in (
+            "blocked by our content filters",
+            "content filter",
+            "safety system",
+            "violates content",
+        )
+    )
+
+
 class ProductImageService:
     def __init__(self) -> None:
         settings = get_settings()
@@ -171,6 +184,73 @@ class ProductImageService:
         )
         return _collapse_text(prompt, _MAX_TEXT_CHARS)
 
+    def _build_minimal_prompt(
+        self,
+        *,
+        subject: str,
+        brand: str,
+        category: str,
+    ) -> str:
+        focus_bits = [f"Photorealistic product photo of {_collapse_text(subject, 100)}."]
+        if brand:
+            focus_bits.append(f"Brand family: {_collapse_text(brand, 40)}.")
+        if category:
+            focus_bits.append(f"Category: {_collapse_text(category, 30)}.")
+        prompt = (
+            "Single consumer product only. Clean studio lighting. Plain background. "
+            + " ".join(focus_bits)
+            + " No text, no invoice, no packaging collage, no people, no hands, no logo overlay."
+        )
+        return _collapse_text(prompt, _MAX_TEXT_CHARS)
+
+    def _build_prompt_variants(
+        self,
+        *,
+        subject: str,
+        brand: str,
+        category: str,
+        vendor: str,
+        ocr_excerpt: str,
+    ) -> list[tuple[str, str]]:
+        prompts: list[tuple[str, str]] = [
+            (
+                "detailed",
+                self._build_prompt(
+                    subject=subject,
+                    brand=brand,
+                    category=category,
+                    vendor=vendor,
+                    ocr_excerpt=ocr_excerpt,
+                ),
+            ),
+            (
+                "product_only",
+                self._build_prompt(
+                    subject=subject,
+                    brand=brand,
+                    category=category,
+                    vendor="",
+                    ocr_excerpt="",
+                ),
+            ),
+            (
+                "minimal",
+                self._build_minimal_prompt(
+                    subject=subject,
+                    brand=brand,
+                    category=category,
+                ),
+            ),
+        ]
+        deduped: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for label, prompt in prompts:
+            if not prompt or prompt in seen:
+                continue
+            seen.add(prompt)
+            deduped.append((label, prompt))
+        return deduped
+
     def generate_for_document(self, *, document: Document, object_store: Any) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("Product image generation is disabled.")
@@ -191,12 +271,13 @@ class ProductImageService:
         category = str(references.get("category") or "").strip()
         vendor = str(document.vendor or "").strip()
         ocr_text, ocr_source = self._load_ocr_text(document, object_store)
-        prompt = self._build_prompt(
+        ocr_excerpt = self._ocr_lines(ocr_text)
+        prompt_variants = self._build_prompt_variants(
             subject=subject,
             brand=brand,
             category=category,
             vendor=vendor,
-            ocr_excerpt=self._ocr_lines(ocr_text),
+            ocr_excerpt=ocr_excerpt,
         )
         negative_prompt = _collapse_text(
             "invoice, bill, receipt, document, text overlay, watermark, logo, brand wordmark, person, hand, shopping scene, multiple products, collage, packaging",
@@ -204,49 +285,59 @@ class ProductImageService:
         )
         raw_seed = int(hashlib.sha256(f"{document.id}:{subject}".encode("utf-8")).hexdigest()[:8], 16)
         deterministic_seed = 1 + (raw_seed % _MAX_TITAN_SEED)
-        request_body = {
-            "taskType": "TEXT_IMAGE",
-            "textToImageParams": {
-                "text": prompt,
-                "negativeText": negative_prompt,
-            },
-            "imageGenerationConfig": {
-                "numberOfImages": 1,
-                "quality": "standard",
-                "width": self.width,
-                "height": self.height,
-                "cfgScale": 8.0,
-                "seed": deterministic_seed,
-            },
-        }
 
         response = None
         model_used = self.model
         region_used = self.preferred_region
+        prompt_variant_used = ""
+        prompt_used = ""
         last_error: Exception | None = None
-        for candidate_model, candidate_region in self._model_candidates():
-            client = self._client_for_region(candidate_region)
-            if client is None:
-                continue
-            try:
-                response = client.invoke_model(
-                    modelId=candidate_model,
-                    contentType="application/json",
-                    accept="application/json",
-                    body=json.dumps(request_body),
-                )
-                model_used = candidate_model
-                region_used = candidate_region
+        for prompt_variant, prompt in prompt_variants:
+            request_body = {
+                "taskType": "TEXT_IMAGE",
+                "textToImageParams": {
+                    "text": prompt,
+                    "negativeText": negative_prompt,
+                },
+                "imageGenerationConfig": {
+                    "numberOfImages": 1,
+                    "quality": "standard",
+                    "width": self.width,
+                    "height": self.height,
+                    "cfgScale": 8.0,
+                    "seed": deterministic_seed,
+                },
+            }
+            for candidate_model, candidate_region in self._model_candidates():
+                client = self._client_for_region(candidate_region)
+                if client is None:
+                    continue
+                try:
+                    response = client.invoke_model(
+                        modelId=candidate_model,
+                        contentType="application/json",
+                        accept="application/json",
+                        body=json.dumps(request_body),
+                    )
+                    model_used = candidate_model
+                    region_used = candidate_region
+                    prompt_variant_used = prompt_variant
+                    prompt_used = prompt
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(
+                        "Bedrock product image invoke failed model=%s region=%s variant=%s error=%s",
+                        candidate_model,
+                        candidate_region,
+                        prompt_variant,
+                        str(exc),
+                    )
+                    if _is_content_filter_error(exc):
+                        break
+                    continue
+            if response is not None:
                 break
-            except Exception as exc:
-                last_error = exc
-                logger.warning(
-                    "Bedrock product image invoke failed model=%s region=%s error=%s",
-                    candidate_model,
-                    candidate_region,
-                    str(exc),
-                )
-                continue
         if response is None:
             if last_error is not None:
                 raise last_error
@@ -289,8 +380,9 @@ class ProductImageService:
             "category": category,
             "vendor": vendor,
             "ocr_source": ocr_source,
-            "ocr_excerpt": self._ocr_lines(ocr_text),
-            "prompt": prompt,
+            "ocr_excerpt": ocr_excerpt,
+            "prompt_variant": prompt_variant_used,
+            "prompt": prompt_used,
             "negative_prompt": negative_prompt,
             "model": model_used,
             "model_region": region_used,

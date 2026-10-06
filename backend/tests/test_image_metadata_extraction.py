@@ -101,6 +101,39 @@ def test_extract_invoice_metadata_ignores_customer_number_in_line_items() -> Non
     assert any(abs(float(item.get("amount") or 0.0) - 27881.36) < 0.01 for item in line_items)
 
 
+def test_extract_invoice_metadata_prefers_tax_invoice_number_and_rejects_capacity_as_amount() -> None:
+    ocr_text = """
+    Tax Invoice
+    Apple India Private Limited
+    Apple Document Number: MB78190631
+    Tax Invoice Number: 9222000002664974
+    Tax Invoice Date: 10.06.2025
+    Customer Number: 919115
+    Place of Supply: KAR
+    000010 PD4A4HN/A
+    IPAD WIFI 128GB BLU-HIN
+    84713090
+    1
+    27,881.36
+    27,881.36
+    5,018.64
+    18.00
+    Serial Numbers for Item
+    10
+    Total Amount After Tax INR 32,900.00
+    """
+
+    metadata = extract_invoice_metadata(ocr_text, "apple-tax-invoice-live.png")
+
+    assert metadata["bill_id"] == "9222000002664974"
+    assert metadata["date"] == date(2025, 6, 10)
+    assert abs(float(metadata["total_amount"] or 0.0) - 32900.0) < 0.01
+    assert "serial numbers" not in str(metadata.get("product_name") or "").lower()
+    line_items = metadata.get("line_items") or []
+    assert all(abs(float(item.get("amount") or 0.0) - 128.0) > 0.01 for item in line_items)
+    assert all(abs(float(item.get("amount") or 0.0) - 10.0) > 0.01 for item in line_items)
+
+
 def test_extract_invoice_metadata_from_tools_invoice_avoids_address_and_pincode_mapping() -> None:
     ocr_text = """
     Gujarat Freight Tools

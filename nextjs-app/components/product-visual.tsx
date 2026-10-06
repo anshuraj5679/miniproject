@@ -49,7 +49,6 @@ async function ensureProductImage(docId: string): Promise<boolean> {
       return success
     })
     .catch(() => {
-      failedImages.add(docId)
       return false
     })
     .finally(() => {

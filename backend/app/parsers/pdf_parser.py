@@ -143,6 +143,8 @@ def _looks_like_non_merchandise_label(value: str) -> bool:
         "address",
         "pincode",
         "postal code",
+        "serial number",
+        "serial numbers",
         "hsn code",
         "item number",
         "tax rate",
@@ -153,6 +155,39 @@ def _looks_like_non_merchandise_label(value: str) -> bool:
     if re.fullmatch(r"(?:customer|invoice|document|order|po|gst|pan|hsn|item)\s*(?:no|number|id|code)", text):
         return True
     return False
+
+
+def _looks_like_product_spec_amount(amount: float | None, context_text: str | None) -> bool:
+    if amount is None:
+        return False
+    text = _clean_line(context_text or "")
+    if not text:
+        return False
+    rounded = round(amount)
+    if abs(amount - rounded) > 1e-6:
+        return False
+    size = int(rounded)
+    if size <= 0 or size > 5000:
+        return False
+    spec_units = (
+        "gb",
+        "tb",
+        "mb",
+        "mah",
+        "hz",
+        "inch",
+        "inches",
+        "cm",
+        "mm",
+        "mp",
+        "w",
+        "kw",
+    )
+    joined_units = "|".join(spec_units)
+    return bool(
+        re.search(rf"(?i)\b{size}\s*(?:{joined_units})\b", text)
+        or re.search(rf"(?i)\b(?:{joined_units})\s*{size}\b", text)
+    )
 
 
 def _extract_labeled_value(text: str, labels: list[str]) -> str | None:
@@ -182,8 +217,8 @@ def _extract_labeled_date(text: str, labels: list[str]) -> date | None:
 
 def _extract_bill_id(text: str, filename: str) -> str:
     patterns: list[tuple[int, str]] = [
-        (65, r"(?im)\b(?:apple\s*)?document\s*number\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{4,})"),
-        (60, r"(?im)\btax\s*invoice\s*number\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{4,})"),
+        (72, r"(?im)\btax\s*invoice\s*number\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{4,})"),
+        (62, r"(?im)\b(?:apple\s*)?document\s*number\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{4,})"),
         (40, r"(?im)\b(?:invoice\s*\/\s*bill|bill\s*\/\s*invoice)\s*(?:no|number|#|id)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})"),
         (40, r"(?im)\binvoice\s*(?:no\.?|number|#|id)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})"),
         (35, r"(?im)\binv\s*(?:no\.?|number|#)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})"),
@@ -206,7 +241,10 @@ def _extract_bill_id(text: str, filename: str) -> str:
             prefix = text[max(0, match.start() - 24): match.start()].lower()
             if "po " in prefix or "purchase order" in prefix:
                 continue
-            if value.isdigit() and len(value) >= 15:
+            explicit_invoice_label = bool(
+                re.search(r"(?i)\b(?:tax\s*)?invoice\s*(?:no\.?|number|#|id)\b", full_match)
+            )
+            if value.isdigit() and len(value) >= 15 and not explicit_invoice_label:
                 continue
             score = priority
             if value.upper().startswith("INV"):
@@ -552,6 +590,8 @@ def _extract_line_items_from_text(lines: list[str]) -> list[dict[str, Any]]:
 
         if table_names:
             paired_amounts = table_amounts[-len(table_names) :] if len(table_amounts) >= len(table_names) else []
+            if len(table_names) == 1 and table_amounts:
+                paired_amounts = [max(table_amounts)]
             recovered: list[dict[str, Any]] = []
             for index, name in enumerate(table_names):
                 entry: dict[str, Any] = {"name": name}
@@ -621,15 +661,19 @@ def _extract_line_items_from_text(lines: list[str]) -> list[dict[str, Any]]:
             if "." in token or "," in token
         ]
         decimal_candidates = [value for value in decimal_candidates if value is not None and 0 < value <= 1_000_000]
+        has_currency = bool(currency_re.search(line))
         if decimal_candidates:
             amount = decimal_candidates[-1]
             if amount is not None and amount <= 100 and len(decimal_candidates) >= 2:
                 amount = max(decimal_candidates[:-1])
         elif amount is None:
+            if amount_match is None and not has_currency:
+                continue
             amount = numeric_candidates[-1]
         if amount is None or amount <= 0:
             continue
-        has_currency = bool(currency_re.search(line))
+        if _looks_like_product_spec_amount(amount, line) and not has_currency:
+            continue
         if len(numeric_candidates) == 1 and not has_currency:
             if ":" in line:
                 continue

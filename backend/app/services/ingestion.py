@@ -48,6 +48,61 @@ class IngestionService:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _filename_stem(filename: str) -> str:
+        cleaned = str(filename or "").strip()
+        if not cleaned:
+            return ""
+        stem, _, _suffix = cleaned.rpartition(".")
+        return (stem or cleaned).strip()
+
+    @classmethod
+    def _should_apply_bill_id_hint(cls, current_value: Any, *, filename: str) -> bool:
+        current = str(current_value or "").strip()
+        if not current:
+            return True
+        stem = cls._filename_stem(filename)
+        return bool(stem and current.lower() == stem.lower())
+
+    @staticmethod
+    def _should_apply_vendor_hint(current_value: Any) -> bool:
+        current = str(current_value or "").strip()
+        return not current or current.upper() == "UNKNOWN_VENDOR"
+
+    @staticmethod
+    def _should_apply_date_hint(current_value: Any) -> bool:
+        return current_value in (None, "")
+
+    @classmethod
+    def _apply_request_hints(
+        cls,
+        *,
+        filename: str,
+        parsed_metadata: dict[str, Any],
+        bill_id: str | None,
+        vendor: str | None,
+        document_date: date | None,
+        total_amount: float | None,
+    ) -> dict[str, Any]:
+        resolved = dict(parsed_metadata)
+
+        bill_id_hint = str(bill_id or "").strip()[:128]
+        if bill_id_hint and cls._should_apply_bill_id_hint(resolved.get("bill_id"), filename=filename):
+            resolved["bill_id"] = bill_id_hint
+
+        vendor_hint = str(vendor or "").strip()[:255]
+        if vendor_hint and cls._should_apply_vendor_hint(resolved.get("vendor")):
+            resolved["vendor"] = vendor_hint
+
+        if document_date and cls._should_apply_date_hint(resolved.get("date")):
+            resolved["date"] = document_date
+
+        current_total = cls._safe_float(resolved.get("total_amount"))
+        if total_amount is not None and (current_total is None or current_total <= 0):
+            resolved["total_amount"] = total_amount
+
+        return resolved
+
     def _extract_line_items_from_tables(self, tables: list[dict[str, Any]]) -> list[dict[str, Any]]:
         extracted: list[dict[str, Any]] = []
         ignored_names = {"total", "subtotal", "grand total", "tax", "gst", "cgst", "sgst", "igst"}
@@ -150,11 +205,19 @@ class IngestionService:
         if len(chunks) > self.settings.max_chunks_per_document:
             raise ValueError("Document exceeds configured chunk limit.")
         parsed_metadata = parsed.metadata if isinstance(parsed.metadata, dict) else {}
+        parsed_metadata = self._apply_request_hints(
+            filename=filename,
+            parsed_metadata=parsed_metadata,
+            bill_id=bill_id,
+            vendor=vendor,
+            document_date=document_date,
+            total_amount=total_amount,
+        )
 
         resolved_bill_id = str(
             self._coalesce(
-                bill_id,
                 parsed_metadata.get("bill_id"),
+                None,
             )
             or filename.rsplit(".", 1)[0]
             or f"PDF-{int(time.time() * 1000)}"
@@ -170,9 +233,9 @@ class IngestionService:
         if latest_version is not None and latest_version >= requested_version:
             resolved_version = int(latest_version) + 1
 
-        resolved_vendor = str(self._coalesce(vendor, parsed_metadata.get("vendor")) or "UNKNOWN_VENDOR")[:255]
-        resolved_date = self._coalesce(document_date, parsed_metadata.get("date"))
-        resolved_total_amount = self._coalesce(total_amount, parsed_metadata.get("total_amount"))
+        resolved_vendor = str(self._coalesce(parsed_metadata.get("vendor"), None) or "UNKNOWN_VENDOR")[:255]
+        resolved_date = self._coalesce(parsed_metadata.get("date"), None)
+        resolved_total_amount = self._coalesce(parsed_metadata.get("total_amount"), None)
 
         default_title = str(parsed_metadata.get("product_name") or filename.rsplit(".", 1)[0] or "Uploaded Document").strip()
         if not default_title:

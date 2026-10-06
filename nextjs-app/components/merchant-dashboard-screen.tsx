@@ -37,6 +37,7 @@ import type { Document, ExtractionReview, InAppNotification, MerchantActivity, M
 
 type WorkspaceTab = 'upload' | 'manual' | 'reassign'
 type NavigationMode = 'workspace' | 'activity'
+type WorkspacePanel = 'inventory' | 'review'
 type NoticeTone = 'success' | 'error'
 
 interface ConsumerLookup {
@@ -209,6 +210,12 @@ function formatReviewFieldLabel(key: keyof ReviewDraft): string {
   return labels[key]
 }
 
+function getWorkspaceTabLabel(tab: WorkspaceTab): string {
+  if (tab === 'manual') return 'Manual bill'
+  if (tab === 'reassign') return 'Reassign existing'
+  return 'Upload and assign'
+}
+
 function buildClientAuthHeaders(): HeadersInit | undefined {
   if (typeof window === 'undefined') return undefined
   const token = localStorage.getItem('auth_token')?.trim()
@@ -351,12 +358,14 @@ function EmptyPanel({
 export function MerchantDashboardScreen() {
   const router = useRouter()
   const { user, clearAuth } = useAuthStore()
-  const activityPanelRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const inventoryPanelRef = useRef<HTMLDivElement>(null)
+  const activityPanelRef = useRef<HTMLDivElement>(null)
 
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [activeNav, setActiveNav] = useState<NavigationMode>('workspace')
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('upload')
+  const [activeWorkspacePanel, setActiveWorkspacePanel] = useState<WorkspacePanel>('inventory')
 
   const [documents, setDocuments] = useState<Document[]>([])
   const [recentActivity, setRecentActivity] = useState<MerchantActivity[]>([])
@@ -854,11 +863,39 @@ export function MerchantDashboardScreen() {
     router.push('/landing')
   }, [clearAuth, router])
 
+  const scrollInventoryPanelIntoView = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        inventoryPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      })
+    })
+  }, [])
+
+  const scrollActivityPanelIntoView = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        activityPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      })
+    })
+  }, [])
+
+  const openInventoryPanel = useCallback(() => {
+    setActiveWorkspacePanel('inventory')
+    setInventoryQuery('')
+    scrollInventoryPanelIntoView()
+  }, [scrollInventoryPanelIntoView])
+
+  const navigateToWorkspace = useCallback(() => {
+    setActiveNav('workspace')
+    setSidebarOpen(false)
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }, [])
+
   const navigateToActivity = useCallback(() => {
     setActiveNav('activity')
     setSidebarOpen(false)
-    activityPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  }, [])
+    scrollActivityPanelIntoView()
+  }, [scrollActivityPanelIntoView])
 
   if (!user) {
     return (
@@ -895,11 +932,7 @@ export function MerchantDashboardScreen() {
               icon={LayoutDashboard}
               label="Assignment Console"
               active={activeNav === 'workspace'}
-              onClick={() => {
-                setActiveNav('workspace')
-                setSidebarOpen(false)
-                window.scrollTo({ top: 0, behavior: 'smooth' })
-              }}
+              onClick={navigateToWorkspace}
             />
             <SidebarNavItem icon={Clock3} label="Merchant Activity" active={activeNav === 'activity'} onClick={navigateToActivity} />
           </div>
@@ -918,8 +951,8 @@ export function MerchantDashboardScreen() {
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col">
-        <div className="dashboard-navbar flex items-center justify-between gap-4 px-4 py-4 lg:px-8">
-          <div className="flex items-center gap-3 lg:min-w-[340px] lg:flex-1">
+        <div className="dashboard-navbar flex flex-col gap-4 px-4 py-4 lg:flex-row lg:items-center lg:justify-between lg:px-8">
+          <div className="flex items-center gap-3">
             <button
               className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-slate-200 bg-white text-slate-600 shadow-sm lg:hidden"
               onClick={() => setSidebarOpen(true)}
@@ -927,19 +960,20 @@ export function MerchantDashboardScreen() {
             >
               <Menu className="h-5 w-5" />
             </button>
-            <div className="relative hidden flex-1 lg:block">
-              <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-              <input
-                type="text"
-                value={inventoryQuery}
-                onChange={(event) => setInventoryQuery(event.target.value)}
-                placeholder="Search invoices, products, consumer IDs, or vendors"
-                className="dashboard-input h-12 rounded-2xl border-slate-200 pl-11 pr-4 shadow-sm"
-              />
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Merchant dashboard</p>
+              <h2 className="mt-1 text-lg font-semibold tracking-tight text-slate-950">
+                {activeNav === 'workspace' ? 'Assignment console' : 'Merchant activity'}
+              </h2>
+              <p className="mt-1 text-sm text-slate-500">
+                {activeNav === 'workspace'
+                  ? 'Resolve consumers, process bills, and manage reassignment from one focused workspace.'
+                  : 'Track consumer responses, notifications, and locker events without mixing them into the bill form.'}
+              </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 self-end lg:self-auto">
             <button
               type="button"
               onClick={loadWorkspace}
@@ -974,9 +1008,9 @@ export function MerchantDashboardScreen() {
         </div>
 
         <div className="flex-1 overflow-y-auto px-4 pb-10 pt-6 lg:px-8">
-          <div className="mx-auto flex w-full max-w-7xl flex-col gap-6">
+          <div className="mx-auto flex w-full max-w-[1560px] flex-col gap-6">
             <section className="dashboard-card overflow-hidden">
-              <div className="grid gap-6 px-6 py-6 lg:grid-cols-[1.35fr_0.9fr] lg:px-8 lg:py-8">
+              <div className="grid gap-6 px-6 py-6 xl:grid-cols-[minmax(0,1.28fr)_380px] lg:px-8 lg:py-8">
                 <div>
                   <p className="text-sm font-semibold text-blue-600">Merchant assignment workflow</p>
                   <h1 className="mt-2 text-4xl font-bold tracking-tight text-slate-950">Assign every bill through consumer ID</h1>
@@ -985,20 +1019,15 @@ export function MerchantDashboardScreen() {
                   </p>
 
                   <div className="mt-5 flex flex-wrap gap-3">
-                    <button
-                      onClick={() => setActiveTab('upload')}
-                      className="inline-flex items-center gap-2 rounded-2xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-[0_14px_26px_-18px_rgba(37,99,235,0.9)] transition hover:bg-blue-700"
-                    >
-                      <Upload className="h-4 w-4" />
-                      Upload and assign
-                    </button>
-                    <button
-                      onClick={() => setActiveTab('manual')}
-                      className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
-                    >
-                      <Plus className="h-4 w-4" />
-                      Create manual bill
-                    </button>
+                    <div className="rounded-2xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-900">
+                      <span className="font-semibold">Current workflow:</span> {getWorkspaceTabLabel(activeTab)}
+                    </div>
+                    <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700">
+                      <span className="font-semibold">Review queue:</span> {reviewQueue.length} pending
+                    </div>
+                    <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700">
+                      <span className="font-semibold">Inventory:</span> {documents.length} merchant invoice{documents.length === 1 ? '' : 's'}
+                    </div>
                   </div>
                 </div>
 
@@ -1030,6 +1059,11 @@ export function MerchantDashboardScreen() {
                       <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Step 3</p>
                       <p className="mt-1 text-sm font-semibold text-slate-900">Confirm locker assignment</p>
                     </div>
+                  </div>
+                  <div className="mt-4 rounded-2xl border border-white/70 bg-white/70 px-4 py-3 text-sm text-slate-600">
+                    {activeNav === 'workspace'
+                      ? 'Workspace view keeps consumer lookup, bill workflow, and the selected secondary panel visible without stacking every operational feed below it.'
+                      : 'Activity view isolates notifications, assignment audits, and locker changes so the bill form is not competing for space.'}
                   </div>
                 </div>
               </div>
@@ -1072,8 +1106,8 @@ export function MerchantDashboardScreen() {
               />
             </section>
 
-            <section className="grid gap-6 xl:grid-cols-[1.4fr_0.95fr]">
-              <div className="space-y-6">
+            <section className={activeNav === 'workspace' ? 'grid gap-6 2xl:grid-cols-[minmax(0,1.45fr)_380px]' : 'grid gap-6'}>
+              <div className={activeNav === 'workspace' ? 'space-y-6' : 'hidden'}>
                 <div className="dashboard-card p-6">
                   <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                     <div>
@@ -1094,7 +1128,7 @@ export function MerchantDashboardScreen() {
                     </div>
                   </div>
 
-                  <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_auto]">
+                  <div className="mt-5 grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
                     <div className="relative">
                       <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
                       <input
@@ -1108,14 +1142,14 @@ export function MerchantDashboardScreen() {
                           }
                         }}
                         placeholder="Enter SafeBill consumer ID, for example CON-AB12CD"
-                        className="dashboard-input h-12 rounded-2xl border-slate-200 pl-11 pr-4"
+                        className="dashboard-input h-12 rounded-2xl border-slate-200 !pl-11 pr-4"
                       />
                     </div>
-                    <div className="flex gap-2">
+                    <div className="flex flex-col gap-2 sm:flex-row lg:justify-end">
                       <button
                         onClick={() => void handleLookup()}
                         disabled={lookupLoading || !consumerLookupInput.trim()}
-                        className="inline-flex items-center gap-2 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+                        className="inline-flex h-12 min-w-[164px] items-center justify-center gap-2 rounded-2xl bg-slate-900 px-4 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
                       >
                         {lookupLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
                         Verify consumer
@@ -1127,7 +1161,7 @@ export function MerchantDashboardScreen() {
                             setResolvedConsumer(null)
                             setLookupError(null)
                           }}
-                          className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-50"
+                          className="inline-flex h-12 items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-600 transition hover:bg-slate-50"
                         >
                           <X className="h-4 w-4" />
                           Clear
@@ -1159,23 +1193,15 @@ export function MerchantDashboardScreen() {
                       <div className="rounded-[26px] border border-slate-200 bg-slate-50 px-5 py-5">
                         <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">Next action</p>
                         <p className="mt-3 text-sm leading-6 text-slate-600">
-                          Move to upload, manual issue, or select an existing invoice card and reassign it immediately.
+                          Continue in <span className="font-semibold text-slate-900">{getWorkspaceTabLabel(activeTab)}</span>. Use the workflow switch beside this panel to upload, create, or reassign without jumping around the page.
                         </p>
-                        <div className="mt-4 flex gap-2">
-                          <button
-                            onClick={() => setActiveTab('upload')}
-                            className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-3 py-2 text-sm font-semibold text-white transition hover:bg-blue-700"
-                          >
-                            <Upload className="h-4 w-4" />
-                            Upload
-                          </button>
-                          <button
-                            onClick={() => setActiveTab('manual')}
-                            className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
-                          >
-                            <Plus className="h-4 w-4" />
-                            Manual bill
-                          </button>
+                        <div className="mt-4 flex flex-wrap gap-2">
+                          <span className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700">
+                            {getWorkspaceTabLabel(activeTab)}
+                          </span>
+                          <span className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-500">
+                            {selectedDocument ? 'Invoice selected for reassignment' : 'No invoice selected yet'}
+                          </span>
                         </div>
                       </div>
                     </div>
@@ -1476,8 +1502,8 @@ export function MerchantDashboardScreen() {
                           <EmptyPanel
                             title="Pick an invoice from the merchant bill list"
                             description="Select any existing bill below, then reassign it to the active consumer without leaving the merchant workspace."
-                            actionLabel="Jump to bill inventory"
-                            onAction={() => window.scrollTo({ top: 980, behavior: 'smooth' })}
+                            actionLabel="Open bill inventory"
+                            onAction={openInventoryPanel}
                           />
                         )}
                       </>
@@ -1485,6 +1511,7 @@ export function MerchantDashboardScreen() {
                   </div>
                 </div>
 
+                {activeWorkspacePanel === 'review' ? (
                 <div className="dashboard-card p-6">
                   <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                     <div>
@@ -1494,9 +1521,27 @@ export function MerchantDashboardScreen() {
                         Merchant operators can verify OCR output, correct mapped fields, and push the confirmed values back into the document record.
                       </p>
                     </div>
-                    <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">
-                      {reviewQueue.length} pending review
-                    </span>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">
+                        {reviewQueue.length} pending review
+                      </span>
+                      <div className="flex flex-wrap gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-1.5">
+                        <button
+                          onClick={() => setActiveWorkspacePanel('inventory')}
+                          className="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold text-slate-500 transition hover:text-slate-900"
+                        >
+                          <Package className="h-4 w-4" />
+                          Inventory
+                        </button>
+                        <button
+                          onClick={() => setActiveWorkspacePanel('review')}
+                          className="inline-flex items-center gap-2 rounded-xl bg-white px-4 py-2.5 text-sm font-semibold text-slate-950 shadow-sm"
+                        >
+                          <ShieldCheck className="h-4 w-4" />
+                          OCR review
+                        </button>
+                      </div>
+                    </div>
                   </div>
 
                   <div className="mt-6 grid gap-5 xl:grid-cols-[0.95fr_1.15fr]">
@@ -1635,34 +1680,55 @@ export function MerchantDashboardScreen() {
                     </div>
                   </div>
                 </div>
+                ) : null}
 
-                <div className="dashboard-card p-6">
+                {activeWorkspacePanel === 'inventory' ? (
+                <div ref={inventoryPanelRef} className="dashboard-card scroll-mt-28 p-6">
                   <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                     <div>
                       <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Bill inventory</p>
                       <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-950">Merchant-assigned invoices</h2>
                       <p className="mt-2 text-sm leading-6 text-slate-500">Search, review, open, or reassign any bill already linked to this merchant workspace.</p>
                     </div>
-                    <div className="relative w-full lg:max-w-sm">
-                      <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-                      <input
-                        type="text"
-                        value={inventoryQuery}
-                        onChange={(event) => setInventoryQuery(event.target.value)}
-                        placeholder="Search product, invoice, vendor, consumer"
-                        className="dashboard-input pl-11"
-                      />
+                    <div className="flex flex-wrap gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-1.5">
+                      <button
+                        onClick={() => setActiveWorkspacePanel('inventory')}
+                        className="inline-flex items-center gap-2 rounded-xl bg-white px-4 py-2.5 text-sm font-semibold text-slate-950 shadow-sm"
+                      >
+                        <Package className="h-4 w-4" />
+                        Inventory
+                      </button>
+                      <button
+                        onClick={() => setActiveWorkspacePanel('review')}
+                        className="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold text-slate-500 transition hover:text-slate-900"
+                      >
+                        <ShieldCheck className="h-4 w-4" />
+                        OCR review
+                        <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-700">{reviewQueue.length}</span>
+                      </button>
                     </div>
                   </div>
 
-                  <div className="mt-5 flex items-center justify-between text-sm text-slate-500">
-                    <p>Showing {filteredDocuments.length} of {documents.length} invoices</p>
-                    {workspaceLoading ? (
-                      <div className="inline-flex items-center gap-2">
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                        Syncing merchant data
+                  <div className="mt-5 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                    <p className="text-sm text-slate-500">Showing {filteredDocuments.length} of {documents.length} invoices</p>
+                    <div className="flex w-full flex-col gap-3 sm:flex-row lg:max-w-[520px] lg:justify-end">
+                      <div className="relative flex-1">
+                        <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                        <input
+                          type="text"
+                          value={inventoryQuery}
+                          onChange={(event) => setInventoryQuery(event.target.value)}
+                          placeholder="Search product, invoice, vendor, consumer"
+                          className="dashboard-input h-12 !pl-11 pr-4"
+                        />
                       </div>
-                    ) : null}
+                      {workspaceLoading ? (
+                        <div className="inline-flex h-12 items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 px-4 text-sm text-slate-500">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Syncing merchant data
+                        </div>
+                      ) : null}
+                    </div>
                   </div>
 
                   <div className="mt-6 grid gap-4 xl:grid-cols-2">
@@ -1671,11 +1737,11 @@ export function MerchantDashboardScreen() {
                         <EmptyPanel
                           title="No merchant invoices match this search"
                           description="Upload a new invoice, create a manual bill, or clear your search terms to see more merchant-owned documents."
-                          actionLabel={documents.length === 0 ? 'Upload first invoice' : 'Clear search'}
+                          actionLabel={documents.length === 0 ? 'Open upload flow' : 'Clear search'}
                           onAction={() => {
                             if (documents.length === 0) {
                               setActiveTab('upload')
-                              window.scrollTo({ top: 440, behavior: 'smooth' })
+                              window.scrollTo({ top: 0, behavior: 'smooth' })
                             } else {
                               setInventoryQuery('')
                             }
@@ -1746,230 +1812,267 @@ export function MerchantDashboardScreen() {
                               onClick={() => {
                                 setSelectedDocumentId(document.docId)
                                 setActiveTab('reassign')
+                                window.scrollTo({ top: 0, behavior: 'smooth' })
                               }}
                               className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
                             >
                               <Link2 className="h-4 w-4" />
                               Reassign
                             </button>
-                            <button
-                              onClick={() => void assignDocumentToConsumer(document.docId, selectedConsumer || undefined)}
-                              disabled={!canAssignToActiveConsumer || assignBusyDocId === document.docId}
-                              className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-3 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-300"
-                            >
-                              {assignBusyDocId === document.docId ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                              {canAssignToActiveConsumer ? 'Assign to active consumer' : 'Pick another consumer'}
-                            </button>
+                            {canAssignToActiveConsumer ? (
+                              <button
+                                onClick={() => void assignDocumentToConsumer(document.docId, selectedConsumer || undefined)}
+                                disabled={assignBusyDocId === document.docId}
+                                className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-3 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+                              >
+                                {assignBusyDocId === document.docId ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                                Assign to active consumer
+                              </button>
+                            ) : (
+                              <div className="inline-flex items-center rounded-xl border border-dashed border-slate-200 px-3 py-2 text-sm text-slate-500">
+                                {selectedConsumer ? 'Already assigned to active consumer' : 'Resolve a consumer to enable quick assign'}
+                              </div>
+                            )}
                           </div>
                         </article>
                       )
                     })}
                   </div>
                 </div>
+                ) : null}
               </div>
 
-              <div ref={activityPanelRef} className="space-y-6">
-                <div className="dashboard-card overflow-hidden">
-                  <div className="border-b border-slate-100 px-5 py-4">
-                    <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Active recipient</p>
-                    <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Assignment context</h2>
-                  </div>
-                  <div className="p-5">
-                    {selectedConsumer ? (
-                      <div className="rounded-[28px] border border-blue-100 bg-[linear-gradient(135deg,#eff6ff_0%,#ffffff_100%)] p-5">
-                        <div className="flex items-start justify-between gap-4">
-                          <div>
-                            <p className="text-lg font-semibold text-slate-950">{selectedConsumer.fullName}</p>
-                            <p className="mt-1 text-sm text-slate-500">{selectedConsumer.customId}</p>
-                            <p className="mt-1 text-sm text-slate-500">{selectedConsumer.email || 'No email on record'}</p>
+              <div className="space-y-6">
+                {activeNav === 'workspace' ? (
+                  <>
+                    <div className="dashboard-card overflow-hidden">
+                      <div className="border-b border-slate-100 px-5 py-4">
+                        <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Active recipient</p>
+                        <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Assignment context</h2>
+                      </div>
+                      <div className="p-5">
+                        {selectedConsumer ? (
+                          <div className="rounded-[28px] border border-blue-100 bg-[linear-gradient(135deg,#eff6ff_0%,#ffffff_100%)] p-5">
+                            <div className="flex items-start justify-between gap-4">
+                              <div>
+                                <p className="text-lg font-semibold text-slate-950">{selectedConsumer.fullName}</p>
+                                <p className="mt-1 text-sm text-slate-500">{selectedConsumer.customId}</p>
+                                <p className="mt-1 text-sm text-slate-500">{selectedConsumer.email || 'No email on record'}</p>
+                              </div>
+                              <div className="rounded-2xl border border-white bg-white p-3 text-blue-600 shadow-sm">
+                                <UserCheck className="h-5 w-5" />
+                              </div>
+                            </div>
+                            <div className="mt-5 space-y-3">
+                              <div className="rounded-2xl border border-white/80 bg-white/80 px-4 py-3">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Active workflow</p>
+                                <p className="mt-1 text-sm font-semibold text-slate-900">{getWorkspaceTabLabel(activeTab)}</p>
+                              </div>
+                              <div className="rounded-2xl border border-white/80 bg-white/80 px-4 py-3">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Selected bill</p>
+                                <p className="mt-1 text-sm font-semibold text-slate-900">{selectedDocument?.title || 'No invoice selected'}</p>
+                              </div>
+                            </div>
                           </div>
-                          <div className="rounded-2xl border border-white bg-white p-3 text-blue-600 shadow-sm">
-                            <UserCheck className="h-5 w-5" />
-                          </div>
+                        ) : (
+                          <EmptyPanel
+                            title="No active consumer selected"
+                            description="Resolve a consumer with their SafeBill ID to unlock upload, manual issue, and fast reassignment actions."
+                          />
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="dashboard-card overflow-hidden">
+                      <div className="border-b border-slate-100 px-5 py-4">
+                        <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Workspace summary</p>
+                        <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">What needs attention</h2>
+                      </div>
+                      <div className="grid gap-3 p-5">
+                        <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Assignments awaiting response</p>
+                          <p className="mt-2 text-2xl font-semibold text-slate-950">{pendingAuditCount}</p>
+                          <p className="mt-1 text-xs text-slate-500">Consumer acceptance and escalations continue in Merchant Activity.</p>
                         </div>
-                        <div className="mt-5 space-y-3">
-                          <div className="rounded-2xl border border-white/80 bg-white/80 px-4 py-3">
-                            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Ready actions</p>
-                            <p className="mt-1 text-sm font-semibold text-slate-900">Upload invoice, create manual bill, or reassign existing invoice</p>
-                          </div>
-                          <button
-                            onClick={() => setActiveTab('upload')}
-                            className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-3 py-2 text-sm font-semibold text-white transition hover:bg-blue-700"
-                          >
-                            <Upload className="h-4 w-4" />
-                            Use in upload flow
-                          </button>
+                        <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Unread merchant notifications</p>
+                          <p className="mt-2 text-2xl font-semibold text-slate-950">{unreadNotifications.length}</p>
+                          <p className="mt-1 text-xs text-slate-500">The bell icon switches to the activity feed when you need the details.</p>
+                        </div>
+                        <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">OCR queue</p>
+                          <p className="mt-2 text-2xl font-semibold text-slate-950">{reviewQueue.length}</p>
+                          <p className="mt-1 text-xs text-slate-500">Switch the secondary panel to OCR review when extraction confidence needs correction.</p>
                         </div>
                       </div>
-                    ) : (
-                      <EmptyPanel
-                        title="No active consumer selected"
-                        description="Resolve a consumer with their SafeBill ID to unlock upload, manual issue, and fast reassignment actions."
-                      />
-                    )}
-                  </div>
-                </div>
-
-                <div className="dashboard-card overflow-hidden">
-                  <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Consumer sync</p>
-                      <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Assignment and notification state</h2>
                     </div>
-                    <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
-                      {unreadNotifications.length} unread
-                    </span>
-                  </div>
-                  <div className="p-5">
-                    {unreadNotifications.length === 0 && assignmentAudits.length === 0 ? (
-                      <EmptyPanel
-                        title="No sync events yet"
-                        description="Unread notifications, consumer acknowledgments, and escalations will appear here as the assignment workflow progresses."
-                      />
-                    ) : (
-                      <div className="space-y-4">
-                        <div className="grid gap-3 sm:grid-cols-2">
-                          <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3">
-                            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Assignments awaiting response</p>
-                            <p className="mt-2 text-2xl font-semibold text-slate-950">{pendingAuditCount}</p>
-                            <p className="mt-1 text-xs text-slate-500">Accepted or escalated status from consumers updates the audit trail automatically.</p>
-                          </div>
-                          <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3">
-                            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Unread merchant notifications</p>
-                            <p className="mt-2 text-2xl font-semibold text-slate-950">{unreadNotifications.length}</p>
-                            <p className="mt-1 text-xs text-slate-500">Notifications are scheduled from the same assignment and document workflow.</p>
-                          </div>
-                        </div>
 
-                        {unreadNotifications.length ? (
-                          <div className="space-y-3">
-                            {unreadNotifications.slice(0, 4).map((notification) => (
-                              <article key={notification.notificationId} className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
-                                <p className="text-sm font-semibold text-slate-950">{notification.title}</p>
-                                <p className="mt-1 text-xs leading-5 text-slate-500">{notification.message}</p>
-                                <p className="mt-2 text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400">
-                                  {notification.eventType || notification.type} | {formatRelativeTime(notification.triggerAt)}
-                                </p>
-                              </article>
+                    <div className="dashboard-action-card p-5">
+                      <p className="text-xs font-semibold uppercase tracking-[0.22em] text-blue-100/65">Merchant guidance</p>
+                      <h2 className="mt-2 text-2xl font-semibold tracking-tight text-white">Keep assignments clean</h2>
+                      <div className="mt-5 space-y-3 text-sm text-blue-50/90">
+                        <div className="rounded-2xl border border-white/10 bg-white/10 px-4 py-3">Verify the consumer ID before uploading, so every locker assignment lands on the correct account.</div>
+                        <div className="rounded-2xl border border-white/10 bg-white/10 px-4 py-3">Use reassign only when the invoice already exists in this merchant workspace and the owner needs to change.</div>
+                        <div className="rounded-2xl border border-white/10 bg-white/10 px-4 py-3">Open the document after assignment if OCR, amount, or verification status needs a final review.</div>
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="dashboard-card overflow-hidden">
+                    <div ref={activityPanelRef} className="scroll-mt-28">
+                      <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+                        <div>
+                          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Consumer sync</p>
+                          <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Assignment and notification state</h2>
+                        </div>
+                        <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
+                          {unreadNotifications.length} unread
+                        </span>
+                      </div>
+                      <div className="p-5">
+                        {unreadNotifications.length === 0 && assignmentAudits.length === 0 ? (
+                          <EmptyPanel
+                            title="No sync events yet"
+                            description="Unread notifications, consumer acknowledgments, and escalations will appear here as the assignment workflow progresses."
+                          />
+                        ) : (
+                          <div className="space-y-4">
+                            <div className="grid gap-3 sm:grid-cols-2">
+                              <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Assignments awaiting response</p>
+                                <p className="mt-2 text-2xl font-semibold text-slate-950">{pendingAuditCount}</p>
+                                <p className="mt-1 text-xs text-slate-500">Accepted or escalated status from consumers updates the audit trail automatically.</p>
+                              </div>
+                              <div className="rounded-2xl border border-slate-200 bg-slate-50/70 px-4 py-3">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Unread merchant notifications</p>
+                                <p className="mt-2 text-2xl font-semibold text-slate-950">{unreadNotifications.length}</p>
+                                <p className="mt-1 text-xs text-slate-500">Notifications are scheduled from the same assignment and document workflow.</p>
+                              </div>
+                            </div>
+
+                            {unreadNotifications.length ? (
+                              <div className="space-y-3">
+                                {unreadNotifications.slice(0, 4).map((notification) => (
+                                  <article key={notification.notificationId} className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+                                    <p className="text-sm font-semibold text-slate-950">{notification.title}</p>
+                                    <p className="mt-1 text-xs leading-5 text-slate-500">{notification.message}</p>
+                                    <p className="mt-2 text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400">
+                                      {notification.eventType || notification.type} | {formatRelativeTime(notification.triggerAt)}
+                                    </p>
+                                  </article>
+                                ))}
+                              </div>
+                            ) : null}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    </div>
+
+                    <div className="dashboard-card overflow-hidden">
+                      <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+                        <div>
+                          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Assignment audit</p>
+                          <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Latest assignment history</h2>
+                        </div>
+                        <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
+                          {pendingAuditCount} open
+                        </span>
+                      </div>
+                      <div className="max-h-[420px] overflow-y-auto">
+                        {auditTrail.length === 0 ? (
+                          <div className="p-5">
+                            <EmptyPanel
+                              title="No assignment audit yet"
+                              description="Every upload, manual issue, and reassignment will create a merchant audit record here."
+                            />
+                          </div>
+                        ) : (
+                          <div className="divide-y divide-slate-100">
+                            {auditTrail.map((audit) => {
+                              const document = documentById.get(audit.documentId)
+                              const currentActivity = activityByDocumentId.get(audit.documentId)
+                              return (
+                                <button
+                                  key={audit.assignmentId}
+                                  onClick={() => router.push(`/document/${audit.documentId}`)}
+                                  className="flex w-full items-start gap-3 px-5 py-4 text-left transition hover:bg-slate-50"
+                                >
+                                  <div className="mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-slate-100 text-slate-500">
+                                    <Receipt className="h-4 w-4" />
+                                  </div>
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <p className="truncate text-sm font-semibold text-slate-900">{document?.title || currentActivity?.title || 'Untitled invoice'}</p>
+                                      <span className={`rounded-full border px-2 py-1 text-[11px] font-semibold ${getAuditTone(audit.status)}`}>
+                                        {formatAuditStatus(audit.status)}
+                                      </span>
+                                    </div>
+                                    <p className="mt-1 text-xs text-slate-500">
+                                      {formatAssignmentSource(audit.assignmentSource)} | {currentActivity?.consumerCustomId || audit.consumerUserId}
+                                    </p>
+                                    <p className="mt-2 text-xs text-slate-400">{formatDate(audit.createdAt)} | {formatRelativeTime(audit.createdAt)}</p>
+                                  </div>
+                                  <ChevronRight className="mt-1 h-4 w-4 shrink-0 text-slate-300" />
+                                </button>
+                              )
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="dashboard-card overflow-hidden">
+                      <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+                        <div>
+                          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Merchant activity</p>
+                          <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Latest locker assignments</h2>
+                        </div>
+                        <button
+                          onClick={loadWorkspace}
+                          className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-slate-200 bg-white text-slate-600 transition hover:bg-slate-50"
+                          aria-label="Refresh merchant activity"
+                        >
+                          <RefreshCw className={`h-4 w-4 ${workspaceLoading ? 'animate-spin' : ''}`} />
+                        </button>
+                      </div>
+                      <div className="max-h-[560px] overflow-y-auto">
+                        {recentActivity.length === 0 ? (
+                          <div className="p-5">
+                            <EmptyPanel
+                              title="No merchant activity yet"
+                              description="As soon as you upload or assign a bill, the latest merchant activity will appear here with the consumer and invoice context."
+                            />
+                          </div>
+                        ) : (
+                          <div className="divide-y divide-slate-100">
+                            {recentActivity.slice(0, 12).map((activity) => (
+                              <button
+                                key={activity.activityId}
+                                onClick={() => router.push(`/document/${activity.documentId}`)}
+                                className="flex w-full items-start gap-3 px-5 py-4 text-left transition hover:bg-slate-50"
+                              >
+                                <div className="mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-slate-100 text-slate-500">
+                                  <FileText className="h-4 w-4" />
+                                </div>
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <p className="truncate text-sm font-semibold text-slate-900">{activity.title || 'Untitled invoice'}</p>
+                                    <span className="rounded-full bg-blue-50 px-2 py-1 text-[11px] font-semibold text-blue-700">{activity.action || 'updated'}</span>
+                                  </div>
+                                  <p className="mt-1 text-xs text-slate-500">{activity.vendor || 'Unknown vendor'} | {activity.consumerName || activity.consumerCustomId || activity.consumerUserId || 'Consumer not captured'}</p>
+                                  <p className="mt-2 text-xs text-slate-400">{formatDate(activity.createdAt)} | {formatRelativeTime(activity.createdAt)}</p>
+                                </div>
+                                <ChevronRight className="mt-1 h-4 w-4 shrink-0 text-slate-300" />
+                              </button>
                             ))}
                           </div>
-                        ) : null}
+                        )}
                       </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="dashboard-card overflow-hidden">
-                  <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Assignment audit</p>
-                      <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Latest assignment history</h2>
                     </div>
-                    <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
-                      {pendingAuditCount} open
-                    </span>
-                  </div>
-                  <div className="max-h-[420px] overflow-y-auto">
-                    {auditTrail.length === 0 ? (
-                      <div className="p-5">
-                        <EmptyPanel
-                          title="No assignment audit yet"
-                          description="Every upload, manual issue, and reassignment will create a merchant audit record here."
-                        />
-                      </div>
-                    ) : (
-                      <div className="divide-y divide-slate-100">
-                        {auditTrail.map((audit) => {
-                          const document = documentById.get(audit.documentId)
-                          const currentActivity = activityByDocumentId.get(audit.documentId)
-                          return (
-                            <button
-                              key={audit.assignmentId}
-                              onClick={() => router.push(`/document/${audit.documentId}`)}
-                              className="flex w-full items-start gap-3 px-5 py-4 text-left transition hover:bg-slate-50"
-                            >
-                              <div className="mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-slate-100 text-slate-500">
-                                <Receipt className="h-4 w-4" />
-                              </div>
-                              <div className="min-w-0 flex-1">
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <p className="truncate text-sm font-semibold text-slate-900">{document?.title || currentActivity?.title || 'Untitled invoice'}</p>
-                                  <span className={`rounded-full border px-2 py-1 text-[11px] font-semibold ${getAuditTone(audit.status)}`}>
-                                    {formatAuditStatus(audit.status)}
-                                  </span>
-                                </div>
-                                <p className="mt-1 text-xs text-slate-500">
-                                  {formatAssignmentSource(audit.assignmentSource)} | {currentActivity?.consumerCustomId || audit.consumerUserId}
-                                </p>
-                                <p className="mt-2 text-xs text-slate-400">{formatDate(audit.createdAt)} | {formatRelativeTime(audit.createdAt)}</p>
-                              </div>
-                              <ChevronRight className="mt-1 h-4 w-4 shrink-0 text-slate-300" />
-                            </button>
-                          )
-                        })}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="dashboard-card overflow-hidden">
-                  <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Merchant activity</p>
-                      <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Latest locker assignments</h2>
-                    </div>
-                    <button
-                      onClick={loadWorkspace}
-                      className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-slate-200 bg-white text-slate-600 transition hover:bg-slate-50"
-                      aria-label="Refresh merchant activity"
-                    >
-                      <RefreshCw className={`h-4 w-4 ${workspaceLoading ? 'animate-spin' : ''}`} />
-                    </button>
-                  </div>
-                  <div className="max-h-[560px] overflow-y-auto">
-                    {recentActivity.length === 0 ? (
-                      <div className="p-5">
-                        <EmptyPanel
-                          title="No merchant activity yet"
-                          description="As soon as you upload or assign a bill, the latest merchant activity will appear here with the consumer and invoice context."
-                        />
-                      </div>
-                    ) : (
-                      <div className="divide-y divide-slate-100">
-                        {recentActivity.slice(0, 12).map((activity) => (
-                          <button
-                            key={activity.activityId}
-                            onClick={() => router.push(`/document/${activity.documentId}`)}
-                            className="flex w-full items-start gap-3 px-5 py-4 text-left transition hover:bg-slate-50"
-                          >
-                            <div className="mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-slate-100 text-slate-500">
-                              <FileText className="h-4 w-4" />
-                            </div>
-                            <div className="min-w-0 flex-1">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <p className="truncate text-sm font-semibold text-slate-900">{activity.title || 'Untitled invoice'}</p>
-                                <span className="rounded-full bg-blue-50 px-2 py-1 text-[11px] font-semibold text-blue-700">{activity.action || 'updated'}</span>
-                              </div>
-                              <p className="mt-1 text-xs text-slate-500">{activity.vendor || 'Unknown vendor'} | {activity.consumerName || activity.consumerCustomId || activity.consumerUserId || 'Consumer not captured'}</p>
-                              <p className="mt-2 text-xs text-slate-400">{formatDate(activity.createdAt)} | {formatRelativeTime(activity.createdAt)}</p>
-                            </div>
-                            <ChevronRight className="mt-1 h-4 w-4 shrink-0 text-slate-300" />
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="dashboard-action-card p-5">
-                  <p className="text-xs font-semibold uppercase tracking-[0.22em] text-blue-100/65">Merchant guidance</p>
-                  <h2 className="mt-2 text-2xl font-semibold tracking-tight text-white">Keep assignments clean</h2>
-                  <div className="mt-5 space-y-3 text-sm text-blue-50/90">
-                    <div className="rounded-2xl border border-white/10 bg-white/10 px-4 py-3">Verify the consumer ID before uploading, so every locker assignment lands on the correct account.</div>
-                    <div className="rounded-2xl border border-white/10 bg-white/10 px-4 py-3">Use reassign only when the invoice already exists in this merchant workspace and the owner needs to change.</div>
-                    <div className="rounded-2xl border border-white/10 bg-white/10 px-4 py-3">Open the document after assignment if OCR, amount, or verification status needs a final review.</div>
-                  </div>
-                </div>
+                  </>
+                )}
               </div>
             </section>
           </div>
@@ -1995,7 +2098,7 @@ export function MerchantDashboardScreen() {
             </div>
             <div className="flex-1 px-4 py-6">
               <div className="space-y-1.5">
-                <SidebarNavItem icon={LayoutDashboard} label="Assignment Console" active={activeNav === 'workspace'} onClick={() => { setActiveNav('workspace'); setSidebarOpen(false) }} />
+                <SidebarNavItem icon={LayoutDashboard} label="Assignment Console" active={activeNav === 'workspace'} onClick={navigateToWorkspace} />
                 <SidebarNavItem icon={Clock3} label="Merchant Activity" active={activeNav === 'activity'} onClick={navigateToActivity} />
                 <SidebarNavItem icon={Settings} label="Settings" active={false} onClick={() => { setSidebarOpen(false); router.push('/settings') }} />
               </div>
