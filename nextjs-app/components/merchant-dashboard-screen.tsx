@@ -34,6 +34,7 @@ import {
 import { apiClient } from '@/lib/api-client'
 import { useAuthStore } from '@/lib/store/auth-store'
 import type { Document, ExtractionReview, InAppNotification, MerchantActivity, MerchantAssignmentAudit } from '@/lib/types'
+import { authFetch } from '@/lib/auth-fetch'
 
 type WorkspaceTab = 'upload' | 'manual' | 'reassign'
 type NavigationMode = 'workspace' | 'activity'
@@ -430,7 +431,7 @@ export function MerchantDashboardScreen() {
       throw new Error('Consumer ID is required.')
     }
 
-    const response = await fetch('/api/auth/lookup-id', {
+    const response = await authFetch('/api/auth/lookup-id', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -694,7 +695,7 @@ export function MerchantDashboardScreen() {
       if (uploadForm.totalAmount.trim()) formData.append('totalAmount', uploadForm.totalAmount.trim())
       formData.append('ocrMode', 'hybrid')
 
-      const response = await fetch('/api/merchant/upload', {
+      const response = await authFetch('/api/merchant/upload', {
         method: 'POST',
         headers: buildClientAuthHeaders(),
         credentials: 'include',

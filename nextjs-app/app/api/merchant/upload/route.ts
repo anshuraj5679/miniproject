@@ -3,8 +3,8 @@ import { BackendApiError, backendApiFetch, resolveRequestAuthToken, withQuery } 
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
-const INGEST_TIMEOUT_MS = 120000
-const DOCUMENT_FETCH_TIMEOUT_MS = 60000
+const INGEST_TIMEOUT_MS = 50000
+const DOCUMENT_FETCH_TIMEOUT_MS = 20000
 const DEFAULT_OCR_MODE = 'hybrid'
 
 interface IngestResponse {

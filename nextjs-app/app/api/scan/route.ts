@@ -3,8 +3,9 @@ import { BackendApiError, backendApiFetch, resolveRequestAuthToken, withQuery } 
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
-const INGEST_TIMEOUT_MS = 120000
-const DOCUMENT_FETCH_TIMEOUT_MS = 60000
+// Must finish inside maxDuration; slow image scans go through the async job queue instead.
+const INGEST_TIMEOUT_MS = 50000
+const DOCUMENT_FETCH_TIMEOUT_MS = 20000
 const OCR_TEXT_MIN_LENGTH = 1
 const CLOUD_FAST_MODES = new Set(['auto', 'cloud', 'cloud_only', 'google', 'google_only', 'vision', 'vision_only'])
 const HYBRID_CLOUD_MODES = new Set(['hybrid', 'cloud_hybrid', 'vision_bedrock', 'google_bedrock'])

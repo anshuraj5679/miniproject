@@ -6,12 +6,20 @@ from app.api.routes import _infer_locker_category
 from app.parsers.pdf_parser import extract_invoice_metadata
 
 
-def test_extract_invoice_metadata_does_not_use_document_suffix_as_bill_id() -> None:
+def test_extract_invoice_metadata_does_not_use_filename_or_document_suffix_as_bill_id() -> None:
     metadata = extract_invoice_metadata(
         "Scanned image document: Screenshot 2026-02-14 014701.png",
         "Screenshot 2026-02-14 014701.png",
     )
-    assert metadata["bill_id"] == "Screenshot 2026-02-14 014701"
+    assert metadata["bill_id"] == ""
+
+
+def test_extract_invoice_metadata_ignores_vendor_line_after_tax_invoice_heading() -> None:
+    metadata = extract_invoice_metadata(
+        "Tax Invoice\nApple India Private Limited\nInvoice No: AB12345\n",
+        "invoice.png",
+    )
+    assert metadata["bill_id"] == "AB12345"
 
 
 def test_extract_invoice_metadata_from_amazon_style_ocr_text() -> None:

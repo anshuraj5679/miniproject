@@ -1,4 +1,5 @@
 -- Create user_profiles table for Consumer/Merchant ID login
+-- Superseded by /supabase-full-migration.sql; kept for existing setups.
 -- Run this SQL in your Supabase Dashboard → SQL Editor
 
 CREATE TABLE IF NOT EXISTS user_profiles (
@@ -26,13 +27,4 @@ CREATE POLICY "Allow users to read own profile"
   FOR SELECT
   USING (auth.uid() = user_id);
 
-CREATE POLICY "Allow users to insert own user_profile"
-  ON user_profiles
-  FOR INSERT
-  WITH CHECK (auth.uid() = user_id);
-
-CREATE POLICY "Allow users to update own user_profile"
-  ON user_profiles
-  FOR UPDATE
-  USING (auth.uid() = user_id)
-  WITH CHECK (auth.uid() = user_id);
+-- Inserts/updates are server-managed. Run backend/sql/008_supabase_auth_hardening.sql next.

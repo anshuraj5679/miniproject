@@ -21,6 +21,32 @@ services:
         value: "false"
       - key: DYNAMODB_READ_FALLBACK_ENABLED
         value: "false"
+      # Image scans run through the in-process async job queue so the Vercel
+      # /api/scan function (60s limit) never waits on slow AI calls.
+      - key: ASYNC_EXTRACTION_ENABLED
+        value: "true"
+      - key: LOCAL_ASYNC_EXTRACTION_WORKER_ENABLED
+        value: "true"
+      - key: OPENROUTER_TIMEOUT_SECONDS
+        value: "40"
+      # Must accept image input, e.g. google/gemma-4-31b-it:free. Empty = GEMINI_MODEL.
+      - key: OPENROUTER_VISION_MODEL
+        sync: false
+      # Extra AI engines: each one adds a vote to image extraction and a chat fallback.
+      - key: OPENROUTER_BACKUP_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GOOGLE_GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_GEMINI_MODEL
+        value: gemini-3.6-flash
+      - key: LLM_PROVIDER_ORDER
+        value: claude,gemini,openrouter
+      # Optional JSON map of service tokens to roles, e.g. {"<long-random-secret>": "analyst"}.
+      # Leave unset unless a server-to-server caller needs it.
+      - key: AUTH_TOKENS
+        sync: false
       - key: DATABASE_URL
         sync: false
       - key: SUPABASE_URL

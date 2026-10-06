@@ -345,11 +345,12 @@ class BharatAIService:
         settings = get_settings()
         if settings.ai_provider == "gemini" or self.bedrock is None:
             try:
-                from app.services.gemini_client import gemini_extract_json
-                prompt = json.dumps(payload, default=str)
-                return gemini_extract_json(
-                    prompt=prompt,
-                    system_instruction=system_prompt,
+                from app.services.llm_router import extract_json
+
+                return extract_json(
+                    json.dumps(payload, default=str),
+                    system=system_prompt,
+                    max_tokens=max_tokens,
                 )
             except Exception:
                 return {}

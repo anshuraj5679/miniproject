@@ -1,7 +1,8 @@
 import type { NextRequest } from 'next/server'
 
 const DEFAULT_BACKEND_ORIGIN = 'http://localhost:8000'
-const DEFAULT_TIMEOUT_MS = 90000
+// Vercel functions are cut off at 60s (maxDuration); fail cleanly before that.
+const DEFAULT_TIMEOUT_MS = 55000
 
 function normalizeBaseUrl(raw: string): string {
   const trimmed = raw.replace(/\/+$/, '')
@@ -19,7 +20,7 @@ const backendBaseUrl = normalizeBaseUrl(configuredBaseUrl)
 const backendServiceToken =
   process.env.BACKEND_API_SERVICE_TOKEN ||
   process.env.BACKEND_API_TOKEN ||
-  (process.env.NODE_ENV === 'development' ? 'safebill-analyst-token' : '')
+  ''
 const timeoutMs = Number(process.env.BACKEND_API_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
 const ACCESS_TOKEN_COOKIE = 'sb_access_token'
 

@@ -38,29 +38,32 @@ SafeBill is a warranty locker and invoice intelligence platform that helps consu
 - `backend/` -- FastAPI ingestion/RAG API, extraction pipeline, and notifications
 - `deploy/` -- EC2 deployment assets and infrastructure references
 
-## AWS Tech Stack (Brief)
+## Tech Stack
 
-SafeBill is deployed on AWS using a managed stack for identity, storage, AI inference, and messaging:
+| Layer | Service |
+|---|---|
+| Web app | Next.js 14 on Vercel (`nextjs-app/`), with `/api/*` routes proxying to the backend |
+| Auth | Supabase Auth (email/phone + password, Google OAuth). The consumer/merchant role lives in the user's `app_metadata`, which only the server can write |
+| Database | Supabase Postgres (documents, chunks, reminders, notifications, `user_profiles`) |
+| Backend | FastAPI on Render (`backend/`), with an in-process worker for async image extraction and notifications |
+| AI / OCR | OpenRouter (text + vision models), pdfplumber, optional Google Vision (`vision-ocr-service/`) and client-side Tesseract |
+| Email | AWS SES (reminders, ID recovery), optional |
 
-Amazon Cognito — Central identity provider for both consumers and merchants. It manages sign‑up, login, password resets, and issues JWTs that the
-    backend validates for role‑based access to bills, assignments, and settings.
-  - Amazon S3 — Durable object store for raw invoices, uploaded images, and OCR text snapshots. The backend writes files to S3 and generates presigned URLs
-    for secure, time‑limited access from the UI.
-  - Amazon Bedrock — Hosts the LLM (AMAZON NOVA PRO) used for text‑to‑schema extraction (invoice fields, product names, GST info), plus narrative insight generation. It
-    converts OCR text into structured metadata used throughout the app.
-  - Amazon Textract / Google Vision OCR — OCR layer for extracting text from scanned bills and PDFs. The backend chooses the best OCR output, then feeds it into
-    deterministic parsing and LLM mapping.
-  - Amazon SES — Transactional email delivery for warranty reminders, merchant assignment updates, and claim readiness alerts. It uses a verified sender
-    domain with DKIM for deliverability.
-  - Amazon SNS — Optional multi‑channel delivery layer for SMS/WhatsApp/push notifications when enabled. It’s wired in the backend as a provider for
-    non‑email alerts.
-  - Amazon RDS (Postgres) — Primary relational store for users, documents, extracted metadata, assignments, reviews, and notifications. This is the single
-    source of truth for the product state.
-  - EC2 + Docker Compose — Runtime hosting for both backend and frontend containers. Compose manages service lifecycle, networking, and environment
-    configuration on the EC2 instance.
-  - Amazon Titan used for image generation for the scanned bills.
+The original AWS deployment (Bedrock, S3, DynamoDB, EC2) is still available as a backend
+provider option; see `backend/infra/AWS_DEPLOY.md` and `deploy/ec2/`.
 
 ![AWS Tech Stack](nextjs-app/public/readme/aws%20tech-stack.png)
+
+## Setup
+
+1. **Supabase**: in the SQL editor run `supabase-full-migration.sql`. On an existing project,
+   run `backend/sql/008_supabase_auth_hardening.sql` instead: it moves roles into
+   `app_metadata`, backfills existing users, and locks down `user_profiles`.
+2. **Backend**: copy `backend/.env.example` to `backend/.env` and fill in the Supabase and
+   OpenRouter values. Then `pip install -r requirements.txt` and `make run`.
+3. **Web app**: copy `nextjs-app/.env.local.example` to `nextjs-app/.env.local`, then
+   `npm install` and `npm run dev`.
+4. **Tests**: `cd backend && python -m pytest -q` (tests never read your `.env` database or keys).
 
 ## Contributions
 

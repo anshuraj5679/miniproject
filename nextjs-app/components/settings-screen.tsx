@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 import { useAuthStore } from '@/lib/store/auth-store'
 import { useGsapReveal } from '@/lib/gsap-helpers'
+import { authFetch } from '@/lib/auth-fetch'
 
 export function SettingsScreen() {
   const router = useRouter()
@@ -42,7 +43,7 @@ export function SettingsScreen() {
       }
       params.set('limit', '500')
 
-      const response = await fetch(`/api/documents?${params.toString()}`, {
+      const response = await authFetch(`/api/documents?${params.toString()}`, {
         method: 'GET',
         credentials: 'include',
       })

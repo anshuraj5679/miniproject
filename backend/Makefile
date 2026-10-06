@@ -16,4 +16,4 @@ notify-worker:
 	python -m scripts.notification_worker
 
 adversarial:
-	python scripts/adversarial_query_tests.py --base-url http://localhost:8000 --token safebill-analyst-token
+	python scripts/adversarial_query_tests.py --base-url http://localhost:8000 --token $(BACKEND_API_TOKEN)

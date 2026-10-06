@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import { Loader2 } from 'lucide-react'
 
 import { getSupabaseBrowserClient } from '@/lib/supabase'
-import { persistClientAuthCookies } from '@/lib/auth-client'
+import { loadOrClaimProfile, persistClientAuthCookies } from '@/lib/auth-client'
 import { useAuthStore } from '@/lib/store/auth-store'
 import type { UserType } from '@/lib/types'
 
@@ -28,33 +28,14 @@ export default function AuthCallbackPage() {
         const userType = (searchParams.get('userType') as UserType) || 'consumer'
         const user = session.user
 
-        // Check if user profile exists, create if not
-        const { data: profile } = await supabase
-          .from('user_profiles')
-          .select('custom_id, user_type, full_name')
-          .eq('user_id', user.id)
-          .single()
+        // Profile + role are created server-side; a first Google sign-in claims one here.
+        const profile = await loadOrClaimProfile(user.id, userType)
+        const customId = profile?.custom_id || undefined
+        const resolvedUserType = (profile?.user_type as UserType) || userType
 
-        let customId = profile?.custom_id
-        let resolvedUserType = (profile?.user_type as UserType) || userType
-
-        if (!profile) {
-          // First-time OAuth user — create profile
-          const prefix = userType === 'merchant' ? 'MER' : 'CON'
-          const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(4)))
-            .map((b) => b.toString(16).toUpperCase().padStart(2, '0'))
-            .join('')
-          customId = `${prefix}-${randomHex}`
-
-          await supabase.from('user_profiles').insert({
-            user_id: user.id,
-            custom_id: customId,
-            email: user.email || '',
-            full_name: user.user_metadata?.full_name || user.user_metadata?.name || user.email?.split('@')[0] || 'User',
-            user_type: userType,
-          })
-          resolvedUserType = userType
-        }
+        // The role lives in app_metadata; refresh so the access token carries it.
+        const { data: refreshed } = await supabase.auth.refreshSession()
+        const accessToken = refreshed.session?.access_token || session.access_token
 
         await setAuth(
           {
@@ -66,10 +47,10 @@ export default function AuthCallbackPage() {
             picture: user.user_metadata?.avatar_url,
             provider: user.app_metadata?.provider || 'google',
           },
-          session.access_token
+          accessToken
         )
 
-        persistClientAuthCookies(session.access_token, resolvedUserType)
+        persistClientAuthCookies(accessToken, resolvedUserType)
         router.push(resolvedUserType === 'merchant' ? '/merchant-dashboard' : '/locker')
       } catch (err: unknown) {
         setError(err instanceof Error ? err.message : 'Authentication failed.')

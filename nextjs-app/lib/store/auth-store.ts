@@ -7,12 +7,13 @@ interface AuthState {
   token: string | null;
   isAuthenticated: boolean;
   setAuth: (user: User, token: string) => Promise<void>;
+  setToken: (token: string) => Promise<void>;
   clearAuth: () => Promise<void>;
 }
 
 export const useAuthStore = create<AuthState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       user: null,
       token: null,
       isAuthenticated: false,
@@ -34,6 +35,14 @@ export const useAuthStore = create<AuthState>()(
           } catch (error) {
             console.error('Failed to persist secure auth session:', error);
           }
+        }
+      },
+      setToken: async (token) => {
+        const { user } = get();
+        if (!user || !token) return;
+        await get().setAuth(user, token);
+        if (typeof document !== 'undefined') {
+          document.cookie = `sb_access_token=${token}; path=/; max-age=${60 * 60 * 24 * 7}`;
         }
       },
       clearAuth: async () => {

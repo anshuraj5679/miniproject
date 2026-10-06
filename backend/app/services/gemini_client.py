@@ -31,10 +31,28 @@ def get_last_gemini_error() -> str:
 
 def _get_api_key() -> str:
     settings = get_settings()
-    key = settings.gemini_api_key.strip()
+    key = settings.gemini_api_key.strip() or settings.openrouter_backup_api_key.strip()
     if not key:
         raise RuntimeError("OpenRouter API key is not configured. Set GEMINI_API_KEY in .env")
     return key
+
+
+# Main key rejected (401/403), out of credit (402) or rate-limited (429): retry on the backup key.
+_SWITCH_KEY_STATUSES = {401, 402, 403, 429}
+
+
+def _post_openrouter(headers: dict[str, str], body: dict[str, Any], timeout: float) -> Any:
+    response = httpx.post(_OPENROUTER_URL, headers=headers, json=body, timeout=timeout)
+    backup_key = get_settings().openrouter_backup_api_key.strip()
+    if (
+        response.status_code in _SWITCH_KEY_STATUSES
+        and backup_key
+        and headers.get("Authorization") != f"Bearer {backup_key}"
+    ):
+        logger.warning("OpenRouter main key failed with %s; retrying with the backup key.", response.status_code)
+        backup_headers = {**headers, "Authorization": f"Bearer {backup_key}"}
+        response = httpx.post(_OPENROUTER_URL, headers=backup_headers, json=body, timeout=timeout)
+    return response
 
 
 def _get_model(model: str | None) -> str:
@@ -46,6 +64,40 @@ def _get_model(model: str | None) -> str:
     if resolved.endswith(":free") and "qwen" in resolved:
         resolved = "openrouter/free"
     return resolved
+
+
+_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_FREE_ROUTER_MODEL = "openrouter/free"
+
+
+def _get_vision_model() -> str:
+    """Model for image input. OPENROUTER_VISION_MODEL wins; otherwise the general model."""
+    configured = str(get_settings().openrouter_vision_model or "").strip()
+    return configured or _get_model(None)
+
+
+def _timeout(cap: float | None = None) -> float:
+    value = float(get_settings().openrouter_timeout_seconds or 40.0)
+    return min(value, cap) if cap else value
+
+
+def _post_vision(body: dict[str, Any], headers: dict[str, str], timeout: float) -> Any:
+    """POST an image request; drop response_format if rejected, then fall back to the free router."""
+    response = _post_openrouter(headers, body, timeout)
+    if response.status_code == 400 and "response_format" in body:
+        body = {key: value for key, value in body.items() if key != "response_format"}
+        response = _post_openrouter(headers, body, timeout)
+    if response.status_code in (400, 402, 403, 404, 429) and body.get("model") != _FREE_ROUTER_MODEL:
+        logger.warning(
+            "Vision model %s failed with status %s. Falling back to %s.",
+            body.get("model"),
+            response.status_code,
+            _FREE_ROUTER_MODEL,
+        )
+        body = {key: value for key, value in body.items() if key != "response_format"}
+        body["model"] = _FREE_ROUTER_MODEL
+        response = _post_openrouter(headers, body, timeout)
+    return response
 
 
 def gemini_generate(
@@ -87,12 +139,12 @@ def gemini_generate(
     }
 
     try:
-        response = httpx.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=90)
+        response = _post_openrouter(headers, body, _timeout())
         if response.status_code == 400 and response_json and "response_format" in body:
             # Retry without response_format in case model doesn't support structured output
             body_fallback = body.copy()
             del body_fallback["response_format"]
-            response = httpx.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body_fallback, timeout=90)
+            response = _post_openrouter(headers, body_fallback, _timeout())
         
         if response.status_code in (402, 403, 429) and resolved_model != "openrouter/free":
             logger.warning("Paid model %s failed with status %s. Falling back to openrouter/free.", resolved_model, response.status_code)
@@ -101,7 +153,7 @@ def gemini_generate(
             # Some free models might not support response_format: JSON
             if "response_format" in body_free:
                 del body_free["response_format"]
-            response = httpx.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body_free, timeout=90)
+            response = _post_openrouter(headers, body_free, _timeout())
 
         response.raise_for_status()
         data = response.json()
@@ -196,13 +248,13 @@ def gemini_chat(
     }
 
     try:
-        response = httpx.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=90)
+        response = _post_openrouter(headers, body, _timeout())
         
         if response.status_code in (402, 403, 429) and resolved_model != "openrouter/free":
             logger.warning("Paid chat model %s failed with status %s. Falling back to openrouter/free.", resolved_model, response.status_code)
             body_free = body.copy()
             body_free["model"] = "openrouter/free"
-            response = httpx.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body_free, timeout=90)
+            response = _post_openrouter(headers, body_free, _timeout())
 
         response.raise_for_status()
         data = response.json()
@@ -227,7 +279,7 @@ def gemini_extract_image_metadata(image_bytes: bytes, filename: str) -> dict[str
     except Exception:
         return {}
 
-    resolved_model = _get_model(None)
+    resolved_model = _get_vision_model()
     mime_type = mimetypes.guess_type(filename)[0] or "image/png"
     encoded_image = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime_type};base64,{encoded_image}"
@@ -300,19 +352,7 @@ def gemini_extract_image_metadata(image_bytes: bytes, filename: str) -> dict[str
     }
 
     try:
-        response = httpx.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=90)
-        if response.status_code == 400 and "response_format" in body:
-            body_fallback = body.copy()
-            del body_fallback["response_format"]
-            response = httpx.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body_fallback, timeout=90)
-        
-        if response.status_code in (400, 402, 403, 404, 429) and resolved_model != "openrouter/free":
-            logger.warning("Paid image extraction model failed with %s. Falling back to openrouter/free.", response.status_code)
-            body_free = body.copy()
-            body_free["model"] = "openrouter/free"
-            if "response_format" in body_free:
-                del body_free["response_format"]
-            response = httpx.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body_free, timeout=90)
+        response = _post_vision(body, headers, _timeout())
 
         response.raise_for_status()
         data = response.json()
@@ -352,7 +392,7 @@ def gemini_classify_image(image_bytes: bytes, filename: str) -> dict[str, Any]:
     except Exception:
         return {}
 
-    resolved_model = _get_model(None)
+    resolved_model = _get_vision_model()
     mime_type = mimetypes.guess_type(filename)[0] or "image/png"
     encoded_image = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime_type};base64,{encoded_image}"
@@ -391,12 +431,7 @@ def gemini_classify_image(image_bytes: bytes, filename: str) -> dict[str, Any]:
     }
 
     try:
-        response = httpx.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=30)
-        if response.status_code == 400 and "response_format" in body:
-            body_fallback = body.copy()
-            del body_fallback["response_format"]
-            response = httpx.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body_fallback, timeout=30)
-            
+        response = _post_vision(body, headers, _timeout(cap=20.0))
         response.raise_for_status()
         data = response.json()
         choices = data.get("choices", [])
@@ -427,7 +462,7 @@ def gemini_ocr_image(image_bytes: bytes, filename: str) -> str:
     except Exception:
         return ""
 
-    resolved_model = _get_model(None)
+    resolved_model = _get_vision_model()
     mime_type = mimetypes.guess_type(filename)[0] or "image/png"
     encoded_image = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime_type};base64,{encoded_image}"
@@ -461,7 +496,7 @@ def gemini_ocr_image(image_bytes: bytes, filename: str) -> str:
     }
 
     try:
-        response = httpx.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=90)
+        response = _post_vision(body, headers, _timeout())
         response.raise_for_status()
         data = response.json()
         choices = data.get("choices", [])

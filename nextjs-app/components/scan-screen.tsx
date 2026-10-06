@@ -20,6 +20,7 @@ import {
 } from 'lucide-react'
 import { useAuthStore } from '@/lib/store/auth-store'
 import { useGsapReveal } from '@/lib/gsap-helpers'
+import { authFetch } from '@/lib/auth-fetch'
 
 interface ScanResult {
   docId: string
@@ -141,10 +142,10 @@ export function ScanScreen() {
   }
 
   const pollAsyncScanJob = async (jobId: string, headers: HeadersInit) => {
-    const deadline = Date.now() + 120000
+    const deadline = Date.now() + 180000
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 2500))
-      const response = await fetch(`/api/scan?jobId=${encodeURIComponent(jobId)}`, {
+      const response = await authFetch(`/api/scan?jobId=${encodeURIComponent(jobId)}`, {
         method: 'GET',
         headers,
         credentials: 'include',
@@ -219,7 +220,7 @@ export function ScanScreen() {
         formData.append('ocrText', clientOcrText.trim())
       }
 
-      const response = await fetch('/api/scan', {
+      const response = await authFetch('/api/scan', {
         method: 'POST',
         body: formData,
         headers,

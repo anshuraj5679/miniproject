@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 
 import { backendPublicApiFetch } from '@/lib/backend-api'
-import { normalizeEmailAddress } from '@/lib/cognito'
 
 export const runtime = 'nodejs'
+
+function normalizeEmailAddress(value: string): string {
+  return value.trim().toLowerCase()
+}
 
 interface RecoverIdBody {
   email?: string

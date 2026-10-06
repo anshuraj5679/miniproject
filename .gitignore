@@ -52,3 +52,6 @@ deploy/ec2/secrets/*
 !deploy/ec2/secrets/.gitkeep
 run-logs/
 artifacts/
+
+# Local SQLite fallback database
+*.db

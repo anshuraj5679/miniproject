@@ -33,6 +33,7 @@ import { getCurrentLocation } from '@/lib/location'
 import { useAuthStore } from '@/lib/store/auth-store'
 import type { Document, User as AuthUser } from '@/lib/types'
 import { ProductVisual } from '@/components/product-visual'
+import { authFetch } from '@/lib/auth-fetch'
 
 interface ChatMessage {
   id: string
@@ -521,7 +522,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
           headers.Authorization = `Bearer ${token}`
         }
 
-        const response = await fetch('/api/ai/bharat/enrich', {
+        const response = await authFetch('/api/ai/bharat/enrich', {
           method: 'POST',
           headers,
           body: JSON.stringify({
@@ -841,7 +842,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
         if (token) {
           headers.Authorization = `Bearer ${token}`
         }
-        const response = await fetch('/api/ai/bharat/translate-batch', {
+        const response = await authFetch('/api/ai/bharat/translate-batch', {
           method: 'POST',
           headers,
           body: JSON.stringify({
@@ -1079,7 +1080,7 @@ export function DocumentDetailScreen({ docId }: { docId: string }) {
       if (token) {
         headers.Authorization = `Bearer ${token}`
       }
-      const response = await fetch('/api/ai/bharat/ask', {
+      const response = await authFetch('/api/ai/bharat/ask', {
         method: 'POST',
         headers,
         body: JSON.stringify({

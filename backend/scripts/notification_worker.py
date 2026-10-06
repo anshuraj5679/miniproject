@@ -35,8 +35,12 @@ def main() -> None:
         return
 
     while True:
-        result = run_once(limit=args.limit)
-        print(result)
+        # A failed tick (e.g. a dropped database connection) must not kill the worker.
+        try:
+            result = run_once(limit=args.limit)
+            print(result, flush=True)
+        except Exception as exc:  # noqa: BLE001 - keep the loop alive, retry next tick
+            print(f"notification worker tick failed: {type(exc).__name__}: {exc}", flush=True)
         time.sleep(poll_seconds)
 
 

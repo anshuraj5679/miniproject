@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { BackendApiError, backendApiFetch, resolveRequestAuthToken } from '@/lib/backend-api'
 
 export const runtime = 'nodejs'
-const CHAT_BACKEND_TIMEOUT_MS = Number(process.env.BACKEND_CHAT_TIMEOUT_MS || 120000)
+export const maxDuration = 60
+const CHAT_BACKEND_TIMEOUT_MS = Number(process.env.BACKEND_CHAT_TIMEOUT_MS || 50000)
 
 interface ChatRequestPayload {
   message?: string

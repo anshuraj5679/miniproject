@@ -66,6 +66,8 @@ REVIEW_FIELDS = {
 }
 ENGINE_WEIGHTS = {
     "manual_override": 1.0,
+    "claude_vision": 0.95,
+    "google_gemini_vision": 0.94,
     "aws_bedrock_vision": 0.94,
     "gemini_vision": 0.93,
     "aws_bedrock_text": 0.96,

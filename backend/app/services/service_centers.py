@@ -5,7 +5,7 @@ import math
 import re
 import time
 from dataclasses import dataclass
-from difflib import SequenceMatcher
+from difflib import SequenceMatcher, get_close_matches
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
@@ -534,6 +534,11 @@ class ServiceCenterLocator:
         for key, value in self.INDIA_LOCATION_HINTS.items():
             if key in normalized_hint or normalized_hint in key:
                 return value
+        # Misspelt city names ("banglore") must resolve here: live geocoding of the typo
+        # can land on an unrelated place and push every real centre outside the radius.
+        close = get_close_matches(normalized_hint, list(self.INDIA_LOCATION_HINTS), n=1, cutoff=0.8)
+        if close:
+            return self.INDIA_LOCATION_HINTS[close[0]]
         return None
 
     def _resolve_anchor_for_location_hint(self, location_hint: str | None) -> tuple[float, float] | None:

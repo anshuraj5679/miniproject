@@ -250,7 +250,9 @@ def _extract_labeled_date(text: str, labels: list[str]) -> date | None:
 
 def _extract_bill_id(text: str, filename: str) -> str:
     patterns: list[tuple[int, str]] = [
-        (80, r"(?im)\btax\s*invoice\s*(?:no\.?|number|#|id)?\s*[:\-#\s]*#?\s*([A-Z0-9][A-Z0-9\-\/]{3,})"),
+        (80, r"(?im)\btax\s*invoice\s*(?:no\.?|number|#|id)\s*[:\-#\s]*#?\s*([A-Z0-9][A-Z0-9\-\/]{3,})"),
+        # Bare "Tax Invoice" heading: accept a value on the same line only, never the next line.
+        (70, r"(?im)\btax[ \t]*invoice[ \t]*[:\-#][ \t]*#?[ \t]*([A-Z0-9][A-Z0-9\-\/]{3,})"),
         (75, r"(?im)\binvoice\s*(?:no\.?|number|#|id)\s*[:\-#\s]*#?\s*([A-Z0-9][A-Z0-9\-\/]{3,})"),
         (62, r"(?im)\b(?:apple\s*)?document\s*number\s*[:\-#\s]*#?\s*([A-Z0-9][A-Z0-9\-\/]{4,})"),
         (40, r"(?im)\b(?:invoice\s*\/\s*bill|bill\s*\/\s*invoice)\s*(?:no|number|#|id)\s*[:\-#\s]*#?\s*([A-Z0-9][A-Z0-9\-\/]{2,})"),
@@ -266,6 +268,9 @@ def _extract_bill_id(text: str, filename: str) -> str:
             if not value:
                 continue
             if value.lower() in {"document", "invoice", "bill", "receipt", "original", "recipient", "number"}:
+                continue
+            # Invoice numbers carry at least one digit; this rejects words such as vendor names.
+            if not any(ch.isdigit() for ch in value):
                 continue
             # Skip purchase-order references masquerading as invoice number.
             full_match = _clean_line(match.group(0)).lower()

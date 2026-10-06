@@ -111,6 +111,30 @@ class Settings(BaseSettings):
     # --- Gemini AI ---
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
+    # Emergency OpenRouter key: used when GEMINI_API_KEY is rejected, out of credit or rate-limited.
+    openrouter_backup_api_key: str = ""
+    # Model used for image OCR/extraction; must accept image input. Empty = use GEMINI_MODEL.
+    openrouter_vision_model: str = ""
+    # Per-request timeout for OpenRouter calls. Keep well under the frontend's 60s function limit.
+    openrouter_timeout_seconds: float = 40.0
+    # --- Claude (Anthropic) vision extraction; enabled when the key is set ---
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-opus-5-5"
+    # low | medium | high | xhigh | max. Thinking depth and token spend per scan.
+    anthropic_effort: str = "medium"
+    anthropic_timeout_seconds: float = 90.0
+    anthropic_chat_effort: str = "medium"
+    # --- Google Gemini, called directly (GEMINI_API_KEY above is the OpenRouter key) ---
+    google_gemini_api_key: str = ""
+    # Pro models need billing on the Google AI project; Flash works on the free tier.
+    google_gemini_model: str = "gemini-3.6-flash"
+    # Tried when the main model is overloaded (503), out of quota (429) or retired (404).
+    google_gemini_fallback_model: str = "gemini-3.1-flash-lite"
+    google_gemini_timeout_seconds: float = 90.0
+    # Chatbot answers: first configured provider that succeeds wins.
+    llm_provider_order: str = "claude,gemini,openrouter"
+    # Total seconds a chat answer may take across all providers (frontend limit is 60s).
+    llm_chat_budget_seconds: float = 45.0
     # --- OCR ---
     ocr_enabled: bool = True
     use_unstructured_partition: bool = False
@@ -169,7 +193,7 @@ class Settings(BaseSettings):
     product_image_generation_enabled: bool = False
     product_image_width: int = 768
     product_image_height: int = 768
-    async_extraction_enabled: bool = False
+    async_extraction_enabled: bool = True
     async_extraction_source_prefix: str = "async-extraction"
     async_extraction_backend_callback_url: str = ""
     async_extraction_callback_token: str = ""
@@ -181,14 +205,9 @@ class Settings(BaseSettings):
     api_rate_limit_ask_per_window: int = 30
     api_rate_limit_ingest_per_window: int = 20
     api_rate_limit_notification_per_window: int = 40
-    auth_tokens: Dict[str, str] = Field(
-        default_factory=lambda: {
-            "safebill-admin-token": "admin",
-            "safebill-analyst-token": "analyst",
-            "safebill-auditor-token": "auditor",
-            "safebill-viewer-token": "viewer",
-        }
-    )
+    # Static service tokens mapped to roles, e.g. AUTH_TOKENS={"<long-random-secret>": "analyst"}.
+    # Empty by default: every token accepted here bypasses user-level auth.
+    auth_tokens: Dict[str, str] = Field(default_factory=dict)
     prompt_injection_blocking: bool = True
     storage_provider: str = "supabase"
     s3_bucket_name: str = ""

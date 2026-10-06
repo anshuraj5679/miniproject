@@ -224,3 +224,22 @@ def test_async_extraction_job_status_falls_back_to_dynamodb() -> None:
         assert status_response.json()["filename"] == "bill.png"
 
     app.dependency_overrides.clear()
+
+
+def test_failed_job_is_marked_failed_after_a_database_error() -> None:
+    from types import SimpleNamespace
+
+    from app.api.routes import _mark_async_job_failed
+
+    calls: list[str] = []
+    db = SimpleNamespace(
+        rollback=lambda: calls.append("rollback"),
+        add=lambda obj: calls.append("add"),
+        commit=lambda: calls.append("commit"),
+    )
+    job = SimpleNamespace(status="processing", error_message=None, engines_used=[], completed_at=None)
+
+    _mark_async_job_failed(db, job, error_message="flush failed")
+
+    assert calls[0] == "rollback"
+    assert job.status == "failed" and job.error_message == "flush failed"

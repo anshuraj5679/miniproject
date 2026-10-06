@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { backendPublicApiFetch } from '@/lib/backend-api'
+import { backendApiFetch, resolveRequestAuthToken } from '@/lib/backend-api'
 
 export const runtime = 'nodejs'
 
@@ -20,7 +20,12 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const payload = await backendPublicApiFetch<{
+    const authToken = resolveRequestAuthToken(request)
+    if (!authToken) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const payload = await backendApiFetch<{
       userId: string
       username: string
       email?: string
@@ -31,7 +36,7 @@ export async function POST(request: NextRequest) {
     }>('/auth/lookup-id', {
       method: 'POST',
       body: JSON.stringify({ customId, userType }),
-    })
+    }, undefined, authToken)
 
     return NextResponse.json({
       userId: payload.userId,

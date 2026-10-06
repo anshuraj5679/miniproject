@@ -6,6 +6,7 @@ import { ArrowLeft, Send, Bot, User } from 'lucide-react'
 import { useGsapReveal } from '@/lib/gsap-helpers'
 import { getCurrentLocation } from '@/lib/location'
 import { useAuthStore } from '@/lib/store/auth-store'
+import { authFetch } from '@/lib/auth-fetch'
 
 interface ChatMessage {
   id: string
@@ -49,7 +50,7 @@ export function ChatScreen() {
 
     try {
       const location = await getCurrentLocation()
-      const response = await fetch('/api/chat', {
+      const response = await authFetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

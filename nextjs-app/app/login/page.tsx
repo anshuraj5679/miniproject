@@ -61,7 +61,7 @@ export default function LoginPage() {
               </div>
               <h2 className="text-2xl font-bold">Welcome back</h2>
               <p className="text-sm text-base-content/60 mt-1">
-                Sign in with your email or phone and password
+                Sign in with your SafeBill ID, email, or phone and password
               </p>
             </div>
 
@@ -96,12 +96,12 @@ export default function LoginPage() {
               <div className="form-control">
                 <label className="label">
                   <span className="label-text font-medium text-base-content/80">
-                    {userType === 'consumer' ? 'Email or phone' : 'Email or phone'}
+                    {userType === 'consumer' ? 'Consumer ID, email, or phone' : 'Merchant ID, email, or phone'}
                   </span>
                 </label>
                 <input
                   type="text"
-                  placeholder="name@email.com or +91XXXXXXXXXX"
+                  placeholder={userType === 'consumer' ? 'CON-XXXXXXXX, name@email.com, or +91XXXXXXXXXX' : 'MER-XXXXXXXX, name@email.com, or +91XXXXXXXXXX'}
                   value={identifier}
                   onChange={(event) => setIdentifier(event.target.value)}
                   className="input input-bordered w-full focus:input-primary bg-base-50"

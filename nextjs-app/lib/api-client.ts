@@ -27,6 +27,24 @@ class ApiClient {
       },
       (error) => Promise.reject(error)
     );
+
+    // Expired Supabase access token: refresh once and replay the request.
+    this.client.interceptors.response.use(
+      (response) => response,
+      async (error) => {
+        const original = error?.config as (AxiosRequestConfig & { _authRetried?: boolean }) | undefined;
+        if (typeof window === 'undefined' || error?.response?.status !== 401 || !original || original._authRetried) {
+          return Promise.reject(error);
+        }
+        original._authRetried = true;
+        const { refreshAccessToken } = await import('@/lib/auth-client');
+        const { useAuthStore } = await import('@/lib/store/auth-store');
+        const freshToken = await refreshAccessToken().catch(() => null);
+        if (!freshToken) return Promise.reject(error);
+        await useAuthStore.getState().setToken(freshToken);
+        return this.client.request(original);
+      }
+    );
   }
 
   async get<T>(path: string, config?: AxiosRequestConfig): Promise<T> {

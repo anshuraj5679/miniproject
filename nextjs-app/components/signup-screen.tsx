@@ -4,7 +4,7 @@ import { useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Check, Copy, Mail, ShieldCheck, Smartphone, UserPlus } from 'lucide-react'
 
-import { persistClientAuthCookies, signUpWithIdentifier } from '@/lib/auth-client'
+import { persistClientAuthCookies, resendSignupConfirmation, signUpWithIdentifier } from '@/lib/auth-client'
 import { useGsapReveal } from '@/lib/gsap-helpers'
 import { useAuthStore } from '@/lib/store/auth-store'
 import type { UserType } from '@/lib/types'
@@ -29,6 +29,8 @@ export function SignupScreen() {
   const [createdCustomId, setCreatedCustomId] = useState<string | null>(null)
   const [signupSuccess, setSignupSuccess] = useState(false)
   const [needsVerification, setNeedsVerification] = useState(false)
+  const [resendState, setResendState] = useState<'idle' | 'sending' | 'sent'>('idle')
+  const [resendError, setResendError] = useState<string | null>(null)
 
   useGsapReveal(rootRef, [userType, createdCustomId, signupSuccess, copied, error, loading])
 
@@ -64,6 +66,18 @@ export function SignupScreen() {
       setError(err instanceof Error ? err.message : 'Signup failed.')
     } finally {
       setLoading(false)
+    }
+  }
+
+  const resendEmail = async () => {
+    setResendState('sending')
+    setResendError(null)
+    try {
+      await resendSignupConfirmation(identifier)
+      setResendState('sent')
+    } catch (err: unknown) {
+      setResendError(err instanceof Error ? err.message : 'Could not resend the email.')
+      setResendState('idle')
     }
   }
 
@@ -139,6 +153,18 @@ export function SignupScreen() {
                 </button>
               </div>
               {copied ? <p className="text-success text-xs mt-2 font-medium">Copied to clipboard.</p> : null}
+            </div>
+
+            <div className="text-center text-sm text-base-content/60">
+              <p>Not in your inbox? Check Spam and Promotions, and make sure the address is spelled correctly.</p>
+              <button
+                onClick={resendEmail}
+                disabled={resendState !== 'idle'}
+                className="btn btn-ghost btn-sm mt-2"
+              >
+                {resendState === 'sending' ? 'Sending...' : resendState === 'sent' ? 'Email sent again' : 'Resend confirmation email'}
+              </button>
+              {resendError ? <p className="text-error text-xs mt-1">{resendError}</p> : null}
             </div>
 
             <button onClick={() => router.push('/login')} className="btn btn-primary w-full">

@@ -12,6 +12,8 @@ import re
 import shutil
 import time
 import uuid
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from datetime import date
@@ -20,6 +22,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Request, Response, UploadFile
 from sqlalchemy import and_, desc, func, or_, select
+from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
 try:
@@ -56,6 +59,8 @@ from app.models import (
 from app.parsers.pdf_parser import extract_invoice_metadata, parse_pdf_document
 from app.services.bedrock_client import configure_bedrock_api_key
 from app.services.gemini_client import gemini_extract_image_metadata, gemini_classify_image
+from app.services.claude_client import claude_extract_image_metadata, claude_extraction_enabled
+from app.services.google_gemini_client import google_gemini_enabled, google_gemini_extract_image_metadata
 from app.schemas import (
     AskRequest,
     AskResponse,
@@ -446,6 +451,10 @@ def _mark_async_job_failed(
     engines_used: list[str] | None = None,
     services: ServiceRegistry | None = None,
 ) -> None:
+    # The failure may have come from a database flush; until the session is rolled back it
+    # rejects every statement, the job would stay "processing" and be retried forever.
+    if hasattr(db, "rollback"):
+        db.rollback()
     job.status = "failed"
     job.error_message = (error_message or "Async extraction failed")[:2000]
     if engines_used is not None:
@@ -612,7 +621,8 @@ def process_pending_async_extraction_jobs(
             _mark_async_job_failed(
                 db,
                 job,
-                error_message=str(exc),
+                # HTTPException's str() is "409: <detail>"; users should only see the detail.
+                error_message=(str(exc.detail) if isinstance(exc, HTTPException) else str(exc)),
                 engines_used=["local_async_worker"],
                 services=services,
             )
@@ -624,105 +634,6 @@ def process_pending_async_extraction_jobs(
     }
 
 
-def _cognito_attr_map(user: dict[str, object]) -> dict[str, str]:
-    attrs = user.get("Attributes")
-    if not isinstance(attrs, list):
-        return {}
-    mapped: dict[str, str] = {}
-    for attr in attrs:
-        if not isinstance(attr, dict):
-            continue
-        key = str(attr.get("Name") or "").strip()
-        value = str(attr.get("Value") or "").strip()
-        if key:
-            mapped[key] = value
-    return mapped
-
-
-def _list_cognito_users_by_custom_id(
-    *,
-    client: object,
-    user_pool_id: str,
-    custom_id: str,
-) -> list[dict[str, object]]:
-    escaped = custom_id.replace('"', '\\"')
-    filter_expressions = [
-        f'custom:custom_id = "{escaped}"',
-        f'preferred_username = "{escaped}"',
-    ]
-    matched_by_filter: list[dict[str, object]] = []
-    seen_usernames: set[str] = set()
-    for filter_expression in filter_expressions:
-        try:
-            response = client.list_users(UserPoolId=user_pool_id, Filter=filter_expression, Limit=20)
-            users = response.get("Users", [])
-            if not isinstance(users, list):
-                continue
-            for user in users:
-                if not isinstance(user, dict):
-                    continue
-                username = str(user.get("Username") or "").strip()
-                if username and username not in seen_usernames:
-                    seen_usernames.add(username)
-                    matched_by_filter.append(user)
-        except Exception:
-            continue
-
-    if matched_by_filter:
-        return matched_by_filter
-
-    # Fallback for pools where custom-attribute filtering is unavailable.
-    matched: list[dict[str, object]] = []
-    pagination_token: str | None = None
-    for _ in range(20):
-        params: dict[str, object] = {"UserPoolId": user_pool_id, "Limit": 60}
-        if pagination_token:
-            params["PaginationToken"] = pagination_token
-        response = client.list_users(**params)
-        users = response.get("Users", [])
-        if isinstance(users, list):
-            for user in users:
-                if not isinstance(user, dict):
-                    continue
-                attrs = _cognito_attr_map(user)
-                stored_custom_id = str(
-                    attrs.get("custom:custom_id") or attrs.get("preferred_username") or ""
-                ).strip().upper()
-                if stored_custom_id == custom_id.upper():
-                    matched.append(user)
-        token_value = response.get("PaginationToken")
-        pagination_token = str(token_value).strip() if token_value else None
-        if not pagination_token:
-            break
-    return matched
-
-
-def _list_cognito_users_by_attribute(
-    *,
-    client: object,
-    user_pool_id: str,
-    attribute_name: str,
-    attribute_value: str,
-    limit: int = 20,
-) -> list[dict[str, object]]:
-    escaped = str(attribute_value or "").replace('"', '\\"')
-    if not escaped:
-        return []
-    try:
-        response = client.list_users(
-            UserPoolId=user_pool_id,
-            Filter=f'{attribute_name} = "{escaped}"',
-            Limit=max(1, min(limit, 60)),
-        )
-    except Exception:
-        return []
-
-    users = response.get("Users", [])
-    if not isinstance(users, list):
-        return []
-    return [user for user in users if isinstance(user, dict)]
-
-
 def _user_type_from_custom_id(custom_id: str) -> str | None:
     normalized = str(custom_id or "").strip().upper()
     if normalized.startswith("MER-"):
@@ -732,86 +643,45 @@ def _user_type_from_custom_id(custom_id: str) -> str | None:
     return None
 
 
-def _should_try_next_cognito_password_flow(exc: Exception) -> bool:
-    message = str(exc).strip().lower()
-    if not message:
-        return False
-    retry_markers = (
-        "flow not enabled",
-        "not enabled for this client",
-        "invalid choice for authflow",
-        "unknown operation exception",
-        "accessdenied",
-        "access denied",
-        "admininitiateauth",
-    )
-    return any(marker in message for marker in retry_markers)
-
-
-def _cognito_password_login_response(
+def _find_user_profiles(
+    db: Session,
     *,
-    client: object,
-    user_pool_id: str,
-    client_id: str,
-    username: str,
-    password: str,
-    secret_hash: str | None = None,
-) -> dict[str, object]:
-    auth_parameters = {
-        "USERNAME": username,
-        "PASSWORD": password,
-    }
-    if secret_hash:
-        auth_parameters["SECRET_HASH"] = secret_hash
+    custom_id: str | None = None,
+    email: str | None = None,
+) -> list[dict[str, object]]:
+    """Look up SafeBill profiles from the Supabase-managed user_profiles table."""
+    if custom_id:
+        clause, params = "upper(custom_id) = :value", {"value": custom_id.strip().upper()}
+    elif email:
+        clause, params = "lower(email) = :value", {"value": email.strip().lower()}
+    else:
+        return []
 
-    flow_attempts: list[tuple[str, dict[str, object]]] = [
-        (
-            "admin_initiate_auth",
-            {
-                "UserPoolId": user_pool_id,
-                "ClientId": client_id,
-                "AuthFlow": "ADMIN_USER_PASSWORD_AUTH",
-                "AuthParameters": auth_parameters,
-            },
-        ),
-        (
-            "admin_initiate_auth",
-            {
-                "UserPoolId": user_pool_id,
-                "ClientId": client_id,
-                "AuthFlow": "ADMIN_NO_SRP_AUTH",
-                "AuthParameters": auth_parameters,
-            },
-        ),
-        (
-            "initiate_auth",
-            {
-                "ClientId": client_id,
-                "AuthFlow": "USER_PASSWORD_AUTH",
-                "AuthParameters": auth_parameters,
-            },
-        ),
-    ]
+    query = sql_text(
+        "SELECT CAST(user_id AS TEXT) AS user_id, custom_id, email, full_name, user_type "
+        f"FROM user_profiles WHERE {clause} ORDER BY created_at ASC LIMIT 5"
+    )
+    try:
+        rows = db.execute(query, params).mappings().all()
+    except Exception as exc:
+        logger.exception("user_profiles lookup failed")
+        if hasattr(db, "rollback"):
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=503,
+            detail="User directory is unavailable. Apply the user_profiles migration (backend/sql/008_supabase_auth_hardening.sql).",
+        ) from exc
+    return [dict(row) for row in rows]
 
-    last_error: Exception | None = None
-    for index, (method_name, params) in enumerate(flow_attempts):
-        method = getattr(client, method_name, None)
-        if not callable(method):
-            continue
-        try:
-            response = method(**params)
-        except Exception as exc:
-            last_error = exc
-            should_retry = index < len(flow_attempts) - 1 and _should_try_next_cognito_password_flow(exc)
-            if should_retry:
-                continue
-            raise
-        if isinstance(response, dict):
-            return response
 
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("Cognito password login is unavailable")
+def _profile_user_type(profile: dict[str, object]) -> str:
+    stored = str(profile.get("user_type") or "").strip().lower()
+    if stored in {"consumer", "merchant"}:
+        return stored
+    return _user_type_from_custom_id(str(profile.get("custom_id") or "")) or ""
 
 
 def _safe_session_commit(db: Session) -> None:
@@ -888,67 +758,39 @@ def _rate_limit_or_429(
 
 
 @router.post("/auth/lookup-id")
-def lookup_user_by_custom_id(payload: dict[str, object]) -> dict[str, object]:
-    settings = get_settings()
+def lookup_user_by_custom_id(
+    payload: dict[str, object],
+    principal: Principal = Depends(require_roles("admin", "analyst", "merchant")),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    _ = principal
     custom_id = str(payload.get("customId") or "").strip().upper()
     requested_type = str(payload.get("userType") or "").strip().lower()
-    if not custom_id or requested_type not in {"consumer", "merchant"}:
+    if not custom_id or len(custom_id) > 64 or requested_type not in {"consumer", "merchant"}:
         raise HTTPException(status_code=400, detail="customId and valid userType are required")
 
-    if not settings.cognito_user_pool_id:
-        raise HTTPException(status_code=500, detail="COGNITO_USER_POOL_ID is not configured")
-    if boto3 is None:
-        raise HTTPException(status_code=500, detail="boto3 dependency is unavailable")
-
-    try:
-        client = boto3.client("cognito-idp", region_name=settings.aws_region)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to initialize Cognito client: {exc}") from exc
-
-    try:
-        users = _list_cognito_users_by_custom_id(
-            client=client,
-            user_pool_id=settings.cognito_user_pool_id,
-            custom_id=custom_id,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Cognito lookup failed: {exc}") from exc
-
-    for user in users:
-        attrs = _cognito_attr_map(user)
-        resolved_custom_id = str(
-            attrs.get("custom:custom_id") or attrs.get("preferred_username") or custom_id
-        ).strip().upper()
-        discovered_type = str(attrs.get("custom:user_type") or "").strip().lower()
-        if discovered_type not in {"consumer", "merchant"}:
-            discovered_type = _user_type_from_custom_id(resolved_custom_id) or ""
-        if discovered_type and discovered_type != requested_type:
+    for profile in _find_user_profiles(db, custom_id=custom_id):
+        if _profile_user_type(profile) != requested_type or not profile.get("user_id"):
             continue
-
-        email = str(attrs.get("email") or "").strip().lower()
-        phone = str(attrs.get("phone_number") or "").strip()
-        username = str(user.get("Username") or "").strip()
-        if not username:
-            continue
-        full_name = str(attrs.get("name") or attrs.get("given_name") or "").strip()
-        user_sub = str(attrs.get("sub") or "").strip()
-        resolved_type = discovered_type if discovered_type in {"consumer", "merchant"} else requested_type
-
+        resolved_custom_id = str(profile.get("custom_id") or custom_id).strip().upper()
         return {
-            "userId": user_sub,
-            "username": username,
-            "email": email,
-            "phone": phone,
-            "fullName": full_name,
-            "userType": resolved_type,
+            "userId": str(profile.get("user_id")),
+            "username": resolved_custom_id,
+            "email": (str(profile.get("email") or "").strip() or None),
+            "phone": None,
+            "fullName": str(profile.get("full_name") or "").strip() or resolved_custom_id,
+            "userType": requested_type,
             "customId": resolved_custom_id,
         }
 
-    raise HTTPException(status_code=404, detail="Account not found")
+    raise HTTPException(status_code=404, detail="No SafeBill account found for that ID.")
 
 
 @router.post("/auth/recover-id")
-def recover_custom_id_via_email(payload: dict[str, object]) -> dict[str, object]:
+def recover_custom_id_via_email(
+    payload: dict[str, object],
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     settings = get_settings()
     email = str(payload.get("email") or payload.get("identifier") or "").strip().lower()
     requested_type = str(payload.get("userType") or "").strip().lower()
@@ -957,6 +799,15 @@ def recover_custom_id_via_email(payload: dict[str, object]) -> dict[str, object]
     if "@" not in email or requested_type not in {"consumer", "merchant"}:
         raise HTTPException(status_code=400, detail="email and valid userType are required")
 
+    if not settings.email_notifications_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "ID recovery by email is not enabled. Sign in with your email and password - "
+                f"your {account_label} is shown in Settings."
+            ),
+        )
+
     generic_response = {
         "ok": True,
         "deliveryDestination": email,
@@ -964,52 +815,19 @@ def recover_custom_id_via_email(payload: dict[str, object]) -> dict[str, object]
         "message": f"If an account exists, your {account_label} has been emailed.",
     }
 
-    if not settings.cognito_user_pool_id:
-        raise HTTPException(status_code=500, detail="COGNITO_USER_POOL_ID is not configured")
-    if boto3 is None:
-        raise HTTPException(status_code=500, detail="boto3 dependency is unavailable")
-
-    try:
-        client = boto3.client("cognito-idp", region_name=settings.aws_region)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to initialize Cognito client: {exc}") from exc
-
-    try:
-        users = _list_cognito_users_by_attribute(
-            client=client,
-            user_pool_id=settings.cognito_user_pool_id,
-            attribute_name="email",
-            attribute_value=email,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Cognito lookup failed: {exc}") from exc
-
-    matched_user: dict[str, object] | None = None
-    resolved_custom_id = ""
-    full_name = ""
-
-    for user in users:
-        attrs = _cognito_attr_map(user)
-        resolved_email = str(attrs.get("email") or "").strip().lower()
-        resolved_custom_id = str(
-            attrs.get("custom:custom_id") or attrs.get("preferred_username") or ""
-        ).strip().upper()
-        if not resolved_email or resolved_email != email or not resolved_custom_id:
-            continue
-
-        discovered_type = str(attrs.get("custom:user_type") or "").strip().lower()
-        if discovered_type not in {"consumer", "merchant"}:
-            discovered_type = _user_type_from_custom_id(resolved_custom_id) or ""
-        if discovered_type != requested_type:
-            continue
-
-        matched_user = user
-        full_name = str(attrs.get("name") or attrs.get("given_name") or "").strip()
-        break
-
-    if matched_user is None or not resolved_custom_id:
+    matched = next(
+        (
+            profile
+            for profile in _find_user_profiles(db, email=email)
+            if _profile_user_type(profile) == requested_type and profile.get("custom_id")
+        ),
+        None,
+    )
+    if matched is None:
         return generic_response
 
+    resolved_custom_id = str(matched.get("custom_id")).strip().upper()
+    full_name = str(matched.get("full_name") or "").strip()
     salutation = full_name or ("Merchant" if requested_type == "merchant" else "Consumer")
     subject = f"Your SafeBill {account_label}"
     body = "\n".join(
@@ -1018,7 +836,7 @@ def recover_custom_id_via_email(payload: dict[str, object]) -> dict[str, object]
             "",
             f"Your SafeBill {account_label} is: {resolved_custom_id}",
             "",
-            "Use this ID with your password to sign in to SafeBill.",
+            "Share this ID with merchants so they can send bills to your SafeBill locker.",
             "If you did not request this email, you can ignore it.",
             "",
             "SafeBill",
@@ -1032,65 +850,10 @@ def recover_custom_id_via_email(payload: dict[str, object]) -> dict[str, object]
             body=body,
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to send recovery email: {exc}") from exc
+        logger.exception("ID recovery email failed")
+        raise HTTPException(status_code=500, detail="Failed to send recovery email.") from exc
 
     return generic_response
-
-
-@router.post("/auth/cognito/login")
-def cognito_password_login(payload: dict[str, object]) -> dict[str, object]:
-    settings = get_settings()
-    username = str(payload.get("username") or "").strip()
-    password = str(payload.get("password") or "")
-    secret_hash = str(payload.get("secretHash") or "").strip() or None
-
-    if not username or not password:
-        raise HTTPException(status_code=400, detail="username and password are required")
-    if not settings.cognito_user_pool_id:
-        raise HTTPException(status_code=500, detail="COGNITO_USER_POOL_ID is not configured")
-    if not settings.cognito_app_client_id:
-        raise HTTPException(status_code=500, detail="COGNITO_APP_CLIENT_ID is not configured")
-    if boto3 is None:
-        raise HTTPException(status_code=500, detail="boto3 dependency is unavailable")
-
-    try:
-        client = boto3.client("cognito-idp", region_name=settings.aws_region)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to initialize Cognito client: {exc}") from exc
-
-    try:
-        response = _cognito_password_login_response(
-            client=client,
-            user_pool_id=settings.cognito_user_pool_id,
-            client_id=settings.cognito_app_client_id,
-            username=username,
-            password=password,
-            secret_hash=secret_hash,
-        )
-    except Exception as exc:
-        detail = str(exc).strip() or "Cognito login failed"
-        lowered = detail.lower()
-        if "not authorized" in lowered or "incorrect username or password" in lowered:
-            raise HTTPException(status_code=401, detail=detail) from exc
-        if "user is not confirmed" in lowered or "usernotconfirmedexception" in lowered:
-            raise HTTPException(status_code=400, detail=detail) from exc
-        if "password reset required" in lowered:
-            raise HTTPException(status_code=400, detail=detail) from exc
-        raise HTTPException(status_code=500, detail=detail) from exc
-
-    auth_result = response.get("AuthenticationResult")
-    challenge_name = str(response.get("ChallengeName") or "").strip() or None
-    session = str(response.get("Session") or "").strip() or None
-    auth_result_map = auth_result if isinstance(auth_result, dict) else {}
-
-    return {
-        "accessToken": str(auth_result_map.get("AccessToken") or "").strip() or None,
-        "idToken": str(auth_result_map.get("IdToken") or "").strip() or None,
-        "refreshToken": str(auth_result_map.get("RefreshToken") or "").strip() or None,
-        "expiresIn": auth_result_map.get("ExpiresIn"),
-        "challengeName": challenge_name,
-        "session": session,
-    }
 
 
 def _coerce_date(value: object) -> date | None:
@@ -1571,14 +1334,14 @@ def _classify_document_with_bedrock(ocr_text: str, filename: str) -> dict[str, o
     if boto3 is None or not model:
         # Fallback to Gemini for text-based classification.
         try:
-            from app.services.gemini_client import gemini_extract_json
+            from app.services.llm_router import extract_json
             prompt = (
                 f"Classify this document text. Is it a bill/invoice/receipt or warranty card?\n"
                 f"filename={filename}\nocr_text:\n{ocr_text[:8000]}\n\n"
                 f"Return JSON with keys: is_invoice (boolean), document_type (string: invoice/receipt/warranty_card/guarantee_card/other), "
                 f"confidence (0-1), reason (short string)."
             )
-            parsed = gemini_extract_json(prompt)
+            parsed = extract_json(prompt, budget_seconds=30)
             if isinstance(parsed, dict):
                 raw_is = parsed.get("is_invoice")
                 is_inv = None
@@ -2691,6 +2454,38 @@ def _manual_override_metadata(
     return payload
 
 
+def _vision_llm_engine_result(
+    engine: str,
+    raw: dict[str, object] | None,
+    filename: str,
+) -> dict[str, object] | None:
+    """Turn a vision LLM's raw JSON into an engine result, or None if it found nothing usable."""
+    if not raw or not isinstance(raw, dict):
+        return None
+    raw = dict(raw)
+    full_text = str(raw.pop("full_text", "") or "").strip()
+    metadata = ensure_strict_extraction(_normalize_invoice_metadata(raw))
+    key_fields = ("bill_id", "vendor", "total_amount", "date")
+    if not any(_is_meaningful_metadata_value(metadata.get(key)) for key in key_fields):
+        if not full_text:
+            return None
+        # Structured fields were weak; run the model's transcription through regex extraction.
+        metadata = ensure_strict_extraction(extract_invoice_metadata(full_text, filename))
+        if not any(_is_meaningful_metadata_value(metadata.get(key)) for key in key_fields):
+            return None
+    text = full_text or _metadata_to_canonical_text(metadata)
+    return {
+        "engine": engine,
+        "metadata": metadata,
+        "text": text,
+        "field_confidences": compute_field_confidences(
+            metadata=metadata,
+            engine=engine,
+            text_quality=estimate_text_quality(text),
+        ),
+    }
+
+
 def _run_image_extraction_router(
     *,
     image_bytes: bytes,
@@ -2753,53 +2548,34 @@ def _run_image_extraction_router(
                 }
             )
 
-    # --- Gemini Vision engine (primary when Gemini API key is configured) ---
+    # --- Vision LLM engines: Claude, Gemini and the OpenRouter model run in parallel and
+    # vote per field. ("gemini_vision" is the OpenRouter engine; its name predates Gemini.)
     if not local_only_mode:
-        try:
-            gemini_raw = gemini_extract_image_metadata(image_bytes, filename)
-            if gemini_raw and isinstance(gemini_raw, dict):
-                gemini_full_text = str(gemini_raw.pop("full_text", "") or "").strip()
-                gemini_metadata = ensure_strict_extraction(_normalize_invoice_metadata(gemini_raw))
-                if any(
-                    _is_meaningful_metadata_value(gemini_metadata.get(key))
-                    for key in ("bill_id", "vendor", "total_amount", "date")
-                ):
-                    canonical_gemini_text = gemini_full_text or _metadata_to_canonical_text(gemini_metadata)
-                    engine_results.append(
-                        {
-                            "engine": "gemini_vision",
-                            "metadata": gemini_metadata,
-                            "text": canonical_gemini_text,
-                            "field_confidences": compute_field_confidences(
-                                metadata=gemini_metadata,
-                                engine="gemini_vision",
-                                text_quality=estimate_text_quality(canonical_gemini_text),
-                            ),
-                        }
-                    )
-                elif gemini_full_text:
-                    # Even if structured fields were weak, feed full text through regex extraction.
-                    fallback_metadata = ensure_strict_extraction(extract_invoice_metadata(gemini_full_text, filename))
-                    if any(
-                        _is_meaningful_metadata_value(fallback_metadata.get(key))
-                        for key in ("bill_id", "vendor", "total_amount", "date")
-                    ):
-                        engine_results.append(
-                            {
-                                "engine": "gemini_vision",
-                                "metadata": fallback_metadata,
-                                "text": gemini_full_text,
-                                "field_confidences": compute_field_confidences(
-                                    metadata=fallback_metadata,
-                                    engine="gemini_vision",
-                                    text_quality=estimate_text_quality(gemini_full_text),
-                                ),
-                            }
-                        )
-        except Exception:
-            pass  # Gemini unavailable, continue with other engines.
+        vision_extractors: dict[str, Callable[[bytes, str], dict[str, object]]] = {
+            "gemini_vision": gemini_extract_image_metadata,
+        }
+        if claude_extraction_enabled():
+            vision_extractors["claude_vision"] = claude_extract_image_metadata
+        if google_gemini_enabled():
+            vision_extractors["google_gemini_vision"] = google_gemini_extract_image_metadata
+        with ThreadPoolExecutor(max_workers=len(vision_extractors)) as pool:
+            futures = {
+                engine: pool.submit(extractor, image_bytes, filename)
+                for engine, extractor in vision_extractors.items()
+            }
+        for engine, future in futures.items():
+            try:
+                raw = future.result()
+            except Exception:
+                logger.exception("%s extraction failed filename=%s", engine, filename)
+                continue
+            result = _vision_llm_engine_result(engine, raw, filename)
+            if result is not None:
+                engine_results.append(result)
 
-    has_gemini_success = any(r.get("engine") == "gemini_vision" for r in engine_results)
+    has_gemini_success = any(
+        r.get("engine") in {"gemini_vision", "claude_vision", "google_gemini_vision"} for r in engine_results
+    )
     if not local_only_mode and not has_gemini_success:
         google_metadata, google_text = _extract_image_metadata_with_google_vision(image_bytes, filename)
         google_vendor = str(google_metadata.get("vendor") or "").strip().lower()
@@ -2944,6 +2720,8 @@ def _run_image_extraction_router(
     grounded_engine_names = {
         "google_vision",
         "gemini_vision",
+        "claude_vision",
+        "google_gemini_vision",
         "aws_bedrock_text",
         "aws_textract",
         "aws_textract_proxy",

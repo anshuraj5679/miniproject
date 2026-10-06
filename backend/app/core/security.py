@@ -50,14 +50,9 @@ def cognito_jwt_runtime_available() -> bool:
 
 
 def _extract_user_type(claims: dict[str, Any]) -> str | None:
-    # Supabase: check user_metadata
-    user_metadata = claims.get("user_metadata")
-    if isinstance(user_metadata, dict):
-        candidate = str(user_metadata.get("user_type") or "").strip().lower()
-        if candidate in {"consumer", "merchant"}:
-            return candidate
-
-    # Supabase: check app_metadata
+    # Supabase: only app_metadata is trusted. user_metadata is writable by the user
+    # (supabase.auth.updateUser), so reading the role from it allows self-promotion.
+    # app_metadata.user_type is set server-side by backend/sql/008_supabase_auth_hardening.sql.
     app_metadata = claims.get("app_metadata")
     if isinstance(app_metadata, dict):
         candidate = str(app_metadata.get("user_type") or "").strip().lower()
