@@ -1409,6 +1409,63 @@ def _metadata_looks_like_ui(metadata: dict[str, object]) -> bool:
     return any(token in combined for token in ui_tokens)
 
 
+def _normalize_identifier_value(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper()).strip()
+
+
+def _is_plausible_identifier(value: str) -> bool:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return False
+    if len(candidate) < 4 or len(candidate) > 64:
+        return False
+    if not any(ch.isdigit() for ch in candidate):
+        return False
+    lowered = candidate.lower()
+    if lowered in {"na", "n/a", "none", "unknown", "nil"}:
+        return False
+    return True
+
+
+def _extract_document_identifiers(metadata: dict[str, object], raw_text: str) -> dict[str, object]:
+    invoice_number = str(metadata.get("bill_id") or "").strip()
+    serial_number = str(metadata.get("serial_number") or "").strip()
+    order_number = ""
+    warranty_number = ""
+
+    pattern = re.compile(
+        r"(?im)\b(?P<label>invoice|inv|bill|receipt|order|po|purchase\s*order|warranty|guarantee|serial|s\/n|imei)"
+        r"\s*(?:no|number|#|id)?\s*[:\-]?\s*(?P<value>[A-Z0-9][A-Z0-9\/\\-]{3,64})"
+    )
+    for match in pattern.finditer(raw_text or ""):
+        label = str(match.group("label") or "").strip().lower()
+        value = str(match.group("value") or "").strip()
+        if not _is_plausible_identifier(value):
+            continue
+        if label in {"invoice", "inv", "bill", "receipt"} and not invoice_number:
+            invoice_number = value
+        elif label in {"order", "po", "purchase order"} and not order_number:
+            order_number = value
+        elif label in {"warranty", "guarantee"} and not warranty_number:
+            warranty_number = value
+        elif label in {"serial", "s/n", "imei"} and not serial_number:
+            serial_number = value
+
+    raw_candidates = [invoice_number, order_number, warranty_number, serial_number]
+    raw_candidates = [value for value in raw_candidates if _is_plausible_identifier(value)]
+    normalized = [_normalize_identifier_value(value) for value in raw_candidates]
+    normalized = [value for value in normalized if _is_plausible_identifier(value)]
+
+    return {
+        "invoice_number": invoice_number if _is_plausible_identifier(invoice_number) else None,
+        "order_number": order_number if _is_plausible_identifier(order_number) else None,
+        "warranty_number": warranty_number if _is_plausible_identifier(warranty_number) else None,
+        "serial_number": serial_number if _is_plausible_identifier(serial_number) else None,
+        "identifiers_raw": raw_candidates[:8],
+        "identifiers_norm": normalized[:8],
+    }
+
+
 def _heuristic_is_invoice_document(text: str) -> tuple[bool, float]:
     cleaned = re.sub(r"\s+", " ", (text or "").lower()).strip()
     if not cleaned:
@@ -2963,6 +3020,10 @@ def _persist_structured_document(
     )
 
     fingerprint = extraction_fingerprint(metadata, extracted_text)
+    identifier_payload = _extract_document_identifiers(metadata, extracted_text)
+    identifier_raw = list(identifier_payload.get("identifiers_raw") or [])
+    identifier_norm = list(identifier_payload.get("identifiers_norm") or [])
+
     duplicate_count = 0
     scoped_user_id = str(user_id or "").strip()
     scoped_merchant_id = str((additional_references or {}).get("merchant_user_id") or "").strip()
@@ -2974,12 +3035,18 @@ def _persist_structured_document(
     elif scoped_merchant_id:
         owner_field = Document.references["merchant_user_id"].as_string()
         owner_value = scoped_merchant_id
+
     if owner_field is not None and owner_value:
         duplicate_conditions: list[object] = [
             Document.references["extraction_fingerprint"].as_string() == fingerprint,
         ]
-        if resolved_bill_id:
-            duplicate_conditions.append(Document.bill_id == resolved_bill_id)
+        if identifier_raw:
+            duplicate_conditions.append(Document.bill_id.in_(identifier_raw))
+        if identifier_norm:
+            duplicate_conditions.append(Document.references["invoice_number_norm"].as_string().in_(identifier_norm))
+            duplicate_conditions.append(Document.references["order_number_norm"].as_string().in_(identifier_norm))
+            duplicate_conditions.append(Document.references["warranty_number_norm"].as_string().in_(identifier_norm))
+            duplicate_conditions.append(Document.references["serial_number_norm"].as_string().in_(identifier_norm))
         duplicate_stmt = select(func.count(Document.id)).where(
             owner_field == owner_value,
             or_(*duplicate_conditions),
@@ -3045,6 +3112,27 @@ def _persist_structured_document(
         references["line_items"] = sanitized_line_items[:50]
     if metadata.get("serial_number") and not references.get("serial_number"):
         references["serial_number"] = str(metadata["serial_number"])
+    if identifier_payload:
+        if identifier_payload.get("invoice_number") and not references.get("invoice_number"):
+            references["invoice_number"] = identifier_payload["invoice_number"]
+        if identifier_payload.get("order_number") and not references.get("order_number"):
+            references["order_number"] = identifier_payload["order_number"]
+        if identifier_payload.get("warranty_number") and not references.get("warranty_number"):
+            references["warranty_number"] = identifier_payload["warranty_number"]
+        if identifier_payload.get("serial_number") and not references.get("serial_number"):
+            references["serial_number"] = identifier_payload["serial_number"]
+        if identifier_payload.get("identifiers_raw"):
+            references["document_identifiers"] = identifier_payload["identifiers_raw"]
+        if identifier_payload.get("identifiers_norm"):
+            references["document_identifiers_norm"] = identifier_payload["identifiers_norm"]
+        if identifier_payload.get("invoice_number"):
+            references["invoice_number_norm"] = _normalize_identifier_value(identifier_payload["invoice_number"])
+        if identifier_payload.get("order_number"):
+            references["order_number_norm"] = _normalize_identifier_value(identifier_payload["order_number"])
+        if identifier_payload.get("warranty_number"):
+            references["warranty_number_norm"] = _normalize_identifier_value(identifier_payload["warranty_number"])
+        if identifier_payload.get("serial_number"):
+            references["serial_number_norm"] = _normalize_identifier_value(identifier_payload["serial_number"])
     if extracted_warranty_start and not references.get("warranty_start"):
         references["warranty_start"] = extracted_warranty_start.isoformat()
     if extracted_warranty_end and not references.get("warranty_end"):
@@ -4507,6 +4595,9 @@ async def ingest_pdf(
         fallback_text=resolved_pdf_text,
     )
     fingerprint = extraction_fingerprint(parsed_metadata, resolved_pdf_text)
+    identifier_payload = _extract_document_identifiers(parsed_metadata, resolved_pdf_text)
+    identifier_raw = list(identifier_payload.get("identifiers_raw") or [])
+    identifier_norm = list(identifier_payload.get("identifiers_norm") or [])
     owner_field = None
     owner_value = ""
     if user_id:
@@ -4519,9 +4610,13 @@ async def ingest_pdf(
         duplicate_conditions: list[object] = [
             Document.references["extraction_fingerprint"].as_string() == fingerprint,
         ]
-        candidate_bill = str(parsed_metadata.get("bill_id") or "").strip()
-        if candidate_bill:
-            duplicate_conditions.append(Document.bill_id == candidate_bill)
+        if identifier_raw:
+            duplicate_conditions.append(Document.bill_id.in_(identifier_raw))
+        if identifier_norm:
+            duplicate_conditions.append(Document.references["invoice_number_norm"].as_string().in_(identifier_norm))
+            duplicate_conditions.append(Document.references["order_number_norm"].as_string().in_(identifier_norm))
+            duplicate_conditions.append(Document.references["warranty_number_norm"].as_string().in_(identifier_norm))
+            duplicate_conditions.append(Document.references["serial_number_norm"].as_string().in_(identifier_norm))
         duplicate_stmt = select(func.count(Document.id)).where(
             owner_field == owner_value,
             or_(*duplicate_conditions),
@@ -4566,6 +4661,27 @@ async def ingest_pdf(
         references.update(document_type_payload)
     if fingerprint:
         references["extraction_fingerprint"] = fingerprint
+    if identifier_payload:
+        if identifier_payload.get("invoice_number") and not references.get("invoice_number"):
+            references["invoice_number"] = identifier_payload["invoice_number"]
+        if identifier_payload.get("order_number") and not references.get("order_number"):
+            references["order_number"] = identifier_payload["order_number"]
+        if identifier_payload.get("warranty_number") and not references.get("warranty_number"):
+            references["warranty_number"] = identifier_payload["warranty_number"]
+        if identifier_payload.get("serial_number") and not references.get("serial_number"):
+            references["serial_number"] = identifier_payload["serial_number"]
+        if identifier_payload.get("identifiers_raw"):
+            references["document_identifiers"] = identifier_payload["identifiers_raw"]
+        if identifier_payload.get("identifiers_norm"):
+            references["document_identifiers_norm"] = identifier_payload["identifiers_norm"]
+        if identifier_payload.get("invoice_number"):
+            references["invoice_number_norm"] = _normalize_identifier_value(identifier_payload["invoice_number"])
+        if identifier_payload.get("order_number"):
+            references["order_number_norm"] = _normalize_identifier_value(identifier_payload["order_number"])
+        if identifier_payload.get("warranty_number"):
+            references["warranty_number_norm"] = _normalize_identifier_value(identifier_payload["warranty_number"])
+        if identifier_payload.get("serial_number"):
+            references["serial_number_norm"] = _normalize_identifier_value(identifier_payload["serial_number"])
     if storage_references:
         references.update(storage_references)
     if user_id:
