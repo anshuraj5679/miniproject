@@ -228,6 +228,20 @@ export interface MerchantActivity {
   createdAt: string;
 }
 
+export interface MerchantAssignmentAudit {
+  assignmentId: string;
+  documentId: string;
+  merchantUserId: string;
+  consumerUserId: string;
+  status: string;
+  assignmentSource?: string;
+  acceptedAt?: string;
+  escalatedAt?: string;
+  notes?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface MerchantManualBillPayload {
   merchantUserId: string;
   merchantName?: string;

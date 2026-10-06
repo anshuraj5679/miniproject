@@ -33,7 +33,7 @@ import {
 } from 'lucide-react'
 import { apiClient } from '@/lib/api-client'
 import { useAuthStore } from '@/lib/store/auth-store'
-import type { Document, InAppNotification, MerchantActivity } from '@/lib/types'
+import type { Document, InAppNotification, MerchantActivity, MerchantAssignmentAudit } from '@/lib/types'
 
 type WorkspaceTab = 'upload' | 'manual' | 'reassign'
 type NavigationMode = 'workspace' | 'activity'
@@ -149,6 +149,26 @@ function statusChipClass(tone: 'emerald' | 'amber' | 'slate'): string {
   if (tone === 'emerald') return 'border-emerald-200 bg-emerald-50 text-emerald-700'
   if (tone === 'amber') return 'border-amber-200 bg-amber-50 text-amber-700'
   return 'border-slate-200 bg-slate-100 text-slate-600'
+}
+
+function getAuditTone(status?: string | null): string {
+  const normalized = String(status || '').trim().toLowerCase()
+  if (normalized === 'accepted') return 'border-emerald-200 bg-emerald-50 text-emerald-700'
+  if (normalized === 'escalated') return 'border-red-200 bg-red-50 text-red-700'
+  if (normalized === 'assigned') return 'border-blue-200 bg-blue-50 text-blue-700'
+  return 'border-slate-200 bg-slate-100 text-slate-600'
+}
+
+function formatAuditStatus(status?: string | null): string {
+  const normalized = String(status || '').trim().toLowerCase()
+  if (!normalized) return 'unknown'
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1)
+}
+
+function formatAssignmentSource(source?: string | null): string {
+  const normalized = String(source || '').trim().replace(/[_-]+/g, ' ')
+  if (!normalized) return 'manual action'
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1)
 }
 
 function buildClientAuthHeaders(): HeadersInit | undefined {
@@ -302,6 +322,7 @@ export function MerchantDashboardScreen() {
 
   const [documents, setDocuments] = useState<Document[]>([])
   const [recentActivity, setRecentActivity] = useState<MerchantActivity[]>([])
+  const [assignmentAudits, setAssignmentAudits] = useState<MerchantAssignmentAudit[]>([])
   const [notificationCount, setNotificationCount] = useState(0)
   const [workspaceLoading, setWorkspaceLoading] = useState(false)
   const [workspaceError, setWorkspaceError] = useState<string | null>(null)
@@ -390,7 +411,7 @@ export function MerchantDashboardScreen() {
     setWorkspaceLoading(true)
     setWorkspaceError(null)
 
-    const [documentsResult, activityResult, notificationsResult] = await Promise.allSettled([
+    const [documentsResult, activityResult, notificationsResult, auditsResult] = await Promise.allSettled([
       apiClient.get<{ documents: Document[] }>('/documents', {
         params: { merchantUserId: user.userId, limit: 200 },
       }),
@@ -399,6 +420,9 @@ export function MerchantDashboardScreen() {
       }),
       apiClient.get<{ notifications: InAppNotification[] }>('/notifications', {
         params: { userId: user.userId, include_read: false, limit: 20 },
+      }),
+      apiClient.get<{ assignments: MerchantAssignmentAudit[] }>('/merchant/assignment-audits', {
+        params: { merchantUserId: user.userId, limit: 50 },
       }),
     ])
 
@@ -411,11 +435,15 @@ export function MerchantDashboardScreen() {
     if (notificationsResult.status === 'fulfilled') {
       setNotificationCount((notificationsResult.value.notifications || []).length)
     }
+    if (auditsResult.status === 'fulfilled') {
+      setAssignmentAudits(auditsResult.value.assignments || [])
+    }
 
     if (
       documentsResult.status === 'rejected' &&
       activityResult.status === 'rejected' &&
-      notificationsResult.status === 'rejected'
+      notificationsResult.status === 'rejected' &&
+      auditsResult.status === 'rejected'
     ) {
       setWorkspaceError('Merchant workspace failed to load. Refresh and retry.')
     }
@@ -445,6 +473,14 @@ export function MerchantDashboardScreen() {
     }
     return map
   }, [recentActivity])
+
+  const documentById = useMemo(() => {
+    const map = new Map<string, Document>()
+    for (const document of documents) {
+      map.set(document.docId, document)
+    }
+    return map
+  }, [documents])
 
   const recentConsumers = useMemo(() => {
     const seen = new Set<string>()
@@ -490,12 +526,26 @@ export function MerchantDashboardScreen() {
     [documents, selectedDocumentId]
   )
 
+  const reviewQueue = useMemo(
+    () =>
+      documents
+        .filter((document) => document.reviewRequired || (document.lowConfidenceFields || []).length > 0)
+        .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime())
+        .slice(0, 6),
+    [documents]
+  )
+
+  const auditTrail = useMemo(() => assignmentAudits.slice(0, 8), [assignmentAudits])
+
+  const pendingAuditCount = useMemo(
+    () => assignmentAudits.filter((audit) => String(audit.status || '').trim().toLowerCase() !== 'accepted').length,
+    [assignmentAudits]
+  )
+
   const stats = useMemo(() => {
     const uniqueConsumers = new Set<string>()
     let totalValue = 0
     let attentionCount = 0
-    let recentAssignments = 0
-    const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
 
     for (const document of documents) {
       if (document.userId) uniqueConsumers.add(document.userId)
@@ -504,10 +554,6 @@ export function MerchantDashboardScreen() {
       if (document.reviewRequired || (document.lowConfidenceFields || []).length > 0) {
         attentionCount += 1
       }
-      const createdAt = new Date(document.createdAt).getTime()
-      if (!Number.isNaN(createdAt) && createdAt >= weekAgo) {
-        recentAssignments += 1
-      }
     }
 
     return {
@@ -515,7 +561,6 @@ export function MerchantDashboardScreen() {
       totalConsumers: uniqueConsumers.size,
       trackedValue: totalValue,
       attentionCount,
-      recentAssignments,
     }
   }, [documents])
 
@@ -841,7 +886,7 @@ export function MerchantDashboardScreen() {
                         {selectedConsumer ? selectedConsumer.fullName : 'No consumer selected'}
                       </h2>
                       <p className="mt-1 text-sm text-slate-500">
-                        {selectedConsumer ? `${selectedConsumer.customId}${selectedConsumer.email ? ` • ${selectedConsumer.email}` : ''}` : 'Search with SafeBill consumer ID to start assigning bills.'}
+                        {selectedConsumer ? `${selectedConsumer.customId}${selectedConsumer.email ? ` | ${selectedConsumer.email}` : ''}` : 'Search with SafeBill consumer ID to start assigning bills.'}
                       </p>
                     </div>
                     <div className="rounded-2xl border border-blue-200 bg-white p-3 text-blue-600">
@@ -898,7 +943,7 @@ export function MerchantDashboardScreen() {
                 icon={ShieldCheck}
                 label="Needs review"
                 value={String(stats.attentionCount)}
-                detail={`${stats.recentAssignments} invoice${stats.recentAssignments === 1 ? '' : 's'} added in the last 7 days`}
+                detail={`${pendingAuditCount} assignment${pendingAuditCount === 1 ? '' : 's'} still waiting for final acceptance`}
                 accent="violet"
               />
             </section>
@@ -980,7 +1025,7 @@ export function MerchantDashboardScreen() {
                           </div>
                           <div>
                             <p className="text-sm font-semibold text-slate-950">{resolvedConsumer.fullName}</p>
-                            <p className="text-xs text-slate-500">{resolvedConsumer.customId}{resolvedConsumer.email ? ` • ${resolvedConsumer.email}` : ''}</p>
+                            <p className="text-xs text-slate-500">{resolvedConsumer.customId}{resolvedConsumer.email ? ` | ${resolvedConsumer.email}` : ''}</p>
                           </div>
                         </div>
                         <p className="mt-4 text-sm leading-6 text-slate-600">
@@ -1493,6 +1538,131 @@ export function MerchantDashboardScreen() {
                 <div className="dashboard-card overflow-hidden">
                   <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
                     <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Review queue</p>
+                      <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Invoices needing review</h2>
+                    </div>
+                    <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">
+                      {reviewQueue.length} flagged
+                    </span>
+                  </div>
+                  <div className="p-5">
+                    {reviewQueue.length === 0 ? (
+                      <EmptyPanel
+                        title="No flagged invoices"
+                        description="When OCR confidence drops or mapped fields need verification, those invoices will appear here for merchant follow-up."
+                      />
+                    ) : (
+                      <div className="space-y-3">
+                        {reviewQueue.map((document) => {
+                          const latestActivity = activityByDocumentId.get(document.docId)
+                          const lowConfidence = (document.lowConfidenceFields || []).slice(0, 3)
+                          return (
+                            <article key={document.docId} className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
+                              <div className="flex items-start justify-between gap-3">
+                                <div>
+                                  <p className="text-sm font-semibold text-slate-950">{document.title || 'Untitled invoice'}</p>
+                                  <p className="mt-1 text-xs text-slate-500">
+                                    {latestActivity?.consumerCustomId || document.consumerCustomId || document.userId || 'Consumer missing'} | {formatCurrency(getDocumentAmount(document))}
+                                  </p>
+                                </div>
+                                <span className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-700">
+                                  Review
+                                </span>
+                              </div>
+                              <div className="mt-3 flex flex-wrap gap-2">
+                                {lowConfidence.length > 0 ? lowConfidence.map((field) => (
+                                  <span key={field} className="rounded-full bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 shadow-sm">
+                                    {field}
+                                  </span>
+                                )) : (
+                                  <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-600 shadow-sm">
+                                    Low-confidence mapping
+                                  </span>
+                                )}
+                              </div>
+                              <div className="mt-4 flex flex-wrap gap-2">
+                                <button
+                                  onClick={() => router.push(`/document/${document.docId}`)}
+                                  className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-3 py-2 text-xs font-semibold text-white transition hover:bg-slate-800"
+                                >
+                                  <Eye className="h-3.5 w-3.5" />
+                                  Review document
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    setSelectedDocumentId(document.docId)
+                                    setActiveTab('reassign')
+                                  }}
+                                  className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-50"
+                                >
+                                  <Link2 className="h-3.5 w-3.5" />
+                                  Reassign
+                                </button>
+                              </div>
+                            </article>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="dashboard-card overflow-hidden">
+                  <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Assignment audit</p>
+                      <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Latest assignment history</h2>
+                    </div>
+                    <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
+                      {pendingAuditCount} open
+                    </span>
+                  </div>
+                  <div className="max-h-[420px] overflow-y-auto">
+                    {auditTrail.length === 0 ? (
+                      <div className="p-5">
+                        <EmptyPanel
+                          title="No assignment audit yet"
+                          description="Every upload, manual issue, and reassignment will create a merchant audit record here."
+                        />
+                      </div>
+                    ) : (
+                      <div className="divide-y divide-slate-100">
+                        {auditTrail.map((audit) => {
+                          const document = documentById.get(audit.documentId)
+                          const currentActivity = activityByDocumentId.get(audit.documentId)
+                          return (
+                            <button
+                              key={audit.assignmentId}
+                              onClick={() => router.push(`/document/${audit.documentId}`)}
+                              className="flex w-full items-start gap-3 px-5 py-4 text-left transition hover:bg-slate-50"
+                            >
+                              <div className="mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-slate-100 text-slate-500">
+                                <Receipt className="h-4 w-4" />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <p className="truncate text-sm font-semibold text-slate-900">{document?.title || currentActivity?.title || 'Untitled invoice'}</p>
+                                  <span className={`rounded-full border px-2 py-1 text-[11px] font-semibold ${getAuditTone(audit.status)}`}>
+                                    {formatAuditStatus(audit.status)}
+                                  </span>
+                                </div>
+                                <p className="mt-1 text-xs text-slate-500">
+                                  {formatAssignmentSource(audit.assignmentSource)} | {currentActivity?.consumerCustomId || audit.consumerUserId}
+                                </p>
+                                <p className="mt-2 text-xs text-slate-400">{formatDate(audit.createdAt)} | {formatRelativeTime(audit.createdAt)}</p>
+                              </div>
+                              <ChevronRight className="mt-1 h-4 w-4 shrink-0 text-slate-300" />
+                            </button>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="dashboard-card overflow-hidden">
+                  <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+                    <div>
                       <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Merchant activity</p>
                       <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Latest locker assignments</h2>
                     </div>
@@ -1528,8 +1698,8 @@ export function MerchantDashboardScreen() {
                                 <p className="truncate text-sm font-semibold text-slate-900">{activity.title || 'Untitled invoice'}</p>
                                 <span className="rounded-full bg-blue-50 px-2 py-1 text-[11px] font-semibold text-blue-700">{activity.action || 'updated'}</span>
                               </div>
-                              <p className="mt-1 text-xs text-slate-500">{activity.vendor || 'Unknown vendor'} • {activity.consumerName || activity.consumerCustomId || activity.consumerUserId || 'Consumer not captured'}</p>
-                              <p className="mt-2 text-xs text-slate-400">{formatDate(activity.createdAt)} • {formatRelativeTime(activity.createdAt)}</p>
+                              <p className="mt-1 text-xs text-slate-500">{activity.vendor || 'Unknown vendor'} | {activity.consumerName || activity.consumerCustomId || activity.consumerUserId || 'Consumer not captured'}</p>
+                              <p className="mt-2 text-xs text-slate-400">{formatDate(activity.createdAt)} | {formatRelativeTime(activity.createdAt)}</p>
                             </div>
                             <ChevronRight className="mt-1 h-4 w-4 shrink-0 text-slate-300" />
                           </button>
