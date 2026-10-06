@@ -267,6 +267,109 @@ def _store_ocr_text_snapshot(
     }
 
 
+def _load_ocr_text_from_snapshot(
+    *,
+    services: ServiceRegistry,
+    snapshot_references: dict[str, object] | None,
+    fallback_text: str,
+) -> tuple[str, str]:
+    store = getattr(services, "object_store", None)
+    key = str((snapshot_references or {}).get("ocr_text_storage_key") or "").strip()
+    if store is not None and getattr(store, "enabled", False) and key:
+        try:
+            payload = store.get_bytes(key=key)
+        except Exception:
+            logger.exception("Failed to load OCR text snapshot key=%s", key)
+            payload = None
+        if payload:
+            try:
+                return payload.decode("utf-8", errors="ignore").strip(), "s3"
+            except Exception:
+                logger.exception("Failed to decode OCR text snapshot key=%s", key)
+    return str(fallback_text or "").strip(), "fallback"
+
+
+def _classify_document_from_snapshot(
+    *,
+    services: ServiceRegistry,
+    filename: str,
+    snapshot_references: dict[str, object] | None,
+    fallback_text: str,
+) -> tuple[dict[str, object], str, str]:
+    ocr_text, text_source = _load_ocr_text_from_snapshot(
+        services=services,
+        snapshot_references=snapshot_references,
+        fallback_text=fallback_text,
+    )
+    if not ocr_text:
+        return {}, text_source, ""
+    classification = _classify_document_with_bedrock(ocr_text, filename)
+    return classification, text_source, ocr_text
+
+
+def _enforce_document_text_classification(
+    *,
+    services: ServiceRegistry,
+    filename: str,
+    snapshot_references: dict[str, object] | None,
+    fallback_text: str,
+) -> dict[str, object]:
+    classification, text_source, ocr_text = _classify_document_from_snapshot(
+        services=services,
+        filename=filename,
+        snapshot_references=snapshot_references,
+        fallback_text=fallback_text,
+    )
+    if not classification:
+        heuristic_is_invoice, heuristic_confidence = _heuristic_is_invoice_document(ocr_text)
+        if not heuristic_is_invoice and heuristic_confidence >= 0.8:
+            raise HTTPException(
+                status_code=422,
+                detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+            )
+        return {"document_type_source": text_source}
+
+    doc_is_invoice = classification.get("is_invoice")
+    doc_confidence = _coerce_float(classification.get("confidence"), default=0.0) or 0.0
+    doc_type = str(classification.get("document_type") or "").strip().lower()
+    allowed_types = {"invoice", "receipt", "warranty_card", "guarantee_card"}
+    is_allowed_type = doc_type in allowed_types
+
+    if doc_is_invoice is True or is_allowed_type:
+        return {
+            "document_type": doc_type or None,
+            "document_type_confidence": doc_confidence,
+            "document_type_reason": classification.get("reason"),
+            "document_type_source": text_source,
+        }
+
+    if doc_is_invoice is False and doc_confidence >= 0.6:
+        raise HTTPException(
+            status_code=422,
+            detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+        )
+
+    if doc_type == "other" and doc_confidence >= 0.6:
+        raise HTTPException(
+            status_code=422,
+            detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+        )
+
+    heuristic_is_invoice, heuristic_confidence = _heuristic_is_invoice_document(ocr_text)
+    if not heuristic_is_invoice and heuristic_confidence >= 0.8:
+        raise HTTPException(
+            status_code=422,
+            detail="Not a bill/invoice. Please upload a valid invoice or warranty card.",
+        )
+
+    return {
+        "document_type": doc_type or None,
+        "document_type_confidence": doc_confidence,
+        "document_type_reason": classification.get("reason"),
+        "document_type_source": text_source,
+    }
+
+
 def _async_extraction_enabled() -> bool:
     settings = get_settings()
     return bool(settings.async_extraction_enabled)
@@ -2820,6 +2923,16 @@ def _persist_structured_document(
             references[key] = value
     if ocr_snapshot_references:
         references.update(ocr_snapshot_references)
+
+    if source in {"image_ocr", "image_ocr_router", "image_ocr_async"}:
+        document_type_payload = _enforce_document_text_classification(
+            services=services,
+            filename=filename,
+            snapshot_references=ocr_snapshot_references,
+            fallback_text=extracted_text,
+        )
+        if document_type_payload:
+            references.update(document_type_payload)
     if metadata.get("vendor_tax_id"):
         references["vendor_tax_id"] = str(metadata["vendor_tax_id"])
     for tax_key in ("taxable_amount", "gst_amount", "gst_rate", "cgst_amount", "sgst_amount", "igst_amount"):
@@ -4277,6 +4390,20 @@ async def ingest_pdf(
     resolved_pdf_text = str(getattr(parsed, "raw_text", "") or "").strip()
     if not resolved_pdf_text:
         resolved_pdf_text = _metadata_to_canonical_text(parsed_metadata)
+    ocr_snapshot_references = _store_ocr_text_snapshot(
+        services=services,
+        extracted_text=resolved_pdf_text,
+        filename=file.filename,
+        source="ingest_pdf",
+        document_user_id=user_id,
+        merchant_user_id=merchant_user_id,
+    )
+    document_type_payload = _enforce_document_text_classification(
+        services=services,
+        filename=file.filename,
+        snapshot_references=ocr_snapshot_references,
+        fallback_text=resolved_pdf_text,
+    )
     has_invoice_signals = any(
         _is_meaningful_metadata_value(parsed_metadata.get(key))
         for key in ("bill_id", "vendor", "total_amount", "date")
@@ -4305,6 +4432,10 @@ async def ingest_pdf(
         "source": "pdf",
         "is_verified": True,
     }
+    if ocr_snapshot_references:
+        references.update(ocr_snapshot_references)
+    if document_type_payload:
+        references.update(document_type_payload)
     if storage_references:
         references.update(storage_references)
     if user_id:
