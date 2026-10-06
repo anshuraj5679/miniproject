@@ -4,14 +4,16 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import smtplib
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from email.message import EmailMessage
-from email.utils import formataddr
+from email.utils import formataddr, parseaddr, parsedate_to_datetime
 from string import Formatter
-from time import perf_counter
+from threading import Lock
+from time import perf_counter, sleep
 from typing import Any
 from uuid import UUID
 
@@ -64,6 +66,22 @@ EVENT_WARRANTY_EXPIRED = "WARRANTY_EXPIRED"
 EVENT_CLAIM_WINDOW_CLOSING = "CLAIM_WINDOW_CLOSING"
 EVENT_SUSPICIOUS_OR_DUPLICATE_BILL = "SUSPICIOUS_OR_DUPLICATE_BILL"
 EVENT_CONSUMER_NOT_ACTIVATED = "CONSUMER_NOT_ACTIVATED"
+EMAIL_ADDRESS_PATTERN = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
+
+
+class NotificationDeliveryError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after_seconds: int | None = None,
+        permanent: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
+        self.permanent = permanent
 
 
 def _safe_float(value: object) -> float | None:
@@ -101,6 +119,33 @@ def _normalize_phone(value: str | None) -> str | None:
     digits = "".join(ch for ch in value if ch.isdigit() or ch == "+")
     digits = digits.strip()
     return digits or None
+
+
+def _is_valid_email_address(value: str) -> bool:
+    candidate = (value or "").strip()
+    if not candidate:
+        return False
+    return bool(EMAIL_ADDRESS_PATTERN.fullmatch(candidate))
+
+
+def _parse_retry_after_seconds(value: str | None) -> int | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return max(1, int(text))
+    try:
+        retry_at = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=DEFAULT_TIMEZONE)
+    delta_seconds = int((retry_at.astimezone(DEFAULT_TIMEZONE) - datetime.now(DEFAULT_TIMEZONE)).total_seconds())
+    if delta_seconds <= 0:
+        return None
+    return delta_seconds
 
 
 class _SafeFormatter(Formatter):
@@ -267,6 +312,16 @@ class NotificationService:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.template_engine = TemplateEngine()
+        self._email_webhook_min_interval_seconds = max(
+            0.0,
+            float(getattr(self.settings, "email_webhook_min_interval_seconds", 0.0)),
+        )
+        self._resend_api_base_url = (
+            str(getattr(self.settings, "resend_api_base_url", "https://api.resend.com")).strip().rstrip("/")
+            or "https://api.resend.com"
+        )
+        self._email_webhook_next_allowed_at = 0.0
+        self._email_webhook_rate_lock = Lock()
 
     def _utcnow(self) -> datetime:
         return datetime.now(DEFAULT_TIMEZONE)
@@ -1048,18 +1103,108 @@ class NotificationService:
         db.commit()
         return True
 
-    def _send_email(self, *, recipient_email: str, subject: str, body: str) -> dict[str, object]:
-        sender_email = (self.settings.email_from or "").strip()
-        if not sender_email:
-            raise RuntimeError("Email sender is not configured. Set EMAIL_FROM.")
+    def _resolve_email_sender(self) -> str:
+        raw_sender = (self.settings.email_from or "").strip()
+        if not raw_sender:
+            raise NotificationDeliveryError(
+                "Email sender is not configured. Set EMAIL_FROM.",
+                permanent=True,
+            )
 
-        sender_name = (self.settings.email_from_name or "").strip()
-        from_value = formataddr((sender_name, sender_email)) if sender_name else sender_email
+        parsed_name, parsed_email = parseaddr(raw_sender)
+        sender_email = (parsed_email or raw_sender).strip()
+        if not _is_valid_email_address(sender_email):
+            raise NotificationDeliveryError(
+                "Invalid EMAIL_FROM value. Use `email@example.com` or `Name <email@example.com>`.",
+                permanent=True,
+            )
+
+        sender_name = (parsed_name or "").strip() or (self.settings.email_from_name or "").strip()
+        return formataddr((sender_name, sender_email)) if sender_name else sender_email
+
+    def _apply_email_webhook_rate_limit(self) -> None:
+        min_interval = self._email_webhook_min_interval_seconds
+        if min_interval <= 0:
+            return
+        with self._email_webhook_rate_lock:
+            now = perf_counter()
+            wait_seconds = self._email_webhook_next_allowed_at - now
+            if wait_seconds > 0:
+                sleep(wait_seconds)
+                now = perf_counter()
+            self._email_webhook_next_allowed_at = now + min_interval
+
+    def _send_via_resend(
+        self,
+        *,
+        from_value: str,
+        recipient_email: str,
+        subject: str,
+        body: str,
+    ) -> dict[str, object]:
+        api_key = (getattr(self.settings, "resend_api_key", "") or "").strip()
+        if not api_key:
+            raise NotificationDeliveryError(
+                "Resend API key is not configured. Set RESEND_API_KEY.",
+                permanent=True,
+            )
+
+        payload = {
+            "from": from_value,
+            "to": [recipient_email],
+            "subject": subject,
+            "text": body,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        self._apply_email_webhook_rate_limit()
+        endpoint = f"{self._resend_api_base_url}/emails"
+        with httpx.Client(timeout=20.0) as client:
+            response = client.post(endpoint, headers=headers, json=payload)
+        if response.status_code >= 400:
+            raise NotificationDeliveryError(
+                f"Resend API failed with status {response.status_code}: {response.text[:400]}",
+                status_code=response.status_code,
+                retry_after_seconds=_parse_retry_after_seconds(response.headers.get("Retry-After")),
+                permanent=response.status_code in {400, 401, 403, 404, 422},
+            )
+
+        message_id: str | None = None
+        try:
+            parsed = response.json()
+            if isinstance(parsed, dict):
+                raw_id = parsed.get("id") or parsed.get("message_id") or parsed.get("messageId")
+                if raw_id:
+                    message_id = str(raw_id)[:128]
+        except Exception:
+            message_id = None
+
+        provider_payload: dict[str, object] = {
+            "provider": "resend",
+            "status_code": response.status_code,
+        }
+        if message_id:
+            provider_payload["message_id"] = message_id
+        return provider_payload
+
+    def _send_email(self, *, recipient_email: str, subject: str, body: str) -> dict[str, object]:
+        from_value = self._resolve_email_sender()
+        resend_api_key = (getattr(self.settings, "resend_api_key", "") or "").strip()
+        if resend_api_key:
+            return self._send_via_resend(
+                from_value=from_value,
+                recipient_email=recipient_email,
+                subject=subject,
+                body=body,
+            )
         webhook_url = (self.settings.email_webhook_url or "").strip()
 
         # Many PaaS providers block outbound SMTP ports; allow HTTPS delivery via a webhook
         # compatible with Resend's API shape (`/emails`), while keeping SMTP as the default.
         if webhook_url:
+            self._apply_email_webhook_rate_limit()
             headers = {"Content-Type": "application/json"}
             token = (self.settings.email_webhook_api_key or "").strip()
             if token:
@@ -1073,8 +1218,10 @@ class NotificationService:
             with httpx.Client(timeout=20.0) as client:
                 response = client.post(webhook_url, headers=headers, json=payload)
             if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Email webhook failed with status {response.status_code}: {response.text[:400]}"
+                raise NotificationDeliveryError(
+                    f"Email webhook failed with status {response.status_code}: {response.text[:400]}",
+                    status_code=response.status_code,
+                    retry_after_seconds=_parse_retry_after_seconds(response.headers.get("Retry-After")),
                 )
             message_id: str | None = None
             try:
@@ -1094,7 +1241,10 @@ class NotificationService:
             return provider_payload
 
         if not self.settings.smtp_host:
-            raise RuntimeError("SMTP settings are incomplete. Configure SMTP_HOST (or EMAIL_WEBHOOK_URL).")
+            raise NotificationDeliveryError(
+                "SMTP settings are incomplete. Configure SMTP_HOST (or EMAIL_WEBHOOK_URL).",
+                permanent=True,
+            )
 
         message = EmailMessage()
         message["From"] = from_value
@@ -1144,7 +1294,10 @@ class NotificationService:
     ) -> dict[str, object]:
         webhook_url = self._channel_webhook_url(channel)
         if not webhook_url:
-            raise RuntimeError(f"{channel} webhook URL is not configured.")
+            raise NotificationDeliveryError(
+                f"{channel} webhook URL is not configured.",
+                permanent=True,
+            )
 
         body = {
             "channel": channel,
@@ -1164,7 +1317,11 @@ class NotificationService:
         with httpx.Client(timeout=20.0) as client:
             response = client.post(webhook_url, content=raw, headers=headers)
         if response.status_code >= 400:
-            raise RuntimeError(f"{channel} webhook failed with status {response.status_code}")
+            raise NotificationDeliveryError(
+                f"{channel} webhook failed with status {response.status_code}",
+                status_code=response.status_code,
+                retry_after_seconds=_parse_retry_after_seconds(response.headers.get("Retry-After")),
+            )
         payload_json: dict[str, object] | None = None
         try:
             parsed = response.json()
@@ -1309,7 +1466,17 @@ class NotificationService:
             except Exception as exc:
                 error_text = str(exc)
                 latency_ms = int((perf_counter() - started_at) * 1000)
-                job.retry_count = int(job.retry_count or 0) + 1
+                delivery_error = exc if isinstance(exc, NotificationDeliveryError) else None
+                status_code = delivery_error.status_code if delivery_error else None
+                is_permanent_failure = bool(delivery_error and delivery_error.permanent)
+                if (
+                    not is_permanent_failure
+                    and status_code is not None
+                    and 400 <= int(status_code) < 500
+                    and int(status_code) != 429
+                ):
+                    is_permanent_failure = True
+
                 job.last_error = error_text[:1000]
                 logger.warning(
                     "notification_job_failed job_id=%s channel=%s event_type=%s attempt=%s error=%s",
@@ -1319,14 +1486,23 @@ class NotificationService:
                     attempt_number,
                     error_text[:240],
                 )
-                if job.retry_count >= max_retries:
+                if is_permanent_failure:
+                    job.retry_count = max_retries
                     job.status = STATUS_DEAD_LETTER
                     dead_lettered += 1
                 else:
-                    delay_multiplier = 2 ** max(job.retry_count - 1, 0)
-                    delay_minutes = backoff_minutes * delay_multiplier
-                    job.status = STATUS_PENDING
-                    job.send_at = self._utcnow() + timedelta(minutes=delay_minutes)
+                    job.retry_count = int(job.retry_count or 0) + 1
+                    if job.retry_count >= max_retries:
+                        job.status = STATUS_DEAD_LETTER
+                        dead_lettered += 1
+                    else:
+                        delay_multiplier = 2 ** max(job.retry_count - 1, 0)
+                        delay_seconds = backoff_minutes * 60 * delay_multiplier
+                        retry_after_seconds = delivery_error.retry_after_seconds if delivery_error else None
+                        if retry_after_seconds and retry_after_seconds > 0:
+                            delay_seconds = max(delay_seconds, int(retry_after_seconds))
+                        job.status = STATUS_PENDING
+                        job.send_at = self._utcnow() + timedelta(seconds=delay_seconds)
                 self._create_delivery(
                     db,
                     job=job,
